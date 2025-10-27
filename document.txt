@@ -1,1 +1,41 @@
-Hello world!
+import pandas as pd
+from sklearn.utils import resample
+
+INPUT = "NF-ToN-IoT-v2.csv"
+OUTPUT = "NF-ToN-IoT-v2_1M_balanced.csv"
+TARGET_TOTAL = 1_000_000
+RANDOM_STATE = 1234
+
+df = pd.read_csv(INPUT)
+
+if 'Attack' not in df.columns:
+    raise ValueError("File CSV không có cột 'Attack'")
+
+classes = df['Attack'].unique()
+num_classes = len(classes)
+target_per_class = TARGET_TOTAL // num_classes
+remainder = TARGET_TOTAL % num_classes
+
+sampled_parts = []
+for i, cls in enumerate(sorted(classes)):
+    cls_df = df[df['Attack'] == cls]
+    this_target = target_per_class + (1 if i < remainder else 0)
+    part = cls_df.sample(
+        n=this_target,
+        replace=(len(cls_df) < this_target),
+        random_state=RANDOM_STATE,
+    ).sample(frac=1.0, random_state=RANDOM_STATE)  # shuffle riêng từng lớp
+    sampled_parts.append(part)
+
+# concat mà không shuffle toàn cục
+df_balanced = pd.concat(sampled_parts, ignore_index=True)
+
+print(df_balanced['Attack'].value_counts())
+
+df_balanced.to_csv(OUTPUT, index=False)
+print("Saved to:", OUTPUT)
+
+
+
+
+
