@@ -1,6 +1,34 @@
 import pandas as pd
 import numpy as np
 
+INPUT = "NF-ToN-IoT-v2_1M_balanced.csv"
+OUTPUT = "NF-ToN-IoT-v2_1M_balanced_shuffled.csv"
+CHUNK_SIZE = 100_000
+RANDOM_STATE = 1234
+
+# 1. Đọc file thành từng khối
+chunks = pd.read_csv(INPUT, chunksize=CHUNK_SIZE)
+
+# 2. Shuffle thứ tự các khối
+chunks = list(chunks)
+np.random.seed(RANDOM_STATE)
+np.random.shuffle(chunks)
+
+# 3. Shuffle trong từng khối (ít tốn RAM)
+for i, chunk in enumerate(chunks):
+    chunk = chunk.sample(frac=1.0, random_state=RANDOM_STATE + i)
+    mode = "w" if i == 0 else "a"
+    header = (i == 0)
+    chunk.to_csv(OUTPUT, index=False, mode=mode, header=header)
+
+print("✅ Đã shuffle toàn bộ và lưu:", OUTPUT)
+
+
+
+
+import pandas as pd
+import numpy as np
+
 # ==============================================================
 # ⚙️ CẤU HÌNH
 # ==============================================================
