@@ -1,3 +1,73 @@
+import torch
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1️⃣ Tạo ma trận HiPPO-LegS (A, B)
+# ============================================================
+def hippo_legs_matrix(N: int):
+    """Tạo ma trận A, B cho HiPPO-LegS"""
+    n = torch.arange(N, dtype=torch.float32)
+    A = torch.zeros((N, N))
+    for i in range(N):
+        for j in range(N):
+            if j <= i:
+                A[i, j] = -(2 * i + 1) * ((-1) ** (i - j))
+    B = (2 * n + 1).sqrt().unsqueeze(-1)
+    return A, B
+
+# ============================================================
+# 2️⃣ Rời rạc hóa bằng Bilinear transform (Tustin)
+# ============================================================
+def bilinear_discretize(A, B, dt=0.01):
+    I = torch.eye(A.size(0))
+    Ad = (I + 0.5 * dt * A) @ torch.linalg.inv(I - 0.5 * dt * A)
+    Bd = torch.linalg.inv(I - 0.5 * dt * A) @ B * dt
+    return Ad, Bd
+
+# ============================================================
+# 3️⃣ Mô phỏng HiPPO với tín hiệu x(t) = t
+# ============================================================
+def simulate_hippo(N=4, T=1.0, dt=0.01):
+    steps = int(T / dt)
+    A, B = hippo_legs_matrix(N)
+    Ad, Bd = bilinear_discretize(A, B, dt)
+
+    c = torch.zeros(N, 1)
+    states = [c.clone()]
+    xs = []
+    ts = []
+
+    for step in range(steps):
+        t = step * dt
+        x_t = torch.tensor([t])  # x(t) = t
+        c = Ad @ c + Bd * x_t
+        states.append(c.clone())
+        xs.append(x_t.item())
+        ts.append(t)
+
+    states = torch.cat(states, dim=1)
+    return ts, xs, states
+
+# ============================================================
+# 4️⃣ Vẽ kết quả
+# ============================================================
+ts, xs, states = simulate_hippo(N=4, T=1.0, dt=0.01)
+
+plt.figure(figsize=(10, 6))
+for i in range(states.size(0)):
+    plt.plot(ts, states[i, 1:].numpy(), label=f'c[{i}]')
+
+plt.title("Tiến hóa hệ số HiPPO-LegS cho x(t)=t")
+plt.xlabel("Thời gian t")
+plt.ylabel("Giá trị hệ số c_i(t)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+
 import pandas as pd
 import numpy as np
 
