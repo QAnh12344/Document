@@ -1,4 +1,142 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from captum.attr import IntegratedGradients
+import matplotlib.pyplot as plt
+import numpy as np
+import random, os
+
+# -----------------------------
+# 1️⃣ SETUP
+# -----------------------------
+torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
+
+input_dim = 20
+hidden_dim = 32
+num_classes = 3
+num_samples = 500
+batch_size = 32
+epochs = 15
+log_dir = "runs/model_interpret_full"
+
+os.makedirs(log_dir, exist_ok=True)
+writer = SummaryWriter(log_dir=log_dir)
+
+# -----------------------------
+# 2️⃣ DATA: random cho dễ nhìn
+# -----------------------------
+X = torch.randn(num_samples, 10, input_dim)  # (batch, seq, features)
+y = torch.randint(0, num_classes, (num_samples,))
+
+dataset = TensorDataset(X, y)
+loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# -----------------------------
+# 3️⃣ MODEL: LSTM cơ bản
+# -----------------------------
+class InterpretableLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_classes):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        h, _ = self.lstm(x)
+        out = self.relu(h[:, -1, :])  # lấy hidden cuối
+        logits = self.fc(out)
+        return logits, {"hidden": h, "activation": out}
+
+model = InterpretableLSTM(input_dim, hidden_dim, num_classes)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# -----------------------------
+# 4️⃣ TRAIN LOOP + LOG
+# -----------------------------
+for epoch in range(epochs):
+    model.train()
+    total_loss, correct = 0, 0
+
+    for batch_X, batch_y in loader:
+        optimizer.zero_grad()
+        logits, internals = model(batch_X)
+        loss = criterion(logits, batch_y)
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+        correct += (logits.argmax(1) == batch_y).sum().item()
+
+        # Log histograms
+        for name, param in model.named_parameters():
+            writer.add_histogram(f"weights/{name}", param, epoch)
+            if param.grad is not None:
+                writer.add_histogram(f"grads/{name}", param.grad, epoch)
+
+        # Log activation stats
+        writer.add_histogram("activations/last_hidden", internals["activation"], epoch)
+
+    acc = correct / len(dataset)
+    avg_loss = total_loss / len(loader)
+    writer.add_scalar("Loss/train", avg_loss, epoch)
+    writer.add_scalar("Accuracy/train", acc, epoch)
+
+    print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.3f}")
+
+# -----------------------------
+# 5️⃣ EMBEDDING PROJECTOR
+# -----------------------------
+embeddings = []
+labels = []
+with torch.no_grad():
+    for Xb, yb in loader:
+        logits, internals = model(Xb)
+        embeddings.append(internals["activation"])
+        labels.append(yb)
+embeddings = torch.cat(embeddings)
+labels = torch.cat(labels)
+writer.add_embedding(embeddings, metadata=labels, tag="embedding_space")
+
+# -----------------------------
+# 6️⃣ FEATURE IMPORTANCE (Captum)
+# -----------------------------
+ig = IntegratedGradients(model)
+model.eval()
+sample_X = X[0:1]
+sample_y = y[0:1]
+attr, delta = ig.attribute(sample_X, target=sample_y.item(), return_convergence_delta=True)
+
+# Vẽ heatmap thể hiện importance theo chiều thời gian + feature
+attr_np = attr.squeeze(0).detach().numpy()
+plt.figure(figsize=(8, 4))
+plt.imshow(attr_np.T, cmap="hot", aspect="auto")
+plt.colorbar(label="Feature importance")
+plt.title("Integrated Gradients Heatmap (Captum)")
+plt.xlabel("Time step")
+plt.ylabel("Feature dim")
+plt.tight_layout()
+plt.savefig(os.path.join(log_dir, "feature_importance_heatmap.png"))
+plt.close()
+
+writer.close()
+print("✅ Training done. Logs saved to:", log_dir)
+print("Run TensorBoard: tensorboard --logdir runs/model_interpret_full")
+
+
+
+
+
+
+
+
+
+import torch
 import matplotlib.pyplot as plt
 
 # ============================================================
