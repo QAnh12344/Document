@@ -1,3 +1,142 @@
+# train_whisper_v3.py
+import os
+import torch
+import numpy as np
+import soundfile as sf
+from datasets import load_dataset
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer
+)
+import evaluate
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+# --- config ----------------------------------------------------------------------------
+MODEL = "openai/whisper-large-v3"
+DATASET_CSV = "data/manifest.csv"       # columns: path,text
+OUTPUT_DIR = "whisper_ft_v3"
+BATCH_SIZE = 4
+EPOCHS = 3
+LEARNING_RATE = 1e-5
+# ---------------------------------------------------------------------------------------
+
+processor = WhisperProcessor.from_pretrained(MODEL)
+model = WhisperForConditionalGeneration.from_pretrained(MODEL)
+
+# set language + task → BẮT BUỘC
+model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(
+    language="vi", task="transcribe"
+)
+model.config.suppress_tokens = []
+
+model.to("cuda")
+
+# load dataset
+ds = load_dataset("csv", data_files={"train": DATASET_CSV})["train"]
+
+# load audio
+def load_audio(ex):
+    speech, sr = sf.read(ex["path"])
+    ex["audio"] = {"array": speech, "sampling_rate": sr}
+    return ex
+
+ds = ds.map(load_audio)
+
+# preprocess fn
+def preprocess(batch):
+    audio = batch["audio"]
+
+    # Whisper yêu cầu 16kHz
+    if audio["sampling_rate"] != 16000:
+        raise ValueError("Audio must be 16kHz. Resample first!")
+
+    # extract log-mel
+    features = processor(
+        audio=audio["array"],
+        sampling_rate=16000,
+        return_tensors="pt"
+    ).input_features[0]
+
+    # tokenize text
+    with processor.as_target_processor():
+        labels = processor(batch["text"]).input_ids
+
+    return {"input_features": features, "labels": labels}
+
+ds = ds.map(preprocess, remove_columns=ds.column_names)
+
+# collator
+@dataclass
+class DataCollatorSpeechSeq2Seq:
+    processor: WhisperProcessor
+    def __call__(self, features):
+        input_features = torch.stack([torch.tensor(f["input_features"]) for f in features])
+        labels = [f["labels"] for f in features]
+
+        labels_batch = self.processor.tokenizer.pad(
+            {"input_ids": labels}, 
+            padding=True, 
+            return_tensors="pt"
+        ).input_ids
+
+        labels_batch[labels_batch == self.processor.tokenizer.pad_token_id] = -100
+
+        return {
+            "input_features": input_features,
+            "labels": labels_batch
+        }
+
+data_collator = DataCollatorSpeechSeq2Seq(processor)
+
+# training args
+training_args = Seq2SeqTrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=4,
+    fp16=True,
+    num_train_epochs=EPOCHS,
+    learning_rate=LEARNING_RATE,
+    logging_steps=50,
+    save_total_limit=2,
+    evaluation_strategy="no",
+    remove_unused_columns=False
+)
+
+# WER metric
+wer = evaluate.load("wer")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    return {"wer": wer.compute(predictions=pred_str, references=label_str)}
+
+# trainer
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=ds,
+    data_collator=data_collator,
+    tokenizer=processor.feature_extractor,
+    compute_metrics=compute_metrics,
+)
+
+if __name__ == "__main__":
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
+
+
+
+
+
 import torch
 from torch import nn
 import inspect
