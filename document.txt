@@ -1,5 +1,61 @@
 import re
 
+def analyze_text(text,
+                 max_numbers=3,
+                 max_english_words=5,
+                 max_brackets=4):
+    """
+    Kiểm tra câu xem có quá nhiều số, từ tiếng Anh, hoặc dấu ngoặc.
+    """
+    # ---- Đếm số ----
+    numbers = re.findall(r'\d+(\.\d+)?', text)
+    num_count = len(numbers)
+
+    # ---- Đếm từ tiếng Anh ----
+    english_words = re.findall(r'\b[a-zA-Z]+\b', text)
+    eng_count = len(english_words)
+
+    # ---- Đếm dấu ngoặc ----
+    brackets = re.findall(r'[()\[\]{}]', text)
+    br_count = len(brackets)
+
+    # ---- Tạo thông báo ----
+    messages = []
+
+    if num_count > max_numbers:
+        messages.append("Quá nhiều số")
+
+    if eng_count > max_english_words:
+        messages.append("Quá nhiều từ tiếng Anh")
+
+    if br_count > max_brackets:
+        messages.append("Quá nhiều dấu ngoặc")
+
+    # Nếu không có gì bất thường
+    if not messages:
+        return "Bình thường"
+
+    # Ghép thông báo
+    return ", ".join(messages)
+
+
+# ---- Ví dụ ----
+texts = [
+    "Giá là 3 (lần), thêm 2 (option) và 5 [more] items",
+    "This is a test (a) (b) (c) (d) (e)",
+    "Hôm nay có 2 quả táo thôi",
+    "I bought 3 apples, 2 bananas and {one} more item"
+]
+
+for t in texts:
+    print(f"'{t}' -> {analyze_text(t)}")
+
+
+
+
+
+import re
+
 def analyze_text(text, max_numbers=3, max_english_words=5):
     """
     Kiểm tra một câu xem có quá nhiều số hoặc quá nhiều từ tiếng Anh không.
