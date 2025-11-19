@@ -1,3 +1,49 @@
+import re
+
+def analyze_text(text, max_numbers=3, max_english_words=5):
+    """
+    Kiểm tra một câu xem có quá nhiều số hoặc quá nhiều từ tiếng Anh không.
+    
+    Args:
+        text (str): Câu cần kiểm tra
+        max_numbers (int): Ngưỡng tối đa số lượng số
+        max_english_words (int): Ngưỡng tối đa số lượng từ tiếng Anh
+    
+    Returns:
+        str: Thông báo tình trạng câu
+    """
+    # Đếm số
+    numbers = re.findall(r'\d+(\.\d+)?', text)
+    num_count = len(numbers)
+    
+    # Đếm từ tiếng Anh
+    english_words = re.findall(r'\b[a-zA-Z]+\b', text)
+    eng_count = len(english_words)
+    
+    # Kiểm tra ngưỡng
+    if num_count > max_numbers and eng_count > max_english_words:
+        return "Quá nhiều số và quá nhiều từ tiếng Anh"
+    elif num_count > max_numbers:
+        return "Quá nhiều số"
+    elif eng_count > max_english_words:
+        return "Quá nhiều từ tiếng Anh"
+    else:
+        return "Bình thường"
+
+# Ví dụ sử dụng
+texts = [
+    "Hôm nay tôi mua 3 apples, 2 oranges và 5 bananas giá 10 USD",
+    "Chỉ có 2 quả táo",
+    "I love Python programming and AI"
+]
+
+for t in texts:
+    print(f"'{t}' -> {analyze_text(t)}")
+
+
+
+
+
 # train_whisper_v3.py
 import os
 import torch
