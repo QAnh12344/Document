@@ -1,3 +1,87 @@
+import torch
+from torch_geometric.data import HeteroData
+
+# ==========================
+# 1️⃣ Tạo HeteroGraphData với multi-edges
+# ==========================
+data = HeteroData()
+
+# Node features
+data['node'].x = torch.tensor([[1.0, 0.5],  # node 0
+                               [0.2, 1.5],  # node 1
+                               [0.0, 0.1]]) # node 2
+
+# Multi-edges: 0->1 (3 edges), 1->2 (2 edges)
+edge_index = torch.tensor([
+    [0, 0, 0, 1, 1],  # src
+    [1, 1, 1, 2, 2]   # dst
+])
+edge_attr = torch.tensor([
+    [1.0, 0.0],  # edge 0
+    [0.5, 0.5],  # edge 1
+    [0.0, 1.0],  # edge 2
+    [1.0, 1.0],  # edge 3
+    [0.0, 2.0]   # edge 4
+])
+
+data['node', 'to', 'node'].edge_index = edge_index
+data['node', 'to', 'node'].edge_attr = edge_attr
+
+# Reverse edges
+data['node', 'rev_to', 'node'].edge_index = edge_index.flipud()
+data['node', 'rev_to', 'node'].edge_attr = edge_attr.clone()
+
+# ==========================
+# 2️⃣ Flatten edge mapping
+# ==========================
+def find_parallel_edges(edge_index):
+    simplified_edge_mapping = {}
+    simplified_edge_batch = []
+    i = 0
+    for edge in edge_index.T:
+        tuple_edge = tuple(edge.tolist())
+        if tuple_edge not in simplified_edge_mapping:
+            simplified_edge_mapping[tuple_edge] = i
+            i += 1
+        simplified_edge_batch.append(simplified_edge_mapping[tuple_edge])
+    return torch.LongTensor(simplified_edge_batch)
+
+simp_edge_batch = find_parallel_edges(edge_index)
+
+# Gán vào graph
+data['node', 'to', 'node'].simp_edge_batch = simp_edge_batch
+data['node', 'rev_to', 'node'].simp_edge_batch = simp_edge_batch
+
+print("simp_edge_batch:", simp_edge_batch)
+
+# ==========================
+# 3️⃣ Flatten edge features (sum pooling)
+# ==========================
+def flatten_edge_features(edge_attr, simp_edge_batch):
+    num_flattened_edges = simp_edge_batch.max().item() + 1
+    flattened_edge_attr = torch.zeros((num_flattened_edges, edge_attr.size(1)))
+    for i in range(num_flattened_edges):
+        mask = simp_edge_batch == i
+        flattened_edge_attr[i] = edge_attr[mask].sum(dim=0)
+    return flattened_edge_attr
+
+flat_attr_to = flatten_edge_features(data['node', 'to', 'node'].edge_attr,
+                                     data['node', 'to', 'node'].simp_edge_batch)
+flat_attr_rev = flatten_edge_features(data['node', 'rev_to', 'node'].edge_attr,
+                                     data['node', 'rev_to', 'node'].simp_edge_batch)
+
+print("Flattened edge features (to):\n", flat_attr_to)
+print("Flattened edge features (rev):\n", flat_attr_rev)
+
+# ==========================
+# 4️⃣ Kết quả
+# ==========================
+# Edge 0->1: 3 multi-edges -> sum
+# Edge 1->2: 2 multi-edges -> sum
+
+
+
+
 import re
 
 def analyze_text(text,
