@@ -3,6 +3,115 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HypergraphConv
 
+# --------------------------
+# 1️⃣ Load data
+# --------------------------
+data = torch.load("your_hypergraph.pt")
+# data.edge_index: [2, num_edges] node↔hyperedge
+# data.x: node features [num_nodes, num_features]
+# data.y: node labels [num_nodes]
+
+# Identify rare classes
+threshold = 10
+from collections import Counter
+label_counts = Counter(data.y.tolist())
+rare_classes = [c for c, cnt in label_counts.items() if cnt < threshold]
+rare_nodes_idx = torch.tensor([i for i, label in enumerate(data.y) if label in rare_classes])
+rare_hyperedges_idx = torch.unique(data.edge_index[1][torch.isin(data.edge_index[0], rare_nodes_idx)])
+
+# --------------------------
+# 2️⃣ Augmentation functions
+# --------------------------
+def feature_jitter(x, nodes_idx, sigma=0.02):
+    x_aug = x.clone()
+    x_aug[nodes_idx] += torch.randn_like(x_aug[nodes_idx]) * sigma
+    return x_aug
+
+def drop_nodes_in_hyperedge(edge_index, rare_hyperedges_idx, drop_rate=0.3):
+    new_edge_list = []
+    for he in torch.unique(edge_index[1]):
+        nodes_in_he = edge_index[0, edge_index[1] == he]
+        if he in rare_hyperedges_idx:
+            keep_mask = torch.rand(len(nodes_in_he)) > drop_rate
+            if keep_mask.sum() < 2:
+                keep_mask[:2] = True
+            nodes_in_he = nodes_in_he[keep_mask]
+        he_indices = torch.full((len(nodes_in_he),), he, dtype=torch.long)
+        new_edge_list.append(torch.stack([nodes_in_he, he_indices], dim=0))
+    return torch.cat(new_edge_list, dim=1)
+
+# --------------------------
+# 3️⃣ Hypergraph Encoder
+# --------------------------
+class HyperGCL_Encoder(nn.Module):
+    def __init__(self, in_dim, hid_dim, out_dim):
+        super().__init__()
+        self.conv1 = HypergraphConv(in_dim, hid_dim)
+        self.conv2 = HypergraphConv(hid_dim, out_dim)
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.conv2(x, edge_index)
+        return x
+
+# --------------------------
+# 4️⃣ Prototype Contrastive Loss
+# --------------------------
+def prototype_contrastive_loss(z, y, tau=0.5):
+    classes = torch.unique(y)
+    prototypes = torch.stack([z[y==c].mean(dim=0) for c in classes])
+    z = F.normalize(z, dim=1)
+    prototypes = F.normalize(prototypes, dim=1)
+    sim = torch.matmul(z, prototypes.T) / tau
+    label_to_idx = {c.item(): idx for idx, c in enumerate(classes)}
+    target = torch.tensor([label_to_idx[label.item()] for label in y], device=z.device)
+    loss = F.cross_entropy(sim, target)
+    return loss
+
+# --------------------------
+# 5️⃣ Training step (example)
+# --------------------------
+in_dim = data.x.size(1)
+hid_dim = 64
+out_dim = 64
+encoder = HyperGCL_Encoder(in_dim, hid_dim, out_dim)
+
+optimizer = torch.optim.Adam(encoder.parameters(), lr=0.01)
+
+for epoch in range(50):
+    # Augment rare class
+    x_view1 = feature_jitter(data.x, rare_nodes_idx, sigma=0.02)
+    edge_view1 = drop_nodes_in_hyperedge(data.edge_index, rare_hyperedges_idx, drop_rate=0.3)
+    
+    x_view2 = feature_jitter(data.x, rare_nodes_idx, sigma=0.02)
+    edge_view2 = drop_nodes_in_hyperedge(data.edge_index, rare_hyperedges_idx, drop_rate=0.3)
+    
+    # Encode views
+    z1 = encoder(x_view1, edge_view1)
+    z2 = encoder(x_view2, edge_view2)
+    
+    # Combine embeddings
+    z = torch.cat([z1, z2], dim=0)
+    y = torch.cat([data.y, data.y], dim=0)
+    
+    # Prototype contrastive loss
+    loss = prototype_contrastive_loss(z, y, tau=0.5)
+    
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    if epoch % 5 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import HypergraphConv
+
 # -----------------------
 # 1. Encoder + Projection
 # -----------------------
