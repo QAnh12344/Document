@@ -2,6 +2,219 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HypergraphConv
+from sklearn.model_selection import train_test_split
+from collections import Counter
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------- Load .pt ----------
+data = torch.load("your_hypergraph.pt")
+# expect: data.x [N, F], data.y [N], data.edge_index [2, E] (node, hyperedge)
+x = data.x
+y = data.y
+edge_index = data.edge_index  # [2, E]
+
+# ---------- train/test split (stratified) ----------
+all_idx = torch.arange(x.size(0))
+train_idx_np, test_idx_np = train_test_split(all_idx.numpy(), test_size=0.2, stratify=y.numpy(), random_state=42)
+train_idx = torch.tensor(train_idx_np, dtype=torch.long)
+test_idx = torch.tensor(test_idx_np, dtype=torch.long)
+
+# ---------- helper: build subgraph with reindexing ----------
+def build_subgraph(node_idx, edge_index):
+    """
+    node_idx: 1D tensor of original node indices to keep
+    edge_index: [2, E] (node, hyperedge)
+    returns:
+      new_x_idx_map: dict old->new
+      sub_edge_index: [2, E_sub] with node ids remapped 0..n-1
+      keep_node_idx (tensor): original indices in same order as mapping
+    """
+    node_idx = node_idx.cpu()
+    n_keep = node_idx.numel()
+    old2new = -torch.ones(edge_index[0].max().item()+1, dtype=torch.long)
+    old2new[node_idx] = torch.arange(n_keep, dtype=torch.long)
+    # mask edges columns where node in train
+    mask = torch.isin(edge_index[0], node_idx)
+    ei = edge_index[:, mask]
+    # group by hyperedge id: for each hyperedge collect nodes that are in node_idx
+    he_ids = torch.unique(ei[1])
+    new_cols = []
+    for he in he_ids:
+        nodes = ei[0][ei[1]==he]
+        nodes_new = old2new[nodes]
+        # drop hyperedge if less than 2 nodes after filter
+        if nodes_new.numel() < 2:
+            continue
+        he_new_col = torch.stack([nodes_new, torch.full((nodes_new.size(0),), he, dtype=torch.long)], dim=0)
+        new_cols.append(he_new_col)
+    if len(new_cols)==0:
+        return old2new, torch.empty((2,0), dtype=torch.long), node_idx
+    sub_edge_index = torch.cat(new_cols, dim=1)
+    return old2new, sub_edge_index, node_idx
+
+old2new_train, edge_index_train, train_keep = build_subgraph(train_idx, edge_index)
+# edge_index_train nodes are remapped 0..N_train-1 but hyperedge ids remain original ids (not contiguous) - that's ok
+
+# build x_train, y_train in remapped order
+x_train = x[train_keep].to(device)
+y_train = y[train_keep].to(device)
+
+x_test = x[test_idx].to(device)
+y_test = y[test_idx].to(device)
+
+edge_index_train = edge_index_train.to(device)
+
+# ---------- identify rare classes in train set ----------
+label_counts = Counter(y_train.tolist())
+threshold = 10
+rare_classes = [c for c, cnt in label_counts.items() if cnt < threshold]
+rare_mask = torch.isin(y_train, torch.tensor(rare_classes, device=y_train.device))
+rare_nodes_local_idx = rare_mask.nonzero(as_tuple=True)[0]  # indices in 0..N_train-1
+# collect hyperedges that involve rare nodes (hyperedge ids are original he ids)
+rare_hyperedges = torch.unique(edge_index_train[1][torch.isin(edge_index_train[0], rare_nodes_local_idx)]).to(device)
+
+# ---------- augmentation helpers (operate on remapped train subgraph) ----------
+def feature_jitter_subset(x_sub, nodes_local_idx, sigma=0.02):
+    x_aug = x_sub.clone()
+    if nodes_local_idx.numel() > 0:
+        x_aug[nodes_local_idx] = x_aug[nodes_local_idx] + torch.randn_like(x_aug[nodes_local_idx]) * sigma
+    return x_aug
+
+def drop_nodes_in_hyperedge_sub(edge_index_sub, rare_hyperedges_ids, drop_rate=0.3):
+    new_cols = []
+    he_ids = torch.unique(edge_index_sub[1])
+    for he in he_ids:
+        cols = (edge_index_sub[1] == he)
+        nodes = edge_index_sub[0, cols]
+        if he in rare_hyperedges_ids:
+            keep_mask = torch.rand(nodes.size(0), device=nodes.device) > drop_rate
+            if keep_mask.sum() < 2:
+                # ensure at least 2
+                keep_idx = torch.arange(nodes.size(0), device=nodes.device)
+                keep_mask[keep_idx[:2]] = True
+            nodes = nodes[keep_mask]
+        # skip if <2 nodes
+        if nodes.numel() < 2:
+            continue
+        he_cols = torch.stack([nodes, torch.full((nodes.size(0),), he, dtype=torch.long, device=nodes.device)], dim=0)
+        new_cols.append(he_cols)
+    if len(new_cols)==0:
+        return torch.empty((2,0), dtype=torch.long, device=edge_index_sub.device)
+    return torch.cat(new_cols, dim=1)
+
+# ---------- Encoder ----------
+class HyperGCL_Encoder(nn.Module):
+    def __init__(self, in_dim, hid_dim, out_dim):
+        super().__init__()
+        self.conv1 = HypergraphConv(in_dim, hid_dim)
+        self.conv2 = HypergraphConv(hid_dim, out_dim)
+    def forward(self, x_local, edge_index_local):
+        x = F.relu(self.conv1(x_local, edge_index_local))
+        x = self.conv2(x, edge_index_local)
+        return x
+
+# ---------- prototype contrastive loss (robust) ----------
+def prototype_contrastive_loss(z, y, tau=0.5, eps=1e-6):
+    # z: [N, d] normalized inside
+    # y: [N] local labels (may contain subset of classes)
+    device = z.device
+    classes = torch.unique(y)
+    prototypes = []
+    valid_classes = []
+    for c in classes:
+        mask = (y == c)
+        if mask.sum() == 0:
+            continue
+        prot = z[mask].mean(dim=0)
+        prototypes.append(prot)
+        valid_classes.append(c)
+    if len(prototypes) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    prototypes = torch.stack(prototypes, dim=0)
+    # normalize
+    z_n = F.normalize(z, dim=1)
+    p_n = F.normalize(prototypes, dim=1)
+    sim = torch.matmul(z_n, p_n.T) / tau
+    # map y -> index in valid_classes
+    c2i = {int(c.item()): idx for idx, c in enumerate(valid_classes)}
+    target = torch.tensor([c2i[int(v.item())] for v in y], device=device)
+    loss = F.cross_entropy(sim, target)
+    return loss
+
+# ---------- training ----------
+in_dim = x_train.size(1)
+hid_dim = 64
+out_dim = 64
+encoder = HyperGCL_Encoder(in_dim, hid_dim, out_dim).to(device)
+opt = torch.optim.Adam(encoder.parameters(), lr=1e-3, weight_decay=1e-5)
+
+epochs = 100
+for epoch in range(epochs):
+    encoder.train()
+    # create two augmented views only on train subgraph
+    x_v1 = feature_jitter_subset(x_train, rare_nodes_local_idx, sigma=0.02)
+    e_v1 = drop_nodes_in_hyperedge_sub(edge_index_train, rare_hyperedges, drop_rate=0.3)
+    x_v2 = feature_jitter_subset(x_train, rare_nodes_local_idx, sigma=0.02)
+    e_v2 = drop_nodes_in_hyperedge_sub(edge_index_train, rare_hyperedges, drop_rate=0.3)
+
+    # If augmentation removed all edges, fallback to original
+    if e_v1.size(1) == 0:
+        e_v1 = edge_index_train
+    if e_v2.size(1) == 0:
+        e_v2 = edge_index_train
+
+    z1 = encoder(x_v1, e_v1)
+    z2 = encoder(x_v2, e_v2)
+
+    # combine
+    z = torch.cat([z1, z2], dim=0)
+    y_comb = torch.cat([y_train, y_train], dim=0)
+
+    # normalize embeddings before proto loss
+    z = F.normalize(z, dim=1)
+    loss = prototype_contrastive_loss(z, y_comb, tau=0.5)
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch} loss {loss.item():.4f}")
+
+# ---------- Linear probe evaluation (train a simple classifier on frozen encoder) ----------
+encoder.eval()
+with torch.no_grad():
+    # encode full train graph using original train edge_index (no augmentation)
+    z_train_full = encoder(x_train, edge_index_train)
+    z_test_full = encoder(x_test, edge_index_train)  # WARNING: if test hyperedges refer to nodes outside train, prefer building full graph encoder
+
+# train small linear classifier on top of z_train_full
+clf = nn.Linear(z_train_full.size(1), int(y.max().item())+1).to(device)
+clf_opt = torch.optim.Adam(clf.parameters(), lr=1e-3, weight_decay=1e-5)
+for it in range(200):
+    clf.train()
+    logits = clf(z_train_full)
+    loss_clf = F.cross_entropy(logits, y_train)
+    clf_opt.zero_grad()
+    loss_clf.backward()
+    clf_opt.step()
+# evaluate
+clf.eval()
+with torch.no_grad():
+    logits_test = clf(z_test_full)
+    pred = logits_test.argmax(dim=1)
+    acc = (pred == y_test).float().mean().item()
+print("Linear probe test accuracy:", acc)
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import HypergraphConv
 
 # --------------------------
 # 1️⃣ Load data
