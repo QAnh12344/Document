@@ -1,3 +1,41 @@
+import torch
+import torch.nn.functional as F
+
+def safe_normalize(z, dim=1, eps=1e-6):
+    """
+    Convert to float if needed, handle empty, NaN/Inf, then normalize.
+    Returns normalized tensor with same device.
+    """
+    if not torch.is_tensor(z):
+        raise TypeError("safe_normalize expects a torch.Tensor")
+
+    # ensure float
+    if not z.dtype.is_floating_point:
+        z = z.float()
+
+    # shape check: expect 2D (N, D)
+    if z.ndim != 2:
+        raise ValueError(f"safe_normalize expects 2D tensor (N, D). Got ndim={z.ndim}, shape={z.shape}")
+
+    # replace NaN/Inf (if any)
+    if torch.isnan(z).any() or torch.isinf(z).any():
+        z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    # if a row is all zeros, add tiny noise to avoid zero-norm
+    row_norm = torch.linalg.vector_norm(z, dim=1)
+    zero_rows = (row_norm == 0)
+    if zero_rows.any():
+        z[zero_rows] = z[zero_rows] + (torch.randn_like(z[zero_rows]) * eps)
+
+    # finally normalize
+    z = F.normalize(z, dim=dim)
+    return z
+
+# usage
+z2 = safe_normalize(z2, dim=1)
+
+
+
 def info_nce_loss_minibatch(z1, z2, batch_size=4096, tau=0.2):
     N = z1.size(0)
     loss_all = []
