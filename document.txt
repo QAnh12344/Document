@@ -1,4 +1,53 @@
 import torch
+import torch.nn.functional as F
+
+def prototype_contrastive_loss(z, y, tau=0.2, eps=1e-8):
+    """
+    z: [N, d]   node embeddings
+    y: [N]      labels
+    tau: temperature
+    """
+
+    # ---- 1. Normalize ----
+    z = F.normalize(z, dim=1)
+
+    # ---- 2. Compute prototypes by class ----
+    classes = torch.unique(y)
+    prototypes = []
+
+    for c in classes:
+        proto = z[y == c].mean(dim=0)
+        prototypes.append(proto)
+
+    prototypes = torch.stack(prototypes)                     # [C, d]
+    prototypes = F.normalize(prototypes, dim=1).detach()     # <-- detach quan trọng
+
+    # ---- 3. Cosine sim: node vs all prototypes ----
+    sim = torch.matmul(z, prototypes.T) / tau                # [N, C]
+
+    # ---- 4. Map labels → prototype index ----
+    mapping = {c.item(): i for i, c in enumerate(classes)}
+    target = torch.tensor([mapping[label.item()] for label in y],
+                          device=z.device)
+
+    # ---- 5. Class-balanced loss (fix imbalance) ----
+    counts = torch.tensor(
+        [ (y == c).sum().item() for c in classes ],
+        device=z.device, dtype=torch.float
+    )
+    weights = 1.0 / (counts + eps)                           # inverse freq
+    weights = weights / weights.sum()                       # normalize
+
+    # ---- 6. Cross entropy with class weights ----
+    loss = F.cross_entropy(sim, target, weight=weights)
+
+    return loss
+
+
+
+
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HypergraphConv
