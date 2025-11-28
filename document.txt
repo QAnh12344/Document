@@ -1,3 +1,44 @@
+def info_sup_contrastive_loss(z1, z2, y, tau=0.2, sup_weight=1.0, batch_size=2048):
+    device = z1.device
+    N = z1.size(0)
+    loss_all = []
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        z1_b = safe_normalize(z1[start:end])
+        z2_b = safe_normalize(z2[start:end])
+        y_b = y[start:end]
+
+        # ----- InfoNCE -----
+        logits_info = torch.matmul(z1_b, z2_b.T) / tau
+        labels_info = torch.arange(end-start, device=device)
+        loss_info = F.cross_entropy(logits_info, labels_info)
+
+        # ----- SupCon -----
+        z_b = torch.cat([z1_b, z2_b], dim=0)  # (2B, D)
+        y_b2 = y_b.repeat(2)
+        sim = torch.matmul(z_b, z_b.T) / tau
+
+        mask = torch.eye(2*(end-start), dtype=torch.bool, device=device)
+        sim.masked_fill_(mask, -1e9)
+
+        pos_mask = (y_b2.unsqueeze(0) == y_b2.unsqueeze(1)) & (~mask)
+        exp_sim = torch.exp(sim)
+        numerator = (exp_sim * pos_mask).sum(dim=1)
+        denominator = exp_sim.sum(dim=1)
+        loss_sup = -torch.log((numerator + 1e-8) / (denominator + 1e-8))
+        loss_sup = loss_sup.mean()
+
+        # combine
+        loss_all.append(loss_info + sup_weight * loss_sup)
+
+    return torch.mean(torch.stack(loss_all))
+
+
+
+
+
+
 import torch
 import torch.nn.functional as F
 
