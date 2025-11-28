@@ -1,3 +1,26 @@
+def info_nce_loss_minibatch(z1, z2, batch_size=4096, tau=0.2):
+    N = z1.size(0)
+    loss_all = []
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+
+        z1_b = F.normalize(z1[start:end], dim=1)
+        z2_b = F.normalize(z2[start:end], dim=1)
+
+        # negatives chỉ trong batch → không OOM
+        sim = torch.matmul(z1_b, z2_b.T) / tau
+
+        labels = torch.arange(end - start, device=z1.device)
+
+        loss = F.cross_entropy(sim, labels)
+        loss_all.append(loss)
+
+    return torch.mean(torch.stack(loss_all))
+
+
+
+
 import torch
 import torch.nn.functional as F
 
