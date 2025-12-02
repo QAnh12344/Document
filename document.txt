@@ -1,3 +1,30 @@
+def supcon_loss_sampled(features, labels, temperature=0.07, num_negatives=64):
+    device = features.device
+    N, D = features.shape
+    loss = 0
+    for i in range(N):
+        anchor = features[i]
+        pos_mask = (labels == labels[i]).nonzero(as_tuple=True)[0]
+        pos_mask = pos_mask[pos_mask != i]  # loại chính nó
+        if len(pos_mask) == 0:
+            continue
+        pos_samples = features[pos_mask]
+        # random negatives
+        neg_mask = (labels != labels[i]).nonzero(as_tuple=True)[0]
+        neg_idx = torch.randperm(len(neg_mask))[:num_negatives]
+        neg_samples = features[neg_mask[neg_idx]]
+        logits_pos = torch.matmul(anchor, pos_samples.T) / temperature
+        logits_neg = torch.matmul(anchor, neg_samples.T) / temperature
+        logits = torch.cat([logits_pos, logits_neg])
+        labels_i = torch.zeros(len(logits))
+        labels_i[:len(pos_samples)] = 1
+        labels_i = labels_i.to(device)
+        loss += F.binary_cross_entropy_with_logits(logits, labels_i)
+    return loss / N
+
+
+
+
 def info_sup_contrastive_loss(z1, z2, y, tau=0.2, sup_weight=1.0, batch_size=2048):
     device = z1.device
     N = z1.size(0)
