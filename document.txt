@@ -1,3 +1,53 @@
+import torch
+import torchaudio
+import numpy as np
+from sklearn.cluster import KMeans
+from speechbrain.pretrained import EncoderClassifier
+import torch.hub
+
+# Load ECAPA (speaker embedding)
+embedder = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": "cpu"}
+)
+
+# Load VAD
+vad_model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad")
+(get_speech_timestamps, save_audio, read_audio,
+ VAD_iterator, collect_chunks) = utils
+
+# Load audio
+wav, sr = torchaudio.load("audio.wav")
+wav = wav.squeeze()
+if sr != 16000:
+    wav = torchaudio.functional.resample(wav, sr, 16000)
+    sr = 16000
+
+# 1) VAD tách thành các đoạn
+ts = get_speech_timestamps(wav, vad_model, sampling_rate=sr)
+
+segments = [wav[t['start']:t['end']] for t in ts]
+
+# 2) Lấy embedding người nói
+embs = []
+for seg in segments:
+    emb = embedder.encode_batch(seg.unsqueeze(0)).squeeze().numpy()
+    embs.append(emb)
+
+embs = np.vstack(embs)
+
+# 3) KMeans phân cụm (2 người nói)
+kmeans = KMeans(n_clusters=2)
+labels = kmeans.fit_predict(embs)
+
+# 4) Kết quả diarization
+for i, t in enumerate(ts):
+    print(f"{t['start']/sr:.2f} -> {t['end']/sr:.2f} | SPK_{labels[i]}")
+
+
+
+
+
 # app.py
 """
 Single-file FastAPI app:
