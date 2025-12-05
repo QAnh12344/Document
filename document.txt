@@ -1,6 +1,61 @@
 import torch
 import torchaudio
 import numpy as np
+from sklearn.mixture import BayesianGaussianMixture
+from speechbrain.pretrained import EncoderClassifier
+
+# === Load ECAPA (speaker embedding) ===
+embedder = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": "cpu"}
+)
+
+# === Load Silero VAD ===
+vad_model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad")
+(get_speech_timestamps, save_audio, read_audio, VAD_iterator, collect_chunks) = utils
+
+# === Load audio ===
+wav, sr = torchaudio.load("audio.wav")
+wav = wav.squeeze()
+if sr != 16000:
+    wav = torchaudio.functional.resample(wav, sr, 16000)
+    sr = 16000
+
+# === VAD: lấy các đoạn có tiếng nói ===
+timestamps = get_speech_timestamps(wav, vad_model, sampling_rate=sr)
+
+embs = []
+for t in timestamps:
+    seg = wav[t['start']:t['end']]
+    emb = embedder.encode_batch(seg.unsqueeze(0)).squeeze().numpy()
+    embs.append(emb)
+
+embs = np.vstack(embs)
+
+# === DPGMM: model tự tìm số người ===
+dpgmm = BayesianGaussianMixture(
+    n_components=30,
+    covariance_type="full",
+    weight_concentration_prior_type="dirichlet_process",
+    weight_concentration_prior=1e-3
+)
+
+dpgmm.fit(embs)
+labels = dpgmm.predict(embs)
+
+speakers = np.unique(labels)
+print("Detected speakers:", len(speakers))
+
+# === Print result ===
+for i, t in enumerate(timestamps):
+    print(f"{t['start']/sr:.2f} -> {t['end']/sr:.2f} | SPK_{labels[i]}")
+
+
+
+
+import torch
+import torchaudio
+import numpy as np
 from sklearn.cluster import KMeans
 from speechbrain.pretrained import EncoderClassifier
 import torch.hub
