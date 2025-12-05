@@ -1,3 +1,34 @@
+def merge_segments(segments, gap_threshold=0.5):
+    """
+    segments: list dict {"speaker": int, "start": float, "end": float}
+    gap_threshold: thời gian cho phép để merge (giây)
+    """
+    if not segments:
+        return []
+
+    segments = sorted(segments, key=lambda x: x["start"])
+
+    merged = [segments[0]]
+
+    for seg in segments[1:]:
+        last = merged[-1]
+
+        # cùng speaker
+        if seg["speaker"] == last["speaker"]:
+            # khoảng cách nhỏ -> merge
+            if seg["start"] - last["end"] <= gap_threshold:
+                last["end"] = seg["end"]
+                continue
+
+        # còn lại: segment mới
+        merged.append(seg)
+
+    return merged
+
+
+
+
+
 import torch
 import torchaudio
 import numpy as np
