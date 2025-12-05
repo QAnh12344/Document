@@ -1,3 +1,235 @@
+# app.py
+"""
+Single-file FastAPI app:
+ - Upload audio -> convert -> faster-whisper ASR -> pyannote diarization -> merge -> JSON response
+ - Requires: ffmpeg installed system-wide, HuggingFace token exported for pyannote
+ - Usage: uvicorn app:app --host 0.0.0.0 --port 8000
+"""
+
+import os
+import uuid
+import shutil
+import tempfile
+import math
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from pydub import AudioSegment
+import soundfile as sf
+import numpy as np
+
+# === ASR: faster-whisper ===
+try:
+    from faster_whisper import WhisperModel
+except Exception as e:
+    raise ImportError("Please install faster-whisper. pip install faster-whisper") from e
+
+# === Diarization: pyannote ===
+try:
+    from pyannote.audio import Pipeline
+except Exception as e:
+    raise ImportError("Please install pyannote.audio and set HUGGINGFACE token. pip install pyannote.audio") from e
+
+# === CONFIG ===
+# Model choice: "small", "medium", "large-v2", etc.
+MODEL_NAME = os.environ.get("WHISPER_MODEL", "medium")
+# Device: "cuda" or "cpu"
+DEVICE = os.environ.get("DEVICE", "cuda")
+# compute type for faster-whisper (float16 / int8 / float32)
+COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16")
+
+# Pyannote pipeline id (change if needed)
+PYANNOTE_PIPELINE_ID = os.environ.get("PYANNOTE_PIPELINE_ID", "pyannote/speaker-diarization")
+
+# Safety limits
+MAX_AUDIO_SECONDS = int(os.environ.get("MAX_AUDIO_SECONDS", 60 * 60))  # default 1 hour
+
+# Create simple data dir
+BASE_DIR = os.path.abspath(os.getcwd())
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+app = FastAPI(title="ASR + Diarization (single-file)")
+
+# === Initialize models once ===
+print(f"[startup] Loading WhisperModel {MODEL_NAME} on {DEVICE} (compute_type={COMPUTE_TYPE}) ...")
+whisper_model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+print("[startup] WhisperModel loaded.")
+
+print(f"[startup] Loading pyannote pipeline '{PYANNOTE_PIPELINE_ID}' ...")
+# Pyannote needs HF token via env var: HUGGINGFACE_TOKEN or PYANNOTE_AUDIO_AUTH_TOKEN
+hf_token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("PYANNOTE_AUDIO_AUTH_TOKEN")
+if not hf_token:
+    print("WARNING: No Hugging Face token found in HUGGINGFACE_TOKEN / PYANNOTE_AUDIO_AUTH_TOKEN. Pyannote.from_pretrained may fail.")
+pipeline = Pipeline.from_pretrained(PYANNOTE_PIPELINE_ID, use_auth_token=hf_token)
+print("[startup] Pyannote pipeline loaded.")
+
+
+# === Utility: audio conversion ===
+def ensure_wav_16k_mono(src_path: str, dst_path: str) -> str:
+    """
+    Convert any audio file to 16kHz WAV mono using pydub (ffmpeg required).
+    Returns dst_path.
+    """
+    audio = AudioSegment.from_file(src_path)
+    audio = audio.set_frame_rate(16000).set_channels(1)
+    audio.export(dst_path, format="wav")
+    return dst_path
+
+def get_audio_duration_seconds(path: str) -> float:
+    audio = AudioSegment.from_file(path)
+    return len(audio) / 1000.0
+
+# === ASR wrapper (segment-level) ===
+def transcribe_segments(audio_path: str, language: str = "vi"):
+    """
+    Use faster-whisper to transcribe.
+    Returns list of dicts: [{'start': float,'end': float,'text': str}, ...]
+    """
+    segments_out = []
+    # faster-whisper returns generator of Segment objects plus info
+    segments, info = whisper_model.transcribe(audio_path, language=language, beam_size=5)
+    for seg in segments:
+        segments_out.append({
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": seg.text.strip()
+        })
+    return segments_out
+
+# === Diarization wrapper ===
+def run_diarization(audio_path: str):
+    """
+    Run pyannote diarization pipeline.
+    Returns list of {'start': float, 'end': float, 'speaker': str}
+    """
+    diar = pipeline(audio_path)
+    segments = []
+    # diar.itertracks yields (segment, track, label)
+    for segment, _, label in diar.itertracks(yield_label=True):
+        segments.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "speaker": label
+        })
+    return segments
+
+# === Merge logic ===
+def assign_speaker_to_segment(asr_seg: dict, diar_segments: List[dict]) -> str:
+    """
+    Assign speaker label to an ASR segment using midpoint overlap.
+    Fallback: nearest diarization segment by midpoint distance.
+    """
+    midpoint = (asr_seg["start"] + asr_seg["end"]) / 2.0
+    # Direct cover
+    for d in diar_segments:
+        if d["start"] <= midpoint <= d["end"]:
+            return d["speaker"]
+    # fallback nearest by distance
+    if diar_segments:
+        nearest = min(diar_segments, key=lambda x: abs((x["start"] + x["end"]) / 2.0 - midpoint))
+        return nearest["speaker"]
+    return "SPEAKER_00"
+
+def merge_asr_and_diar(asr_segments: List[dict], diar_segments: List[dict], join_gap: float = 1.0):
+    """
+    Merge ASR segments with speaker labels, then join adjacent segments by same speaker.
+    join_gap: max gap in seconds to join adjacent segments from same speaker.
+    Returns grouped list: [{'speaker','start','end','text'}...]
+    """
+    merged = []
+    for s in asr_segments:
+        spk = assign_speaker_to_segment(s, diar_segments)
+        merged.append({
+            "speaker": spk,
+            "start": s["start"],
+            "end": s["end"],
+            "text": s["text"]
+        })
+    # Sort by start
+    merged.sort(key=lambda x: x["start"])
+    # Group continuous segments by speaker
+    if not merged:
+        return []
+    grouped = []
+    cur = merged[0].copy()
+    for seg in merged[1:]:
+        if seg["speaker"] == cur["speaker"] and seg["start"] - cur["end"] <= join_gap:
+            # extend
+            cur["end"] = seg["end"]
+            cur["text"] = cur["text"] + " " + seg["text"]
+        else:
+            grouped.append(cur)
+            cur = seg.copy()
+    grouped.append(cur)
+    return grouped
+
+# === FastAPI endpoints ===
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...), language: str = "vi"):
+    """
+    Upload audio file -> return JSON with 'transcript' (speaker segments) and duration_seconds.
+    """
+    uid = uuid.uuid4().hex[:8]
+    tmp_dir = tempfile.mkdtemp(prefix=f"asr_{uid}_", dir=DATA_DIR)
+    orig_path = os.path.join(tmp_dir, f"orig_{file.filename}")
+    try:
+        # save uploaded file
+        with open(orig_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+
+    wav_path = os.path.join(tmp_dir, f"{uid}.wav")
+    try:
+        ensure_wav_16k_mono(orig_path, wav_path)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Audio convert failed (ffmpeg required): {e}")
+
+    # duration check
+    duration = get_audio_duration_seconds(wav_path)
+    if duration > MAX_AUDIO_SECONDS:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Audio too long ({duration}s). Max allowed {MAX_AUDIO_SECONDS}s.")
+
+    # 1) ASR
+    try:
+        asr_segments = transcribe_segments(wav_path, language=language)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"ASR failed: {e}")
+
+    # 2) Diarization
+    try:
+        diar_segments = run_diarization(wav_path)
+    except Exception as e:
+        # If diarization fails, we still can return ASR without speakers
+        diar_segments = []
+        print(f"[warn] Diarization failed: {e}")
+
+    # 3) Merge
+    transcript = merge_asr_and_diar(asr_segments, diar_segments)
+
+    # clean temp (keep wav if you want; here we remove everything)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return JSONResponse({"transcript": transcript, "duration_seconds": duration})
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": MODEL_NAME, "device": DEVICE}
+
+# === If run directly ===
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting uvicorn at http://0.0.0.0:8000 ...")
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
