@@ -1,3 +1,25 @@
+from phowhisper import PhoWhisper
+
+model = PhoWhisper("small")
+
+result = model.transcribe(
+    "audio.wav",
+    language="vi",
+    beam_size=5,
+    best_of=5,
+    split_on_word=False,
+    max_context_len=4096,
+    chunk_length=30,      # QUAN TRỌNG
+    stride_length=5,      # QUAN TRỌNG
+    suppress_blank=True
+)
+
+for seg in result["segments"]:
+    print(seg["start"], seg["end"], seg["text"])
+
+
+
+
 def merge_segments(segments, gap_threshold=0.5):
     """
     segments: list dict {"speaker": int, "start": float, "end": float}
