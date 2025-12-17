@@ -1,3 +1,15 @@
+for i, chunk in enumerate(pd.read_csv(csv_file, chunksize=chunksize, dtype={'label':'category'})):
+    chunk.to_parquet(f"chunk_{i}.parquet")
+
+# Đọc lại tất cả chunk bằng pandas.concat
+import glob
+all_chunks = [pd.read_parquet(f) for f in glob.glob("chunk_*.parquet")]
+df = pd.concat(all_chunks, ignore_index=True)
+
+
+
+
+
 import os
 import pandas as pd
 
