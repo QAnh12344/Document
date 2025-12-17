@@ -1,3 +1,19 @@
+import pyarrow.parquet as pq
+
+# đọc file Parquet
+parquet_file = "dataset.parquet"
+table = pq.ParquetFile(parquet_file)
+
+# lặp theo batch (chunk)
+batch_size = 500_000
+for batch in table.iter_batches(batch_size=batch_size):
+    df_chunk = batch.to_pandas()  # chuyển batch thành pandas DataFrame
+    # xử lý df_chunk ở đây
+    print(df_chunk.shape)
+
+
+
+
 for i, chunk in enumerate(pd.read_csv(csv_file, chunksize=chunksize, dtype={'label':'category'})):
     chunk.to_parquet(f"chunk_{i}.parquet")
 
