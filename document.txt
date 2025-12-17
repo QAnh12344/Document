@@ -1,3 +1,32 @@
+import os
+import pandas as pd
+
+folder_path = "path/to/csv_folder"
+csv_files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
+
+combined_df = pd.DataFrame()
+
+for i, file in enumerate(csv_files):
+    file_path = os.path.join(folder_path, file)
+    # File đầu tiên giữ header, các file sau bỏ header
+    df = pd.read_csv(file_path, header=0 if i==0 else None)
+    
+    # Nếu bỏ header, gán lại tên cột từ file đầu tiên
+    if i > 0:
+        df.columns = combined_df.columns
+
+    combined_df = pd.concat([combined_df, df], ignore_index=True)
+
+# Ghi ra CSV với index được reset từ 0
+combined_df.to_csv("combined.csv", index=False)
+
+print("Đã gộp xong, chỉ giữ header file đầu tiên, index đã format lại")
+
+
+
+
+
+
 from phowhisper import PhoWhisper
 
 model = PhoWhisper("small")
