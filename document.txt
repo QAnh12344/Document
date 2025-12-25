@@ -4,6 +4,146 @@ import librosa
 import torch
 import onnxruntime as ort
 
+from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+from transformers import WhisperProcessor
+
+
+# =====================
+# CONFIG
+# =====================
+ONNX_DIR = "./whisper_small_onnx"
+WAV_SCP = "./wav.scp"
+
+LANGUAGE = "vi"
+TASK = "transcribe"
+
+MAX_NEW_TOKENS = 64
+PHYSICAL_CORES = 8   # core vật lý
+
+
+# =====================
+# ONNX Runtime options
+# =====================
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = PHYSICAL_CORES
+sess_options.inter_op_num_threads = 1
+sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+sess_options.enable_mem_pattern = False
+sess_options.enable_cpu_mem_arena = True
+
+
+# =====================
+# Load ONNX model
+# =====================
+model = ORTModelForSpeechSeq2Seq.from_pretrained(
+    ONNX_DIR,
+    provider="CPUExecutionProvider",
+    session_options=sess_options
+)
+processor = WhisperProcessor.from_pretrained(ONNX_DIR)
+
+
+# =====================
+# Read wav.scp (PATH ONLY)
+# =====================
+wav_paths = []
+with open(WAV_SCP, "r", encoding="utf-8") as f:
+    for line in f:
+        p = line.strip()
+        if p:
+            wav_paths.append(p)
+
+assert len(wav_paths) > 0, "wav.scp rỗng"
+
+
+# =====================
+# Warm-up (KHÔNG đo)
+# =====================
+warm_audio, _ = librosa.load(wav_paths[0], sr=16000)
+warm_inputs = processor(
+    warm_audio,
+    sampling_rate=16000,
+    return_tensors="pt"
+)
+
+with torch.no_grad():
+    _ = model.generate(
+        warm_inputs["input_features"],
+        max_new_tokens=16,
+        num_beams=1,
+        do_sample=False
+    )
+
+
+# =====================
+# REAL BENCHMARK
+# =====================
+total_audio_sec = 0.0
+total_infer_time = 0.0
+
+results = []
+
+for wav_path in wav_paths:
+    audio, _ = librosa.load(wav_path, sr=16000)
+    duration = len(audio) / 16000
+    total_audio_sec += duration
+
+    inputs = processor(
+        audio,
+        sampling_rate=16000,
+        return_tensors="pt"
+    )
+
+    start = time.time()
+    with torch.no_grad():
+        generated_ids = model.generate(
+            inputs["input_features"],
+            max_new_tokens=MAX_NEW_TOKENS,
+            num_beams=1,          # ❗ bắt buộc
+            do_sample=False,
+            temperature=0.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            language=LANGUAGE,
+            task=TASK
+        )
+    infer_time = time.time() - start
+    total_infer_time += infer_time
+
+    text = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True
+    )[0]
+
+    utt_id = os.path.basename(wav_path)
+    results.append((utt_id, duration, infer_time, text))
+
+
+# =====================
+# REPORT
+# =====================
+rtf = total_infer_time / total_audio_sec
+
+print("=" * 60)
+print(f"TOTAL FILES       : {len(results)}")
+print(f"TOTAL AUDIO (sec) : {total_audio_sec:.2f}")
+print(f"TOTAL INFER (sec) : {total_infer_time:.2f}")
+print(f"RTF (CPU)         : {rtf:.3f}")
+print("=" * 60)
+
+for utt, dur, inf, _ in results:
+    print(f"{utt:20s} {dur:6.2f}s → {inf:6.2f}s")
+
+
+
+
+import os
+import time
+import librosa
+import torch
+import onnxruntime as ort
+
 from transformers import WhisperProcessor
 from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
 
