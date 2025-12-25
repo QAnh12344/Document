@@ -1,3 +1,116 @@
+import time
+import librosa
+import torch
+import onnxruntime as ort
+
+from transformers import WhisperProcessor
+from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+
+
+# =============================
+# CONFIG
+# =============================
+MODEL_NAME = "openai/whisper-small"
+AUDIO_PATH = "test.wav"
+LANGUAGE = "vi"
+MAX_NEW_TOKENS = 128
+CPU_THREADS = 8   # chỉnh theo số core máy bạn
+
+
+# =============================
+# ONNX Runtime CPU optimization
+# =============================
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = CPU_THREADS
+sess_options.inter_op_num_threads = 1
+sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+
+# =============================
+# Load model (export ONNX nếu chưa có)
+# =============================
+model = ORTModelForSpeechSeq2Seq.from_pretrained(
+    MODEL_NAME,
+    export=True,                      # chỉ export ONNX lần đầu
+    provider="CPUExecutionProvider",
+    session_options=sess_options
+)
+
+processor = WhisperProcessor.from_pretrained(MODEL_NAME)
+
+
+# =============================
+# Load & preprocess audio
+# =============================
+audio, sr = librosa.load(AUDIO_PATH, sr=16000)
+
+# giới hạn 30s cho ổn định
+audio = audio[:30 * 16000]
+
+inputs = processor(
+    audio,
+    sampling_rate=16000,
+    return_tensors="pt"
+)
+
+
+# =============================
+# Warm-up (rất quan trọng cho benchmark)
+# =============================
+with torch.no_grad():
+    _ = model.generate(
+        inputs["input_features"],
+        max_new_tokens=32
+    )
+
+
+# =============================
+# Inference
+# =============================
+start = time.time()
+
+with torch.no_grad():
+    generated_ids = model.generate(
+        inputs["input_features"],
+        max_new_tokens=MAX_NEW_TOKENS,
+        language=LANGUAGE,
+        task="transcribe",
+        do_sample=False
+    )
+
+end = time.time()
+
+
+# =============================
+# Decode
+# =============================
+text = processor.batch_decode(
+    generated_ids,
+    skip_special_tokens=True
+)[0]
+
+
+# =============================
+# Output
+# =============================
+audio_duration = len(audio) / 16000
+infer_time = end - start
+rtf = infer_time / audio_duration
+
+print("=" * 50)
+print("TRANSCRIPTION:")
+print(text)
+print("-" * 50)
+print(f"Audio length  : {audio_duration:.2f}s")
+print(f"Infer time    : {infer_time:.2f}s")
+print(f"RTF (CPU)     : {rtf:.3f}")
+print("=" * 50)
+
+
+
+
+
 import pyarrow.parquet as pq
 
 # đọc file Parquet
