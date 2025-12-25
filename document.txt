@@ -1,3 +1,142 @@
+import os
+import time
+import librosa
+import torch
+import onnxruntime as ort
+
+from transformers import WhisperProcessor
+from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+
+
+# =========================
+# CONFIG – TỐI ƯU
+# =========================
+ONNX_DIR = "./whisper_small_onnx"
+AUDIO_PATH = "test.wav"
+
+LANGUAGE = "vi"
+TASK = "transcribe"
+
+MAX_NEW_TOKENS = 64        # CỰC KỲ QUAN TRỌNG
+CHUNK_SECONDS = 5          # chunk ngắn = nhanh hơn
+SAMPLE_RATE = 16000
+
+PHYSICAL_CORES = 8         # ❗ dùng core vật lý, KHÔNG dùng thread
+WARMUP = True
+
+
+# =========================
+# ONNX Runtime tối ưu CPU
+# =========================
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = PHYSICAL_CORES
+sess_options.inter_op_num_threads = 1
+sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+sess_options.enable_mem_pattern = False
+sess_options.enable_cpu_mem_arena = True
+
+
+# =========================
+# Load ONNX model
+# =========================
+model = ORTModelForSpeechSeq2Seq.from_pretrained(
+    ONNX_DIR,
+    provider="CPUExecutionProvider",
+    session_options=sess_options
+)
+
+processor = WhisperProcessor.from_pretrained(ONNX_DIR)
+
+
+# =========================
+# Load audio
+# =========================
+audio, _ = librosa.load(AUDIO_PATH, sr=SAMPLE_RATE)
+audio_len = len(audio) / SAMPLE_RATE
+
+
+# =========================
+# Chunking (ĐÒN MẠNH NHẤT)
+# =========================
+def chunk_audio(audio, chunk_sec):
+    chunk_size = int(chunk_sec * SAMPLE_RATE)
+    return [audio[i:i + chunk_size] for i in range(0, len(audio), chunk_size)]
+
+
+chunks = chunk_audio(audio, CHUNK_SECONDS)
+
+
+# =========================
+# Warm-up (rất quan trọng)
+# =========================
+if WARMUP:
+    dummy = chunks[0]
+    inputs = processor(dummy, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+    with torch.no_grad():
+        _ = model.generate(
+            inputs["input_features"],
+            max_new_tokens=16,
+            num_beams=1,
+            do_sample=False
+        )
+
+
+# =========================
+# Inference
+# =========================
+start = time.time()
+texts = []
+
+for chunk in chunks:
+    inputs = processor(
+        chunk,
+        sampling_rate=SAMPLE_RATE,
+        return_tensors="pt"
+    )
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            inputs["input_features"],
+            max_new_tokens=MAX_NEW_TOKENS,
+            num_beams=1,          # ❗ bắt buộc
+            do_sample=False,
+            temperature=0.0,
+            no_repeat_ngram_size=0,
+            repetition_penalty=1.0,
+            language=LANGUAGE,
+            task=TASK
+        )
+
+    text = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True
+    )[0]
+
+    texts.append(text.strip())
+
+end = time.time()
+
+
+# =========================
+# Output
+# =========================
+final_text = " ".join(texts)
+infer_time = end - start
+rtf = infer_time / audio_len
+
+print("=" * 60)
+print("TRANSCRIPTION:")
+print(final_text)
+print("-" * 60)
+print(f"Audio length : {audio_len:.2f}s")
+print(f"Infer time   : {infer_time:.2f}s")
+print(f"RTF (CPU)    : {rtf:.3f}")
+print("=" * 60)
+
+
+
+
 import time
 import librosa
 import torch
