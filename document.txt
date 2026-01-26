@@ -1,3 +1,226 @@
+import os
+import torch
+import pandas as pd
+import numpy as np
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from sklearn.metrics import (
+    accuracy_score, f1_score, classification_report,
+    precision_recall_fscore_support, confusion_matrix
+)
+from tqdm import tqdm
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# ======================================================
+# 1. CONFIG
+# ======================================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "state-spaces/mamba-130m"
+MAX_LEN = 128
+BATCH_SIZE = 32
+LR = 3e-6
+EPOCHS = 10
+NUM_CLASSES = 3
+
+# ======================================================
+# 2. LOAD DATA
+# ======================================================
+def load_vsfc_data(folder):
+    with open(os.path.join(folder, "sents.txt"), encoding="utf-8") as f:
+        texts = [l.strip() for l in f]
+    with open(os.path.join(folder, "sentiments.txt")) as f:
+        labels = [int(l.strip()) for l in f]
+    return pd.DataFrame({"text": texts, "label": labels})
+
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+tokenizer.pad_token = tokenizer.eos_token
+
+class VSFCDataset(Dataset):
+    def __init__(self, df):
+        self.texts = df.text.values
+        self.labels = df.label.values
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        enc = tokenizer(
+            self.texts[idx],
+            max_length=MAX_LEN,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+
+df_train = load_vsfc_data("train")
+df_dev   = load_vsfc_data("dev")
+df_test  = load_vsfc_data("test")
+
+train_loader = DataLoader(VSFCDataset(df_train), BATCH_SIZE, shuffle=True)
+dev_loader   = DataLoader(VSFCDataset(df_dev), BATCH_SIZE)
+test_loader  = DataLoader(VSFCDataset(df_test), BATCH_SIZE)
+
+# ======================================================
+# 3. MODEL
+# ======================================================
+class MambaSupCon(nn.Module):
+    def __init__(self, model_name):
+        super().__init__()
+        self.mamba = MambaLMHeadModel.from_pretrained(model_name)
+        d_model = self.mamba.config.d_model
+
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(d_model, NUM_CLASSES)
+        self.projector = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+
+    def forward(self, input_ids):
+        hidden = self.mamba.backbone(input_ids)  # (B, L, D)
+
+        # mask-aware mean pooling
+        mask = (input_ids != tokenizer.pad_token_id).unsqueeze(-1)
+        hidden = hidden * mask
+        pooled = hidden.sum(1) / mask.sum(1).clamp(min=1)
+
+        logits = self.classifier(self.dropout(pooled))
+        proj   = self.projector(pooled)
+        return logits, proj
+
+# ======================================================
+# 4. SAFE SUPCON LOSS
+# ======================================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temp = temperature
+
+    def forward(self, feats, labels):
+        feats = nn.functional.normalize(feats, dim=1)
+        device = feats.device
+        bsz = feats.size(0)
+
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+
+        logits = torch.matmul(feats, feats.T) / self.temp
+        logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
+
+        eye = torch.eye(bsz, device=device)
+        logits_mask = 1 - eye
+        mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+        denom = mask.sum(1)
+        valid = denom > 0
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        loss = -(mask * log_prob).sum(1)[valid] / denom[valid]
+        return loss.mean()
+
+# ======================================================
+# 5. TRAINING
+# ======================================================
+model = MambaSupCon(MODEL_NAME).to(DEVICE)
+
+# freeze backbone first (OPTIONAL but stable)
+for p in model.mamba.parameters():
+    p.requires_grad = False
+
+optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+
+class_weights = torch.tensor([1.0, 8.0, 1.0]).to(DEVICE)
+criterion_cls = nn.CrossEntropyLoss(weight=class_weights)
+criterion_con = SupConLoss()
+
+best_f1 = 0
+print("🚀 Start training...")
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        ids = batch["input_ids"].to(DEVICE)
+        labels = batch["labels"].to(DEVICE)
+
+        optimizer.zero_grad()
+        logits, proj = model(ids)
+
+        loss_cls = criterion_cls(logits, labels)
+        loss_con = criterion_con(proj, labels)
+        loss = 0.7 * loss_cls + 0.3 * loss_con
+
+        if torch.isnan(loss):
+            print("⚠️ NaN skipped")
+            continue
+
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    # validation
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for b in dev_loader:
+            l, _ = model(b["input_ids"].to(DEVICE))
+            y_pred.extend(torch.argmax(l, 1).cpu().numpy())
+            y_true.extend(b["labels"].numpy())
+
+    f1 = f1_score(y_true, y_pred, average="macro")
+    print(f"Loss: {total_loss/len(train_loader):.4f} | Val F1: {f1:.4f}")
+
+    if f1 > best_f1:
+        best_f1 = f1
+        torch.save(model.state_dict(), "best_mamba_supcon.pt")
+
+# ======================================================
+# 6. TEST
+# ======================================================
+model.load_state_dict(torch.load("best_mamba_supcon.pt"))
+model.eval()
+
+preds = []
+with torch.no_grad():
+    for b in test_loader:
+        l, _ = model(b["input_ids"].to(DEVICE))
+        preds.extend(torch.argmax(l, 1).cpu().numpy())
+
+y_true = df_test.label.values
+acc = accuracy_score(y_true, preds)
+p, r, f1, _ = precision_recall_fscore_support(y_true, preds, average="macro")
+
+print("="*60)
+print(f"Accuracy: {acc*100:.2f}%")
+print(f"Macro P/R/F1: {p*100:.2f} / {r*100:.2f} / {f1*100:.2f}")
+print("="*60)
+print(classification_report(y_true, preds, target_names=["Neg", "Neu", "Pos"]))
+
+cm = confusion_matrix(y_true, preds)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Oranges",
+            xticklabels=["Neg", "Neu", "Pos"],
+            yticklabels=["Neg", "Neu", "Pos"])
+plt.show()
+
+
+
+
+
+
+
 import matplotlib.pyplot as plt
 import numpy as np
 
