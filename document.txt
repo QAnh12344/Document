@@ -1,3 +1,111 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import random
+
+# ===================== FAKE DATA =====================
+def fake_data(num_samples=100):
+    mels, tokens = [], []
+    for _ in range(num_samples):
+        T_mel = random.randint(200, 600)
+        T_tok = random.randint(10, 50)
+        mels.append(torch.randn(T_mel, 80))            # (T_mel, 80)
+        tokens.append(torch.randint(1, 100, (T_tok,))) # vocab=100, 0=PAD
+    return mels, tokens
+
+# ===================== DATASET =====================
+class SpeechDataset(Dataset):
+    def __init__(self, mels, tokens):
+        self.mels = mels
+        self.tokens = tokens
+
+    def __len__(self):
+        return len(self.mels)
+
+    def __getitem__(self, idx):
+        return self.mels[idx], self.tokens[idx]
+
+# ===================== COLLATE =====================
+def collate_fn(batch):
+    mels, tokens = zip(*batch)
+    B = len(batch)
+
+    T_mel_max = max(m.shape[0] for m in mels)
+    T_tok_max = max(len(t) for t in tokens)
+
+    mel_batch = torch.zeros(B, T_mel_max, 80)
+    mel_mask  = torch.zeros(B, T_mel_max)
+    tok_batch = torch.zeros(B, T_tok_max, dtype=torch.long)
+    tok_mask  = torch.zeros(B, T_tok_max)
+
+    for i, (m, t) in enumerate(zip(mels, tokens)):
+        mel_batch[i, :m.shape[0]] = m
+        mel_mask[i, :m.shape[0]] = 1
+        tok_batch[i, :len(t)] = t
+        tok_mask[i, :len(t)] = 1
+
+    return mel_batch, tok_batch, mel_mask, tok_mask
+
+# ===================== MODEL =====================
+class SimpleASR(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(80, 256, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(512, 100)
+
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        return self.fc(x)
+
+# ===================== MAIN =====================
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    mels, tokens = fake_data(200)
+    dataset = SpeechDataset(mels, tokens)
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+
+    model = SimpleASR().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    for epoch in range(5):
+        total_loss = 0
+        for mel, tok, mel_mask, tok_mask in loader:
+            mel, tok, tok_mask = mel.to(device), tok.to(device), tok_mask.to(device)
+
+            logits = model(mel)               # (B, T_mel, vocab)
+            B, T, V = logits.shape
+
+            tok = tok[:, :T]
+            tok_mask = tok_mask[:, :T]
+
+            loss = criterion(
+                logits.reshape(B*T, V),
+                tok.reshape(B*T)
+            )
+            mask = tok_mask.reshape(B*T)
+            loss = (loss * mask).sum() / mask.sum()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch} | loss = {total_loss:.4f}")
+
+    mel, tok, mel_mask, tok_mask = next(iter(loader))
+    print(mel.shape, tok.shape, mel_mask.shape, tok_mask.shape)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
 import os
 import torch
 import pandas as pd
