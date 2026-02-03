@@ -1,3 +1,151 @@
+# ============================================
+# MAMBA SSM – VIETNAMESE CONTINUED PRETRAINING
+# WITH EXPLICIT LABEL & LOSS (DDP)
+# ============================================
+
+import os
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils.rnn import pad_sequence
+
+from transformers import AutoTokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+# ---------------- CONFIG ----------------
+TEXT_PATH = "corpus_vi.txt"
+SEQ_LEN = 2048
+BATCH_SIZE = 2        # per GPU
+EPOCHS = 1
+LR = 1e-4
+
+# ---------------- DDP INIT ----------------
+dist.init_process_group("nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+device = torch.device("cuda", local_rank)
+
+# ---------------- TOKENIZER ----------------
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+tokenizer.pad_token = tokenizer.eos_token
+PAD_ID = tokenizer.pad_token_id
+VOCAB_SIZE = tokenizer.vocab_size
+
+# ---------------- DATASET ----------------
+class VietnameseLMDataset(Dataset):
+    def __init__(self, path, tokenizer, seq_len):
+        with open(path, "r", encoding="utf8") as f:
+            text = f.read()
+
+        ids = tokenizer.encode(text)
+        self.samples = []
+
+        for i in range(0, len(ids) - seq_len, seq_len):
+            # +1 để shift label
+            self.samples.append(
+                torch.tensor(ids[i:i + seq_len + 1], dtype=torch.long)
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def collate_fn(batch):
+    # batch: List[(T+1)]
+    batch = pad_sequence(batch, batch_first=True, padding_value=PAD_ID)
+
+    # x0..x(n-1)
+    input_ids = batch[:, :-1]
+
+    # x1..xn
+    labels = batch[:, 1:].clone()
+    labels[labels == PAD_ID] = -100
+
+    return input_ids, labels
+
+# ---------------- LOAD MODEL ----------------
+model = MambaLMHeadModel.from_pretrained(
+    "state-spaces/mamba-130m",
+    device=device,
+    dtype=torch.float16
+)
+model.train()
+
+model = DDP(model, device_ids=[local_rank])
+
+# ---------------- DATALOADER ----------------
+dataset = VietnameseLMDataset(TEXT_PATH, tokenizer, SEQ_LEN)
+sampler = DistributedSampler(dataset, shuffle=True)
+
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    sampler=sampler,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=True
+)
+
+# ---------------- OPTIMIZER ----------------
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    betas=(0.9, 0.95),
+    weight_decay=0.1
+)
+
+# ---------------- TRAIN LOOP ----------------
+for epoch in range(EPOCHS):
+    sampler.set_epoch(epoch)
+
+    for step, (input_ids, labels) in enumerate(loader):
+        input_ids = input_ids.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # ---- FORWARD (NO LOSS INSIDE MODEL) ----
+        outputs = model.module(input_ids=input_ids)
+        logits = outputs.logits        # (B, T, V)
+
+        # ---- EXPLICIT LOSS ----
+        loss = F.cross_entropy(
+            logits.view(-1, VOCAB_SIZE),
+            labels.view(-1),
+            ignore_index=-100
+        )
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step % 50 == 0 and local_rank == 0:
+            print(
+                f"[Epoch {epoch} | Step {step}] "
+                f"Loss: {loss.item():.4f}"
+            )
+
+# ---------------- SAVE ----------------
+if local_rank == 0:
+    model.module.save_pretrained("vimamba-130m-vi")
+    tokenizer.save_pretrained("vimamba-130m-vi")
+
+dist.destroy_process_group()
+
+
+
+
+
+
+
+
+
+
+
 # ============================
 # DISTRIBUTED VIETNAMESE CONTINUED PRETRAINING FOR MAMBA
 # ============================
