@@ -1,3 +1,203 @@
+# =====================================================
+# VIETNAMESE CONTINUED PRETRAINING FOR MAMBA-130M
+# WITH TRAIN + VALID, DDP, AMP, EXPLICIT LOSS
+# =====================================================
+
+import os
+import math
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils.rnn import pad_sequence
+
+from transformers import AutoTokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+# ---------------- CONFIG ----------------
+TEXT_PATH = "corpus_vi.txt"   # text tiếng Việt
+SEQ_LEN = 2048
+BATCH_SIZE = 2               # per GPU
+EPOCHS = 1
+LR = 2e-5                    # an toàn cho continued pretrain
+GRAD_CLIP = 0.5
+VALID_RATIO = 0.05
+
+# ---------------- DDP INIT ----------------
+dist.init_process_group("nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+device = torch.device("cuda", local_rank)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# ---------------- TOKENIZER ----------------
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+tokenizer.pad_token = tokenizer.eos_token
+PAD_ID = tokenizer.pad_token_id
+
+# ---------------- DATASET ----------------
+class LMDataset(Dataset):
+    def __init__(self, text, tokenizer, seq_len):
+        ids = tokenizer.encode(text)
+        self.samples = []
+        for i in range(0, len(ids) - seq_len, seq_len):
+            self.samples.append(
+                torch.tensor(ids[i:i + seq_len + 1], dtype=torch.long)
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def collate_fn(batch):
+    batch = pad_sequence(batch, batch_first=True, padding_value=PAD_ID)
+
+    input_ids = batch[:, :-1]
+    labels = batch[:, 1:].clone()
+    labels[labels == PAD_ID] = -100
+
+    return input_ids, labels
+
+# ---------------- LOAD DATA ----------------
+with open(TEXT_PATH, encoding="utf8") as f:
+    text = f.read()
+
+split = int(len(text) * (1 - VALID_RATIO))
+train_text = text[:split]
+valid_text = text[split:]
+
+train_ds = LMDataset(train_text, tokenizer, SEQ_LEN)
+valid_ds = LMDataset(valid_text, tokenizer, SEQ_LEN)
+
+train_sampler = DistributedSampler(train_ds, shuffle=True)
+valid_sampler = DistributedSampler(valid_ds, shuffle=False)
+
+train_loader = DataLoader(
+    train_ds,
+    batch_size=BATCH_SIZE,
+    sampler=train_sampler,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=True
+)
+
+valid_loader = DataLoader(
+    valid_ds,
+    batch_size=BATCH_SIZE,
+    sampler=valid_sampler,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=True
+)
+
+# ---------------- MODEL ----------------
+model = MambaLMHeadModel.from_pretrained(
+    "state-spaces/mamba-130m",
+    device=device,
+    dtype=torch.float16
+)
+
+# resize cho chắc chắn tokenizer ↔ model khớp
+model.resize_token_embeddings(len(tokenizer))
+model.train()
+
+model = DDP(model, device_ids=[local_rank])
+
+# ---------------- OPTIMIZER + AMP ----------------
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    betas=(0.9, 0.95),
+    weight_decay=0.1
+)
+
+scaler = torch.cuda.amp.GradScaler()
+
+# ---------------- VALIDATION ----------------
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    for input_ids, labels in valid_loader:
+        input_ids = input_ids.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        logits = model.module(input_ids).logits
+        vocab = logits.size(-1)
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, vocab),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum"
+        )
+
+        total_loss += loss.item()
+        total_tokens += (labels != -100).sum().item()
+
+    model.train()
+    return total_loss / total_tokens
+
+# ---------------- TRAIN LOOP ----------------
+for epoch in range(EPOCHS):
+    train_sampler.set_epoch(epoch)
+
+    for step, (input_ids, labels) in enumerate(train_loader):
+        input_ids = input_ids.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # tránh batch toàn -100
+        if (labels != -100).sum() == 0:
+            continue
+
+        with torch.cuda.amp.autocast():
+            logits = model(input_ids).logits
+            vocab = logits.size(-1)
+
+            loss = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                labels.reshape(-1),
+                ignore_index=-100
+            )
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+        if step % 50 == 0 and local_rank == 0:
+            print(f"[Epoch {epoch} | Step {step}] Train loss: {loss.item():.4f}")
+
+        if step % 500 == 0 and step > 0 and local_rank == 0:
+            val_loss = evaluate()
+            ppl = math.exp(val_loss)
+            print(f"[VALID] loss={val_loss:.4f} | ppl={ppl:.2f}")
+
+# ---------------- SAVE ----------------
+if local_rank == 0:
+    model.module.save_pretrained("vimamba-130m-vi")
+    tokenizer.save_pretrained("vimamba-130m-vi")
+
+dist.destroy_process_group()
+
+
+
+
+
+
+
+
+
 # ============================================
 # MAMBA SSM – VIETNAMESE CONTINUED PRETRAINING
 # WITH EXPLICIT LABEL & LOSS (DDP)
