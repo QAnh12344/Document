@@ -1,3 +1,62 @@
+Bóng đá chuyên nghiệp - bóng đá
+Bóng đá phong trào - thể thao
+Bóng rổ học đường - bóng rổ
+Bóng rổ chuyên nghiệp - bóng rổ
+Bóng chuyền trong nhà - bóng chuyền
+Bóng chuyền bãi biển - bóng chuyền
+Cầu lông phong trào - cầu lông
+Cầu lông thi đấu - cầu lông
+Quần vợt cơ bản - quần vợt
+Quần vợt nâng cao - quần vợt
+Chạy bộ đường dài - chạy bộ
+Chạy trail - marathon
+Marathon & Half-marathon - marathon
+Bơi lội cơ bản - bơi lội
+Bơi lội thi đấu - bơi lội
+Gym tăng cơ - gym
+Gym giảm mỡ - fitness
+Fitness cho nữ - fitness
+Yoga trị liệu - yoga
+Yoga nâng cao - yoga
+Pilates phục hồi - pilates
+Boxing căn bản - boxing
+Boxing chuyên nghiệp - boxing
+Võ thuật truyền thống - võ thuật
+Võ tổng hợp (MMA) - MMA
+Taekwondo thi đấu - taekwondo
+Karate truyền thống - karate
+Judo thi đấu - judo
+Thể hình chuyên nghiệp - thể hình
+Thể hình phong trào - thể hình
+eSports FPS - eSports
+eSports MOBA - thể thao điện tử
+eSports Mobile - thể thao điện tử
+Golf giải trí - golf
+Golf chuyên nghiệp - golf
+Bida 3 băng - bida
+Bida pool - bida
+Cờ vua cơ bản - cờ vua
+Cờ vua thi đấu - cờ vua
+Thể thao mạo hiểm - thể thao mạo hiểm
+Leo núi trekking - leo núi
+Đạp xe đường trường - đạp xe
+Đạp xe địa hình - đạp xe
+Dinh dưỡng cho vận động viên - dinh dưỡng thể thao
+Phục hồi chấn thương thể thao - phục hồi chấn thương
+Huấn luyện cá nhân PT - huấn luyện thể thao
+Kỹ thuật thi đấu - kỹ thuật thể thao
+Chiến thuật thể thao - chiến thuật thi đấu
+Thiết bị dụng cụ thể thao - thể thao
+Tin tức sự kiện thể thao - thể thao
+
+
+
+
+
+
+
+
+
 # =====================================================
 # VIETNAMESE CONTINUED PRETRAINING FOR MAMBA-130M
 # WITH TRAIN + VALID, DDP, AMP, EXPLICIT LOSS
