@@ -1,3 +1,79 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SambaASRHead(nn.Module):
+    def __init__(self, hidden_dim, vocab_size, eps=1e-6):
+        super().__init__()
+        # 1. RMSNorm giúp ổn định biên độ trước khi ra logits
+        self.norm = nn.LayerNorm(hidden_dim, eps=eps) 
+        self.linear = nn.Linear(hidden_dim, vocab_size)
+        
+    def forward(self, x):
+        # x shape: [batch, seq_len, hidden_dim]
+        x = self.norm(x)
+        logits = self.linear(x)
+        
+        # 2. Logit Normalization (trực tiếp sửa lỗi lệch vector)
+        # Giữ cho std của logits luôn quanh mức 1.0
+        logits_mean = logits.mean(dim=-1, keepdim=True)
+        logits_std = logits.std(dim=-1, keepdim=True)
+        logits = (logits - logits_mean) / (logits_std + 1e-5)
+        
+        return logits
+
+def compute_total_loss(logits, targets, label_smoothing=0.1, z_loss_weight=1e-4):
+    """
+    logits: [batch, seq_len, vocab_size]
+    targets: [batch, seq_len]
+    """
+    # 3. CrossEntropy với Label Smoothing để giảm skew
+    # Sử dụng reduction='mean' thay vì chia (T-1) thủ công để ổn định gradient
+    ce_loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), 
+        targets.view(-1), 
+        label_smoothing=label_smoothing
+    )
+    
+    # 4. Z-Loss: "Cái phanh" cho sự bùng nổ giá trị
+    # Ngăn log(sum(exp(logits))) tăng quá cao
+    log_z = torch.logsumexp(logits, dim=-1)
+    z_loss = torch.mean(log_z**2)
+    
+    return ce_loss + z_loss_weight * z_loss
+
+# --- GIẢ LẬP QUY TRÌNH TRAIN ---
+hidden_dim = 1024
+vocab_size = 5000
+model_head = SambaASRHead(hidden_dim, vocab_size)
+optimizer = torch.optim.AdamW(model_head.parameters(), lr=3e-6)
+
+# Giả sử hidden_states từ backbone Samba
+hidden_states = torch.randn(1, 34, hidden_dim) 
+targets = torch.randint(0, vocab_size, (1, 34))
+
+# Training Step
+model_head.train()
+optimizer.zero_grad()
+
+logits = model_head(hidden_states)
+loss = compute_total_loss(logits, targets)
+
+loss.backward()
+
+# 5. Gradient Clipping: Chốt chặn cuối cùng cho sự lệch lạc
+torch.nn.utils.clip_grad_norm_(model_head.parameters(), max_norm=1.0)
+
+optimizer.step()
+
+print(f"Loss: {loss.item():.4f} | Logits Max: {logits.max().item():.4f} | Logits Min: {logits.min().item():.4f}")
+
+
+
+
+
+
+
 Bóng đá chuyên nghiệp - bóng đá
 Bóng đá phong trào - thể thao
 Bóng rổ học đường - bóng rổ
