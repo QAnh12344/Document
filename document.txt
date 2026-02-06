@@ -1,3 +1,132 @@
+def debug_10_epochs_training(model, train_dataloader, device='cuda'):
+    """
+    DEBUG NaN + Train 10 epochs với GRADIENT MONITORING
+    """
+    print("🚀 DEBUG + 10 EPOCHS TRAINING WITH GRADIENT TRACKING")
+    print("="*80)
+    
+    # ULTRA STABLE CONFIG
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, eps=1e-8, weight_decay=0.01)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    scaler = torch.cuda.amp.GradScaler()
+    
+    step = 0
+    epoch_losses = []
+    
+    torch.autograd.set_detect_anomaly(True)
+    
+    for epoch in range(10):
+        print(f"\n{'='*80}")
+        print(f"🔄 EPOCH {epoch+1}/10")
+        print(f"{'='*80}")
+        
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch in train_dataloader:
+            mel_spec = batch['mel_specs'].to(device)
+            tokens = batch['tokens'].to(device)
+            token_mask = batch['token_mask'].to(device)
+            
+            optimizer.zero_grad()
+            
+            # FORWARD
+            with torch.cuda.amp.autocast():
+                logits = model(mel_spec, tokens, mel_mask=batch['mel_mask'], token_mask=token_mask)
+                
+                # Masked loss
+                loss = loss_fn(logits.transpose(1,2), tokens)
+                masked_loss = (loss * token_mask.float()).sum() / token_mask.sum()
+            
+            # CHECK NaN
+            if torch.isnan(masked_loss):
+                print(f"💀 NaN LOSS tại STEP {step} EPOCH {epoch+1}")
+                print(f"  Logits range: [{logits.min():.2f}, {logits.max():.2f}]")
+                return False
+            
+            # BACKWARD
+            scaler.scale(masked_loss).backward()
+            
+            # GRADIENT DEBUG - CRITICAL!
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            print(f"Step {step:4d} | Loss: {masked_loss.item():6.4f} | Logits: [{logits.min():5.1f},{logits.max():5.1f}] | GradNorm: {grad_norm:6.2f}", end="")
+            
+            if grad_norm > 100:
+                print(" 🚨 EXPLOSION!")
+            elif grad_norm > 50:
+                print(" ⚠️  DANGER!")
+            else:
+                print(" ✅ OK")
+            
+            # AGGRESSIVE GRADIENT CLIPPING
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # RẤT MẠNH!
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += masked_loss.item()
+            num_batches += 1
+            step += 1
+            
+            # Emergency stop
+            if grad_norm > 200 or step > 1000:
+                print(f"🛑 EMERGENCY STOP tại step {step}")
+                break
+        
+        avg_loss = epoch_loss / num_batches
+        epoch_losses.append(avg_loss)
+        print(f"Epoch {epoch+1} COMPLETE | Avg Loss: {avg_loss:.4f}")
+        
+        if avg_loss < 2.0:  # Converging!
+            print("🎉 TRAINING STABLE!")
+            break
+    
+    print("\n📊 10 EPOCHS SUMMARY:")
+    for i, loss in enumerate(epoch_losses):
+        print(f"Epoch {i+1}: {loss:.4f}")
+    
+    return True
+
+# CHẠY DEBUG + TRAINING:
+if __name__ == "__main__":
+    print("🔧 ULTRA STABLE SAMBAASR TRAINING")
+    
+    # Initialize model với safe init
+    model = SambaASR().cuda()
+    
+    # SAFE WEIGHT INIT
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, nn.Conv1d)):
+            nn.init.xavier_uniform_(m.weight, gain=0.1)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+    
+    # Dummy dataloader (thay bằng real data)
+    from torch.utils.data import DataLoader, TensorDataset
+    
+    batch_size = 4
+    mel_spec = torch.randn(32, 80, 600) * 0.1  # 8 batches
+    tokens = torch.randint(0, 128, (32, 50))
+    masks = torch.ones(32, 50, dtype=torch.bool)
+    
+    dummy_dataset = TensorDataset(mel_spec, tokens, masks)
+    dummy_dataloader = DataLoader(dummy_dataset, batch_size=batch_size, 
+                                collate_fn=lambda x: AudioCollator(None)(x))
+    
+    # RUN DEBUG TRAINING
+    success = debug_10_epochs_training(model, dummy_dataloader)
+    
+    if success:
+        print("\n✅ SUCCESS! Model stable qua 10 epochs")
+    else:
+        print("\n❌ FAILED - Check gradient explosion point")
+
+
+
+
+
+
+
 def debug_nan(model, mel_spec, tokens):
     print("=== NAN DEBUGGER ===")
     torch.autograd.set_detect_anomaly(True)  # Pinpoint exact op
