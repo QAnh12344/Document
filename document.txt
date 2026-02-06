@@ -1,3 +1,58 @@
+def debug_nan(model, mel_spec, tokens):
+    print("=== NAN DEBUGGER ===")
+    torch.autograd.set_detect_anomaly(True)  # Pinpoint exact op
+    
+    with torch.cuda.amp.autocast():
+        # 1. Test mel_spec input
+        print(f"mel_spec: min={mel_spec.min():.3f}, max={mel_spec.max():.3f}, isnan={torch.isnan(mel_spec).any()}")
+        
+        # 2. Test MelToEmbedding
+        emb = model.mel_to_embedding(mel_spec)
+        print(f"After MelToEmbedding: min={emb.min():.3f}, max={emb.max():.3f}, isnan={torch.isnan(emb).any()}")
+        
+        # 3. Test 1 layer encoder
+        enc1 = model.encoder.layers[0](emb)
+        print(f"After encoder layer 0: min={enc1.min():.3f}, max={enc1.max():.3f}, isnan={torch.isnan(enc1).any()}")
+        
+        # 4. Test decoder embedding  
+        dec_emb = model.decoder.embedding(tokens)
+        print(f"Decoder embedding: min={dec_emb.min():.3f}, max={dec_emb.max():.3f}")
+        
+        # 5. FULL FORWARD
+        try:
+            logits = model(mel_spec, tokens)
+            print(f"✅ FULL FORWARD OK: logits [{logits.min():.3f}, {logits.max():.3f}]")
+        except Exception as e:
+            print(f"❌ FORWARD FAIL: {e}")
+            return
+    
+    # 6. BACKWARD TEST  
+    loss_fn = nn.CrossEntropyLoss()
+    loss = loss_fn(logits.transpose(1,2), tokens)
+    print(f"Loss: {loss.item():.4f}")
+    
+    try:
+        loss.backward()
+        print("✅ BACKWARD OK")
+        print(f"Grad norm: {torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')):.3f}")
+    except Exception as e:
+        print(f"❌ BACKWARD FAIL: {e}")
+        print("→ GRADIENT EXPLOSION!")
+
+# CHẠY:
+model = SambaASR().cuda()
+mel = torch.randn(2, 80, 600).cuda() * 0.1  # Small values
+tokens = torch.randint(0, 128, (2, 50)).cuda()
+debug_nan(model, mel, tokens)
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
