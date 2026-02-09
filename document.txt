@@ -1,3 +1,203 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mamba_ssm import Mamba
+
+
+# ============================================================
+# Encoder: Mamba-only
+# ============================================================
+class MambaEncoder(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+
+        self.layers = nn.ModuleList([
+            Mamba(
+                d_model=d_model,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+
+    def forward(self, input_ids):
+        """
+        input_ids: (B, S)
+        return:    (B, S, D)
+        """
+        x = self.embed(input_ids)
+
+        for layer in self.layers:
+            x = x + layer(x)   # residual
+
+        x = self.ln_f(x)
+        return x
+
+
+# ============================================================
+# Cross-Attention block (SAFE for Mamba)
+# ============================================================
+class CrossAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.q_ln = nn.LayerNorm(d_model)
+        self.k_ln = nn.LayerNorm(d_model)
+        self.v_ln = nn.LayerNorm(d_model)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            batch_first=True
+        )
+
+    def forward(self, h_dec, h_enc, enc_key_padding_mask=None):
+        """
+        h_dec: (B, T, D)
+        h_enc: (B, S, D)
+        """
+        q = self.q_ln(h_dec)
+        k = self.k_ln(h_enc)
+        v = self.v_ln(h_enc)
+
+        out, _ = self.attn(
+            q, k, v,
+            key_padding_mask=enc_key_padding_mask,
+            need_weights=False
+        )
+        return out
+
+
+# ============================================================
+# Decoder: Mamba + Cross-Attention
+# Decoder ONLY takes tokens + encoder output
+# ============================================================
+class MambaDecoder(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+
+        self.mamba_layers = nn.ModuleList([
+            Mamba(
+                d_model=d_model,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.cross_attn = CrossAttention(d_model, n_heads)
+
+        self.ln_after_attn = nn.LayerNorm(d_model)
+        self.ln_f = nn.LayerNorm(d_model)
+
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, decoder_input_ids, encoder_hidden_states, enc_pad_mask=None):
+        """
+        decoder_input_ids:     (B, T)
+        encoder_hidden_states: (B, S, D)
+        """
+        x = self.embed(decoder_input_ids)
+
+        # 1) Decoder self Mamba
+        for layer in self.mamba_layers:
+            x = x + layer(x)
+
+        # 2) Cross-attention (encoder -> decoder)
+        cross = self.cross_attn(
+            h_dec=x,
+            h_enc=encoder_hidden_states,
+            enc_key_padding_mask=enc_pad_mask
+        )
+
+        x = x + cross
+        x = self.ln_after_attn(x)
+
+        # 3) Output projection
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        return logits
+
+
+# ============================================================
+# Full Encoder–Decoder Model
+# ============================================================
+class MambaEncDecModel(nn.Module):
+    def __init__(
+        self,
+        enc_vocab_size,
+        dec_vocab_size,
+        d_model=512,
+        enc_layers=6,
+        dec_layers=6,
+        n_heads=8,
+    ):
+        super().__init__()
+
+        self.encoder = MambaEncoder(
+            vocab_size=enc_vocab_size,
+            d_model=d_model,
+            n_layers=enc_layers
+        )
+
+        self.decoder = MambaDecoder(
+            vocab_size=dec_vocab_size,
+            d_model=d_model,
+            n_layers=dec_layers,
+            n_heads=n_heads
+        )
+
+    def forward(self, enc_input_ids, dec_input_ids, enc_pad_mask=None):
+        """
+        enc_input_ids: (B, S)
+        dec_input_ids: (B, T)
+        """
+        enc_out = self.encoder(enc_input_ids)
+
+        # Safety check (debug)
+        # enc_out.abs().max() < 20 là rất an toàn cho attention
+        # print("enc max:", enc_out.abs().max().item())
+
+        logits = self.decoder(
+            decoder_input_ids=dec_input_ids,
+            encoder_hidden_states=enc_out,
+            enc_pad_mask=enc_pad_mask
+        )
+        return logits
+
+
+# ============================================================
+# Example training step (teacher forcing)
+# ============================================================
+def compute_loss(model, enc_ids, dec_ids):
+    """
+    dec_ids: (B, T)  -> shift inside
+    """
+    logits = model(enc_ids, dec_ids[:, :-1])
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        dec_ids[:, 1:].reshape(-1),
+        label_smoothing=0.1
+    )
+    return loss
+
+
+
+
+
+
+
+
+
+
 pip install mamba-ssm[causal-conv1d]
 Collecting mamba-ssm[causal-conv1d]
   Downloading mamba_ssm-2.2.4.tar.gz (91 kB)
