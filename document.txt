@@ -1,3 +1,196 @@
+pip install mamba-ssm[causal-conv1d]
+Collecting mamba-ssm[causal-conv1d]
+  Downloading mamba_ssm-2.2.4.tar.gz (91 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 91.8/91.8 kB 3.0 MB/s eta 0:00:00
+  Installing build dependencies ... done
+  Getting requirements to build wheel ... done
+  Preparing metadata (pyproject.toml) ... done
+Requirement already satisfied: torch in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (2.5.1+cu121)
+Requirement already satisfied: ninja in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (1.11.1.3)
+Requirement already satisfied: einops in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (0.8.0)
+Requirement already satisfied: transformers in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (4.47.0)
+Requirement already satisfied: packaging in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (24.2)
+Requirement already satisfied: setuptools>=61.0.0 in /usr/local/lib/python3.10/dist-packages (from mamba-ssm[causal-conv1d]) (75.1.0)
+Collecting causal-conv1d>=1.2.0 (from mamba-ssm[causal-conv1d])
+  Downloading causal_conv1d-1.5.0.post8.tar.gz (9.4 kB)
+  Preparing metadata (setup.py) ... done
+Requirement already satisfied: filelock in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (3.17.0)
+Requirement already satisfied: typing-extensions>=4.8.0 in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (4.12.2)
+Requirement already satisfied: networkx in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (3.4.2)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (3.1.4)
+Requirement already satisfied: fsspec in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (2024.9.0)
+Requirement already satisfied: sympy==1.13.1 in /usr/local/lib/python3.10/dist-packages (from torch->mamba-ssm[causal-conv1d]) (1.13.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /usr/local/lib/python3.10/dist-packages (from sympy==1.13.1->torch->mamba-ssm[causal-conv1d]) (1.3.0)
+Requirement already satisfied: huggingface-hub<1.0,>=0.24.0 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (0.28.1)
+Requirement already satisfied: numpy>=1.17 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (1.26.4)
+Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (6.0.2)
+Requirement already satisfied: regex!=2019.12.17 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (2024.11.6)
+Requirement already satisfied: requests in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (2.32.3)
+Requirement already satisfied: tokenizers<0.22,>=0.21 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (0.21.0)
+Requirement already satisfied: safetensors>=0.4.1 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (0.4.5)
+Requirement already satisfied: tqdm>=4.27 in /usr/local/lib/python3.10/dist-packages (from transformers->mamba-ssm[causal-conv1d]) (4.67.1)
+Requirement already satisfied: mkl_fft in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (1.3.8)
+Requirement already satisfied: mkl_random in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (1.2.4)
+Requirement already satisfied: mkl_umath in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (0.1.1)
+Requirement already satisfied: mkl in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2025.0.1)
+Requirement already satisfied: tbb4py in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2022.0.0)
+Requirement already satisfied: mkl-service in /usr/local/lib/python3.10/dist-packages (from numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2.4.1)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.10/dist-packages (from jinja2->torch->mamba-ssm[causal-conv1d]) (3.0.2)
+Requirement already satisfied: charset-normalizer<4,>=2 in /usr/local/lib/python3.10/dist-packages (from requests->transformers->mamba-ssm[causal-conv1d]) (3.4.1)
+Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.10/dist-packages (from requests->transformers->mamba-ssm[causal-conv1d]) (3.10)
+Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.10/dist-packages (from requests->transformers->mamba-ssm[causal-conv1d]) (2.3.0)
+Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.10/dist-packages (from requests->transformers->mamba-ssm[causal-conv1d]) (2025.1.31)
+Requirement already satisfied: intel-openmp>=2024 in /usr/local/lib/python3.10/dist-packages (from mkl->numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2024.2.0)
+Requirement already satisfied: tbb==2022.* in /usr/local/lib/python3.10/dist-packages (from mkl->numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2022.0.0)
+Requirement already satisfied: tcmlib==1.* in /usr/local/lib/python3.10/dist-packages (from tbb==2022.*->mkl->numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (1.2.0)
+Requirement already satisfied: intel-cmplr-lib-rt in /usr/local/lib/python3.10/dist-packages (from mkl_umath->numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2024.2.0)
+Requirement already satisfied: intel-cmplr-lib-ur==2024.2.0 in /usr/local/lib/python3.10/dist-packages (from intel-openmp>=2024->mkl->numpy>=1.17->transformers->mamba-ssm[causal-conv1d]) (2024.2.0)
+Building wheels for collected packages: causal-conv1d, mamba-ssm
+  Building wheel for causal-conv1d (setup.py) ... done
+  Created wheel for causal-conv1d: filename=causal_conv1d-1.5.0.post8-cp310-cp310-linux_x86_64.whl size=103960374 sha256=ec956a2d0fa48bd16a8dd5be9ad1c03db88565ea6ee2679e362940fef659284b
+  Stored in directory: /root/.cache/pip/wheels/75/ef/0a/d9abf869acdd5fc07f403f4d8dd9db650cd66e81528a907941
+  Building wheel for mamba-ssm (pyproject.toml) ... done
+  Created wheel for mamba-ssm: filename=mamba_ssm-2.2.4-cp310-cp310-linux_x86_64.whl size=323655716 sha256=0f4b4e95ce6271534b916f819bd33c1283d96208fbaac3f62a3c9777a3501187
+  Stored in directory: /root/.cache/pip/wheels/aa/af/c7/fb77bfcd94bd3e052545033449d8c47dc97222d79c39c5bc67
+Successfully built causal-conv1d mamba-ssm
+Installing collected packages: causal-conv1d, mamba-ssm
+Successfully installed causal-conv1d-1.5.0.post8 mamba-ssm-2.2.4
+Note: you may need to restart the kernel to use updated packages.
+pip install triton
+Collecting triton
+  Using cached triton-3.2.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (1.4 kB)
+Using cached triton-3.2.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (253.1 MB)
+Installing collected packages: triton
+Successfully installed triton-3.2.0
+Note: you may need to restart the kernel to use updated packages.
+Model
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from transformers import AutoTokenizer
+from datasets import load_dataset
+from mamba_ssm import Mamba 
+from torch.utils.data import DataLoader
+
+# Load dataset
+dataset = load_dataset("wmt14", "fr-en")
+
+# Load tokenizers
+tokenizer_en = AutoTokenizer.from_pretrained("bert-base-uncased")
+tokenizer_frn = AutoTokenizer.from_pretrained("camembert-base")
+
+
+
+# Tokenization function
+def collate_fn(batch):
+    en_texts = [ex["translation"]["en"] for ex in batch]  #Extract English texts
+    fr_texts = [ex["translation"]["fr"] for ex in batch]  #Extract French texts
+
+    en_inputs = tokenizer_en(
+        en_texts, 
+        padding="max_length", 
+        truncation=True, 
+        max_length=128, 
+        return_tensors="pt"
+    )
+    fr_targets = tokenizer_fr(
+        fr_texts, 
+        padding="max_length", 
+        truncation=True, 
+        max_length=128,  
+        return_tensors="pt"
+    )
+
+    return {
+        "input_ids": en_inputs["input_ids"],
+        "attention_mask": en_inputs["attention_mask"],
+        "labels": fr_targets["input_ids"]
+    }
+
+# Model Parameters
+vocab_size = tokenizer_en.vocab_size
+d_model = 1024
+batch_size = 8  #Use a larger batch size for efficiency
+max_seq_len = 20
+epoch = 10
+lr = 0.00001
+factory_kwargs = {"device": 'cuda', "dtype": torch.float16}
+
+# Create DataLoaders
+train_dataloader = DataLoader(dataset["train"], batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+validation_dataloader = DataLoader(dataset["validation"], batch_size=batch_size, shuffle=False, collate_fn=collate_fn)  
+test_dataloader = DataLoader(dataset["test"], batch_size=batch_size, shuffle=False, collate_fn=collate_fn)  
+
+# Check DataLoader
+batch = next(iter(train_dataloader))
+print(batch.keys())  # Should print: dict_keys(['input_ids', 'attention_mask', 'labels'])
+print("Input shape:", batch["input_ids"].shape)  # Expected: (batch_size, seq_len)
+
+
+embedding = nn.Embedding(vocab_size,d_model,**factory_kwargs)
+embedding_frn = nn.Embedding(tokenizer_frn.vocab_size,d_model,**factory_kwargs)
+lm_head = nn.Linear(d_model,tokenizer_frn.vocab_size, **factory_kwargs)
+Resolving data files:   0%|          | 0/30 [00:00<?, ?it/s]
+Loading dataset shards:   0%|          | 0/30 [00:00<?, ?it/s]
+dict_keys(['input_ids', 'attention_mask', 'labels'])
+Input shape: torch.Size([8, 128])
+encoder = Mamba(
+     # This module uses roughly 3 * expand * d_model^2 parameters
+    d_model=d_model, # Model dimension d_model
+    d_state=64,  # SSM state expansion factor
+    d_conv=4,    # Local convolution width
+    expand=2,# Block expansion factor
+    dtype=torch.float16
+).to('cuda')
+
+decoder = Mamba(
+     # This module uses roughly 3 * expand * d_model^2 parameters
+    d_model=d_model, # Model dimension d_model
+    d_state=64,  # SSM state expansion factor
+    d_conv=4,    # Local convolution width
+    expand=2,# Block expansion factor
+    dtype=torch.float16
+).to('cuda')
+
+
+sentence = "I love learning."
+tokens = tokenizer_en(sentence, return_tensors="pt", padding=True).to("cuda")
+input_ids = tokens["input_ids"]
+token_embedding = embedding(input_ids)
+encoder_output = encoder(token_embedding)
+last_hidden_state = encoder_output[:,-1,:]
+
+
+
+conv_state,ssm_state = decoder.allocate_inference_cache(batch_size,max_seq_len)
+
+decoder_input_ids = torch.tensor([[tokenizer_frn.bos_token_id]]*batch_size).to('cuda')
+print(decoder_input_ids.shape)
+generated_tokens = []
+
+for _ in range(max_seq_len):
+    token_embedding = embedding_frn(decoder_input_ids)
+    combined_input = token_embedding + last_hidden_state
+    #print(combined_input.shape)
+    output,conv_state,ssm_state = decoder.step(combined_input,conv_state,ssm_state)
+    logits = lm_head(output)
+    next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
+    next_token_id = next_token_id[:,-1,:]
+    if next_token_id.item() == tokenizer_frn.sep_token_id:
+        break
+    generated_tokens.append(next_token_id.item())
+    decoder_input_ids = next_token_id
+
+print(generated_tokens)
+translated_text = tokenizer_frn.decode(generated_tokens, skip_special_tokens=True)
+print("Translated sentence:", translated_text)
+
+
+
+
+
+
+
 def debug_10_epochs_training(model, train_dataloader, device='cuda'):
     """
     DEBUG NaN + Train 10 epochs với GRADIENT MONITORING
