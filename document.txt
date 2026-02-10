@@ -1,3 +1,86 @@
+# ============================================
+# Detect multiple speakers inside ONE audio
+# using SpeechBrain ECAPA (sliding window)
+# ============================================
+
+import torch
+import torchaudio
+import numpy as np
+from speechbrain.pretrained import EncoderClassifier
+
+# ---------- config ----------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TARGET_SR = 16000
+WINDOW_SEC = 2.0        # mỗi đoạn 2s
+HOP_SEC = 1.0           # trượt 1s
+SIM_THRESHOLD = 0.70    # < ngưỡng này => khác speaker
+
+# ---------- load ECAPA ----------
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": DEVICE}
+)
+
+# ---------- utils ----------
+def load_audio(path):
+    wav, sr = torchaudio.load(path)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != TARGET_SR:
+        wav = torchaudio.functional.resample(wav, sr, TARGET_SR)
+    return wav.to(DEVICE)
+
+def extract_embedding(wav):
+    with torch.no_grad():
+        emb = classifier.encode_batch(wav)
+        emb = emb.squeeze(0).squeeze(0)
+        emb = torch.nn.functional.normalize(emb, dim=0)
+    return emb
+
+def cosine_sim(a, b):
+    return torch.dot(a, b).item()
+
+# ---------- main logic ----------
+def detect_multiple_speakers(audio_path):
+    wav = load_audio(audio_path)
+    total_len = wav.shape[-1]
+    win_len = int(WINDOW_SEC * TARGET_SR)
+    hop_len = int(HOP_SEC * TARGET_SR)
+
+    embeddings = []
+
+    for start in range(0, total_len - win_len, hop_len):
+        segment = wav[:, start:start + win_len]
+        emb = extract_embedding(segment)
+        embeddings.append(emb)
+
+    if len(embeddings) < 2:
+        return False, "Audio quá ngắn"
+
+    sims = []
+    for i in range(len(embeddings) - 1):
+        sim = cosine_sim(embeddings[i], embeddings[i + 1])
+        sims.append(sim)
+
+    min_sim = min(sims)
+
+    if min_sim < SIM_THRESHOLD:
+        return True, f"⚠️ Có speaker khác (min similarity = {min_sim:.2f})"
+    else:
+        return False, f"✅ Chỉ 1 speaker (min similarity = {min_sim:.2f})"
+
+
+# ---------- run ----------
+if __name__ == "__main__":
+    audio_path = "audio.wav"
+    has_other, msg = detect_multiple_speakers(audio_path)
+    print(msg)
+
+
+
+
+
+
 # ==============================
 # Speaker Verification with SpeechBrain (ECAPA)
 # 1 reference audio + audio mới
