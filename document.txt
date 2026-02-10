@@ -1,3 +1,73 @@
+# ==============================
+# Speaker Verification with SpeechBrain (ECAPA)
+# 1 reference audio + audio mới
+# ==============================
+
+import torch
+import torchaudio
+from speechbrain.pretrained import EncoderClassifier
+
+# -------- config --------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TARGET_SR = 16000
+THRESHOLD = 0.75  # chỉnh theo chất lượng audio
+
+# -------- load pretrained ECAPA --------
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": DEVICE}
+)
+
+# -------- utils --------
+def load_audio(path, target_sr=TARGET_SR):
+    wav, sr = torchaudio.load(path)
+
+    # mono
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+
+    # resample
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, sr, target_sr)
+
+    return wav.to(DEVICE)
+
+
+def extract_embedding(audio_path):
+    wav = load_audio(audio_path)
+
+    with torch.no_grad():
+        emb = classifier.encode_batch(wav)
+        emb = emb.squeeze(0).squeeze(0)      # [D]
+        emb = torch.nn.functional.normalize(emb, dim=0)
+
+    return emb
+
+
+def cosine_similarity(e1, e2):
+    return torch.dot(e1, e2).item()
+
+
+# -------- main --------
+if __name__ == "__main__":
+    # audio gốc (voice clone reference)
+    ref_audio = "audio_ref.wav"
+
+    # audio cần kiểm tra
+    new_audio = "audio_new.wav"
+
+    # extract embeddings
+    E_ref = extract_embedding(ref_audio)
+    E_new = extract_embedding(new_audio)
+
+    # compare
+    score = cosine_similarity(E_ref, E_new)
+    print(f"Cosine similarity: {score:.4f}")
+
+    if score >= THRESHOLD:
+        print("✅ CÙNG SPEAKER (accept vào voice clone)")
+    else:
+        print("❌ KHÁC SPEAKER (reject)")
 
 
 
