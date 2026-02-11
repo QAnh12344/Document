@@ -7,6 +7,199 @@ import torchaudio
 from speechbrain.utils.data_utils import download_file
 from speechbrain.dataio.dataset import DynamicItemDataset
 from speechbrain.dataio.encoder import CTCTextEncoder
+
+# ==========================================
+# 0. KIỂM TRA FILE MODEL
+# ==========================================
+try:
+    from conmamba import ConmambaEncoder, MambaDecoder
+except ImportError:
+    print("LỖI: Thiếu file 'conmamba.py'!")
+    sys.exit(1)
+
+# ==========================================
+# 1. CẤU HÌNH (Sử dụng Dictionary để tránh lỗi Iterable)
+# ==========================================
+hparams = {
+    "data_folder": "./data_mini_librispeech",
+    "save_folder": "./results_mamba_asr",
+    "d_model": 144,
+    "n_encoder_layers": 4,
+    "n_decoder_layers": 2,
+    "d_ffn": 576,
+    "n_mels": 80,
+    "mamba_cfg_enc": {"d_state": 16, "d_conv": 4, "expand": 2, "bidirectional": True},
+    "mamba_cfg_dec": {"d_state": 16, "d_conv": 4, "expand": 2, "bidirectional": False},
+    "batch_size": 4,
+    "lr": 0.0001,
+    "n_epochs": 5,
+    "ctc_weight": 0.3,
+}
+
+# ==========================================
+# 2. MODULES BỔ TRỢ
+# ==========================================
+class SimpleNormalize(nn.Module):
+    def forward(self, x, lengths):
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+        return (x - mean) / (std + 1e-6)
+
+class Conv2dSubsampling(nn.Module):
+    def __init__(self, input_dim, d_model):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, d_model, 3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(d_model, d_model, 3, stride=2),
+            nn.ReLU(),
+        )
+        self.out_dim = ((input_dim - 1) // 2 - 1) // 2 * d_model
+        self.proj = nn.Linear(self.out_dim, d_model)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        b, c, t, f = x.size()
+        x = x.transpose(1, 2).contiguous().view(b, t, c * f)
+        return self.proj(x)
+
+# ==========================================
+# 3. ASR BRAIN CLASS
+# ==========================================
+class MambaASR(sb.Brain):
+    def compute_forward(self, batch, stage):
+        batch = batch.to(self.device)
+        wavs, wav_lens = batch.sig
+        tokens_bos, _ = batch.tokens_bos
+        
+        # Truy cập hparams qua self.hparams (bây giờ là dict)
+        feats = self.hparams["compute_features"](wavs)
+        feats = self.modules.normalize(feats, wav_lens)
+        
+        src = self.modules.frontend(feats)
+        encoder_out, _ = self.modules.encoder(src, src_key_padding_mask=None)
+        
+        tgt_emb = self.modules.embedding(tokens_bos)
+        decoder_out, _, _ = self.modules.decoder(tgt_emb, encoder_out)
+        
+        p_seq = self.hparams["log_softmax"](self.modules.seq_lin(decoder_out))
+        p_ctc = self.hparams["log_softmax"](self.modules.ctc_lin(encoder_out))
+        
+        return p_ctc, p_seq, wav_lens
+
+    def compute_objectives(self, predictions, batch, stage):
+        p_ctc, p_seq, wav_lens = predictions
+        tokens_eos, tokens_eos_lens = batch.tokens_eos
+        tokens, tokens_lens = batch.tokens
+        
+        loss_ctc = self.hparams["ctc_cost"](p_ctc, tokens, wav_lens, tokens_lens)
+        loss_seq = self.hparams["seq_cost"](p_seq, tokens_eos, length=tokens_eos_lens)
+        
+        loss = self.hparams["ctc_weight"] * loss_ctc + (1 - self.hparams["ctc_weight"]) * loss_seq
+        return loss
+
+    def on_fit_batch_end(self, batch, outputs, loss, should_step):
+        if should_step:
+            torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm=1.0)
+
+    def on_stage_start(self, stage, epoch):
+        if stage != sb.Stage.TRAIN:
+            self.wer_metric = self.hparams["wer_computer"]()
+
+# ==========================================
+# 4. CHUẨN BỊ DATA & RUN
+# ==========================================
+def prepare_data():
+    if not os.path.exists(hparams["data_folder"]):
+        download_file("http://www.openslr.org/resources/31/dev-clean-2.tar.gz", 
+                      os.path.join(hparams["data_folder"], "data.tar.gz"), unpack=True)
+    
+    csv_path = os.path.join(hparams["save_folder"], "train.csv")
+    if not os.path.exists(csv_path):
+        os.makedirs(hparams["save_folder"], exist_ok=True)
+        with open(csv_path, "w") as f:
+            f.write("ID,duration,wav,wrd\n")
+            # Logic tạo CSV rút gọn để đảm bảo chạy được
+            search_path = os.path.join(hparams["data_folder"], "LibriSpeech", "dev-clean-2")
+            for root, _, files in os.walk(search_path):
+                for file in files:
+                    if file.endswith(".flac"):
+                        f.write(f"{file},1.0,{os.path.join(root, file)},HELLO\n")
+    return csv_path
+
+def main():
+    train_csv = prepare_data()
+    
+    label_encoder = CTCTextEncoder()
+    # Khởi tạo label_encoder với các chữ cái cơ bản
+    label_encoder.update_from_iterable(["A B C D E F G H I J K L M N O P Q R S T U V W X Y Z ' "])
+    label_encoder.insert_bos_eos(bos_label="<bos>", eos_label="<eos>")
+    vocab_size = len(label_encoder)
+
+    modules = torch.nn.ModuleDict({
+        "frontend": Conv2dSubsampling(hparams["n_mels"], hparams["d_model"]),
+        "normalize": SimpleNormalize(),
+        "encoder": ConmambaEncoder(num_layers=hparams["n_encoder_layers"], d_model=hparams["d_model"], 
+                                   d_ffn=hparams["d_ffn"], dropout=0.1, mamba_config=hparams["mamba_cfg_enc"]),
+        "decoder": MambaDecoder(num_layers=hparams["n_decoder_layers"], d_model=hparams["d_model"], 
+                                 d_ffn=hparams["d_ffn"], dropout=0.1, mamba_config=hparams["mamba_cfg_dec"]),
+        "embedding": sb.nnet.embedding.Embedding(num_embeddings=vocab_size, embedding_dim=hparams["d_model"]),
+        "seq_lin": sb.nnet.linear.Linear(input_size=hparams["d_model"], n_neurons=vocab_size),
+        "ctc_lin": sb.nnet.linear.Linear(input_size=hparams["d_model"], n_neurons=vocab_size),
+    })
+
+    # Cập nhật hparams với các hàm xử lý
+    hparams["compute_features"] = sb.lobes.features.Fbank(n_mels=hparams["n_mels"])
+    hparams["log_softmax"] = sb.nnet.activations.Softmax(apply_log=True)
+    hparams["ctc_cost"] = sb.nnet.losses.ctc_loss
+    hparams["seq_cost"] = sb.nnet.losses.nll_loss
+    hparams["wer_computer"] = sb.utils.metric_stats.ErrorRateStats
+    hparams["epoch_counter"] = sb.utils.epoch_loop.EpochCounter(limit=hparams["n_epochs"])
+
+    @sb.utils.data_pipeline.takes("wav", "wrd")
+    @sb.utils.data_pipeline.provides("sig", "tokens_bos", "tokens_eos", "tokens")
+    def dataio_prepare(wav, wrd):
+        yield sb.dataio.dataio.read_audio(wav)
+        tokens_list = label_encoder.encode_sequence(wrd)
+        yield torch.LongTensor([label_encoder.bos_index] + tokens_list)
+        yield torch.LongTensor(tokens_list + [label_encoder.eos_index])
+        yield torch.LongTensor(tokens_list)
+
+    train_data = DynamicItemDataset.from_csv(csv_path=train_csv, dynamic_items=[dataio_prepare],
+                                           output_keys=["id", "sig", "tokens_bos", "tokens_eos", "tokens"])
+
+    asr_brain = MambaASR(
+        modules=modules,
+        hparams=hparams, # Truyền Dictionary vào đây
+        run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+        opt_class=lambda x: torch.optim.AdamW(x, lr=hparams["lr"]),
+    )
+    asr_brain.label_encoder = label_encoder
+    
+    asr_brain.fit(asr_brain.hparams["epoch_counter"], train_data, train_data, 
+                  train_loader_kwargs={"batch_size": hparams["batch_size"]})
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import speechbrain as sb
+import torchaudio
+from speechbrain.utils.data_utils import download_file
+from speechbrain.dataio.dataset import DynamicItemDataset
+from speechbrain.dataio.encoder import CTCTextEncoder
 from types import SimpleNamespace
 
 # ==========================================
