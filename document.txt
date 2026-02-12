@@ -1,3 +1,13 @@
+Bóng đá quốc tế-Giải ngoại hạng Anh, Bóng đá Việt Nam-Đội tuyển quốc gia, Chuyển nhượng cầu thủ-Mức phí giải phóng, Kỹ thuật bóng đá-Cách sút bóng xoáy, Quần vợt-Giải quần vợt mở rộng, Bóng rổ chuyên nghiệp-Giải nhà nghề Mỹ, Thể thao điện tử-Đấu trường trực tuyến, Võ thuật hỗn hợp-Võ sĩ hạng nặng, Điền kinh thế giới-Kỷ lục chạy ngắn, Đua xe công thức 1-Chặng đua đường phố, Cầu lông chuyên nghiệp-Kỹ thuật đập cầu, Thể hình-Lịch tập cơ bụng, Dinh dưỡng thể thao-Thực phẩm bổ sung, Yoga-Tư thế chào mặt trời, Bơi lội-Kỹ thuật bơi sải, Đạp xe đường trường-Xe đạp sợi carbon, Golf hạng sang-Kỹ thuật vung gậy, Bóng chuyền-Vị trí phòng thủ, Thể thao mạo hiểm-Nhảy dù tự do, Tin tức World Cup-Lịch thi đấu chung kết, Đại hội thể thao-Bảng tổng sắp huy chương, Thế vận hội-Huy chương vàng Olympic, Dụng cụ thể thao-Giày đá bóng sân cỏ, Thời trang thể thao-Áo đấu chính hãng, Chấn thương thể thao-Điều trị đứt dây chằng, Cờ vua trí tuệ-Chiến thuật khai cuộc, Trượt băng nghệ thuật-Kỹ thuật xoay thân, Lặn biển-Thiết bị bình dưỡng khí, Leo núi-Kỹ năng leo núi đá, Bóng bàn-Cách cầm vợt ngang, Bóng bầu dục-Giải vô địch thế giới, Khúc côn cầu-Gậy đánh chuyên dụng, Cricket-Luật chơi cơ bản, Trượt ván-Kỹ thuật nhảy bậc, Thể thao học đường-Giải bóng đá sinh viên, Huấn luyện viên-Chiến thuật phòng ngự, Phân tích dữ liệu-Tỉ lệ kiểm soát bóng, Trọng tài-Công nghệ video hỗ trợ, Sức bền-Bài tập chạy trên máy, Pilates-Gậy tập đa năng, Thể dục dụng cụ-Bài tập xà đơn, Bắn súng thể thao-Súng hơi thi đấu, Bắn cung-Cách ngắm mục tiêu, Đấu kiếm-Kiếm liễu thi đấu, Thể thao mùa đông-Ván trượt tuyết, Chèo thuyền-Tour du lịch trải nghiệm, Ba môn phối hợp-Thử thách sức bền, Bowling-Kỹ thuật ném bóng xoáy, Bida-Kỹ thuật đánh bi lỗ, Thể thao cộng đồng-Phong trào chạy bộ.
+Bạn có muốn tôi hỗ trợ thêm về chủ đề nào khác với cấu trúc này không?
+
+
+
+
+
+
+
+
 import os
 import sys
 import torch
