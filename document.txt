@@ -1,3 +1,148 @@
+import torch
+import torchaudio
+from speechbrain.inference.speaker import EncoderClassifier
+from sklearn.cluster import AgglomerativeClustering
+from torch.nn.functional import cosine_similarity
+import numpy as np
+from tqdm import tqdm
+
+# ================= CẤU HÌNH =================
+INPUT_SCP = "data.scp"
+INPUT_ANS = "data.ans"
+OUTPUT_SCP = "final_clean.scp"
+OUTPUT_ANS = "final_clean.ans"
+
+# 1. Ngưỡng kiểm tra file có >1 người (Single Speaker Consistency)
+# Nếu các đoạn trong file có độ tương đồng thấp hơn mức này -> Loại
+CONSISTENCY_THRESHOLD = 0.55 
+
+# 2. Ngưỡng kiểm tra trùng người giữa các file (Unique Speaker)
+# Nếu 2 file giống nhau trên mức này -> Coi là 1 người -> Chỉ giữ 1 file
+UNIQUE_THRESHOLD = 0.80 
+
+# ================= KHỞI TẠO MODEL =================
+print("Đang tải model: speechbrain/spkrec-ecapa-voxceleb...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb", 
+    savedir="pretrained_models/spkrec-ecapa-voxceleb",
+    run_opts={"device": device}
+)
+
+def analyze_audio(wav_path):
+    """
+    Trả về (is_single, embedding)
+    - is_single: True nếu file chỉ có 1 người nói.
+    - embedding: Vector đặc trưng của toàn bộ file.
+    """
+    try:
+        signal, fs = torchaudio.load(wav_path)
+        if signal.shape[0] > 1: signal = torch.mean(signal, dim=0, keepdim=True) # Convert to mono
+        
+        duration = signal.shape[1] / fs
+        if duration < 1.0: return False, None # File quá ngắn bỏ qua
+
+        if device == "cuda": signal = signal.cuda()
+
+        # --- BƯỚC 1: KIỂM TRA TÍNH ĐỒNG NHẤT (Check > 1 speaker) ---
+        # Chia audio thành các đoạn 1.5s để so sánh
+        win_len = int(1.5 * fs)
+        step = int(1.0 * fs)
+        
+        if signal.shape[1] > win_len * 2: # Chỉ check nếu đủ dài để chia 2 đoạn
+            patches = signal.unfold(1, win_len, step).transpose(0, 1) 
+            # Lấy tối đa 10 đoạn để check cho nhanh
+            if patches.shape[0] > 10:
+                indices = torch.linspace(0, patches.shape[0]-1, 10).long()
+                patches = patches[indices]
+            
+            with torch.no_grad():
+                patch_embs = classifier.encode_batch(patches).squeeze(1)
+                # Tính độ tương đồng giữa các đoạn với nhau
+                mean_patch_emb = torch.mean(patch_embs, dim=0, keepdim=True)
+                sims = cosine_similarity(mean_patch_emb, patch_embs)
+                if torch.min(sims).item() < CONSISTENCY_THRESHOLD:
+                    return False, None # Có dấu hiệu nhiều người nói
+        
+        # --- BƯỚC 2: TRÍCH XUẤT EMBEDDING TOÀN FILE ---
+        with torch.no_grad():
+            full_emb = classifier.encode_batch(signal).squeeze().cpu().numpy()
+            return True, full_emb
+            
+    except Exception as e:
+        print(f"Lỗi {wav_path}: {e}")
+        return False, None
+
+def main():
+    # 1. Đọc dữ liệu đầu vào
+    ids, paths = [], []
+    with open(INPUT_SCP, 'r') as f:
+        for line in f:
+            p = line.strip().split(maxsplit=1)
+            if len(p) == 2: ids.append(p[0]); paths.append(p[1])
+
+    # 2. Duyệt từng file để lọc Single Speaker
+    print(f"Đang kiểm tra {len(ids)} files...")
+    valid_ids, valid_paths, valid_embs = [], [], []
+
+    for i in tqdm(range(len(ids))):
+        is_single, emb = analyze_audio(paths[i])
+        if is_single:
+            valid_ids.append(ids[i])
+            valid_paths.append(paths[i])
+            valid_embs.append(emb)
+
+    if not valid_embs:
+        print("Không tìm thấy file nào đạt yêu cầu."); return
+
+    # 3. Gom nhóm để giữ Unique Speaker
+    print(f"Còn lại {len(valid_ids)} file 1 người. Đang lọc trùng speaker...")
+    embs_matrix = np.array(valid_embs)
+    embs_matrix = embs_matrix / np.linalg.norm(embs_matrix, axis=1, keepdims=True) # Normalize
+
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=1 - UNIQUE_THRESHOLD,
+        metric='cosine',
+        linkage='average'
+    )
+    labels = clustering.fit_predict(embs_matrix)
+
+    # 4. Chọn 1 đại diện cho mỗi cụm người nói
+    seen_speakers = set()
+    final_indices = []
+    for i, label in enumerate(labels):
+        if label not in seen_speakers:
+            seen_speakers.add(label)
+            final_indices.append(i)
+
+    # 5. Ghi kết quả
+    print(f"Kết quả: Giữ lại {len(final_indices)} người nói duy nhất.")
+    ans_map = {}
+    with open(INPUT_ANS, 'r') as f:
+        for line in f:
+            p = line.strip().split(maxsplit=1)
+            if len(p) >= 1: ans_map[p[0]] = p[1] if len(p) > 1 else ""
+
+    with open(OUTPUT_SCP, 'w') as f_s, open(OUTPUT_ANS, 'w') as f_a:
+        for idx in final_indices:
+            uid = valid_ids[idx]
+            f_s.write(f"{uid} {valid_paths[idx]}\n")
+            if uid in ans_map: f_a.write(f"{uid} {ans_map[uid]}\n")
+
+    print("Đã hoàn thành!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
 ### 1. Sức khỏe và Y tế
 Chăm sóc da-Kem chống nắng, Sức khỏe tâm thần-Giảm căng thẳng, Y học cổ truyền-Châm cứu bấm huyệt, Nha khoa thẩm mỹ-Tẩy trắng răng, Sức khỏe mẹ bé-Tiêm chủng định kỳ, Bệnh lý tim mạch-Huyết áp cao, Cơ xương khớp-Thoát vị đĩa đệm, Nhãn khoa-Cận thị học đường, Tai mũi họng-Viêm xoang mãn tính, Dược phẩm-Thực phẩm chức năng, Xét nghiệm máu-Chỉ số đường huyết, Phẫu thuật thẩm mỹ-Nâng mũi cấu trúc, Cấp cứu-Sơ cứu ban đầu, Sản khoa-Khám thai định kỳ, Ung thư học-Hóa trị liệu, Hệ tiêu hóa-Viêm loét dạ dày, Thần kinh học-Rối loạn giấc ngủ, Y học thể thao-Phục hồi chức năng, Truyền nhiễm-Vaccine thế hệ mới, Kiểm soát cân nặng-Chế độ ăn kiêng, Nội tiết-Bệnh tiểu đường, Hô hấp-Hen suyễn kinh niên, Da liễu-Điều trị mụn nội tiết, Nam khoa-Tăng cường sức đề kháng, Phụ khoa-Tầm soát ung thư cổ tử cung, Dị ứng-Dị ứng thực phẩm, Sức khỏe người già-Sa sút trí tuệ, Giải độc cơ thể-Thải độc gan, Chỉnh hình-Bó bột thạch cao, Phục hồi chức năng-Vật lý trị liệu, Sức khỏe tinh thần-Tư vấn tâm lý, Chăm sóc tóc-Ngăn ngừa rụng tóc, Sức khỏe xương-Bổ sung canxi, Y tế dự phòng-Sạch sẽ môi trường, Kiểm tra tổng quát-Tầm soát bệnh lý, Vi trùng học-Kháng sinh đồ, Miễn dịch-Tăng cường sức đề kháng, Phổi học-Cai nghiện thuốc lá, Thận học-Sỏi thận tiết niệu, Khoa nhi-Tăng trưởng chiều cao, Y tế số-Sổ khám bệnh điện tử, Bảo hiểm y tế-Chi phí điều trị, Công nghệ y sinh-Thiết bị trợ thính, Chăm sóc tại nhà-Máy đo huyết áp, Khoa cấp cứu-Xe cứu thương, Vệ sinh cá nhân-Rửa tay sát khuẩn, Đông y-Thảo dược thiên nhiên, Kiểm soát dịch bệnh-Cách ly y tế, Sức khỏe nam giới-Kiểm tra tuyến tiền liệt, Sức khỏe cộng đồng-Tuyên truyền vệ sinh.
 
