@@ -1,3 +1,27 @@
+from speechbrain.inference.classifiers import EncoderClassifier
+
+# 1. Khởi tạo thêm model Gender
+gender_classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/gender-recognition-commonvoice",
+    savedir="pretrained_models/gender-check",
+    run_opts={"device": device}
+)
+
+def get_gender(signal):
+    """
+    Trả về 'female' hoặc 'male'
+    """
+    with torch.no_grad():
+        # Model này trả về: [batch, decision, identities]
+        out_prob, score, index, text_lab = gender_classifier.classify_batch(signal)
+        return text_lab[0] # Lấy nhãn đầu tiên trong batch
+
+
+
+
+
+
+
 import torch
 import torchaudio
 from speechbrain.inference.speaker import EncoderClassifier
