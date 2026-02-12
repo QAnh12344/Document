@@ -5,6 +5,146 @@ from sklearn.cluster import AgglomerativeClustering
 from torch.nn.functional import cosine_similarity
 import numpy as np
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+
+# ================= CẤU HÌNH =================
+INPUT_SCP = "data.scp"
+INPUT_ANS = "data.ans"
+OUTPUT_SCP = "final_parallel.scp"
+OUTPUT_ANS = "final_parallel.ans"
+
+CONSISTENCY_THRESHOLD = 0.55 
+UNIQUE_THRESHOLD = 0.80 
+NUM_WORKERS = 4  # Số luồng CPU nạp dữ liệu mỗi GPU
+
+# ================= CLASS XỬ LÝ SONG SONG =================
+class SpeakerProcessor:
+    def __init__(self, gpu_id):
+        self.device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+        self.classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=f"pretrained_models/spkrec-ecapa-{gpu_id}",
+            run_opts={"device": self.device}
+        )
+
+    def process_one(self, task):
+        utt_id, wav_path = task
+        try:
+            signal, fs = torchaudio.load(wav_path)
+            if signal.shape[0] > 1: signal = torch.mean(signal, dim=0, keepdim=True)
+            
+            if signal.shape[1] / fs < 1.0: return None
+
+            sig_gpu = signal.to(self.device)
+
+            # Check Single Speaker (Consistency)
+            win_len = int(1.5 * fs)
+            step = int(1.0 * fs)
+            if sig_gpu.shape[1] > win_len * 2:
+                patches = sig_gpu.unfold(1, win_len, step).transpose(0, 1)
+                if patches.shape[0] > 10:
+                    indices = torch.linspace(0, patches.shape[0]-1, 10).long()
+                    patches = patches[indices]
+                
+                with torch.no_grad():
+                    patch_embs = self.classifier.encode_batch(patches).squeeze(1)
+                    mean_emb = torch.mean(patch_embs, dim=0, keepdim=True)
+                    sims = cosine_similarity(mean_emb, patch_embs)
+                    if torch.min(sims).item() < CONSISTENCY_THRESHOLD:
+                        return None
+
+            # Get Full Embedding
+            with torch.no_grad():
+                full_emb = self.classifier.encode_batch(sig_gpu).squeeze().cpu().numpy()
+                return (utt_id, wav_path, full_emb)
+        except:
+            return None
+
+def worker_process(gpu_id, tasks):
+    """Hàm chạy trên mỗi tiến trình GPU riêng biệt"""
+    processor = SpeakerProcessor(gpu_id)
+    results = []
+    # Dùng ThreadPoolExecutor bên trong mỗi tiến trình để nạp data nhanh hơn
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        for res in list(tqdm(executor.map(processor.process_one, tasks), total=len(tasks), desc=f"GPU {gpu_id}")):
+            if res: results.append(res)
+    return results
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    # 1. Load Data
+    all_tasks = []
+    with open(INPUT_SCP, 'r') as f:
+        for line in f:
+            p = line.strip().split(maxsplit=1)
+            if len(p) == 2: all_tasks.append((p[0], p[1]))
+
+    # 2. Chia việc cho các GPU
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    print(f"Phát hiện {num_gpus} GPU.")
+    
+    chunks = np.array_split(all_tasks, num_gpus)
+    
+    # Dùng Multiprocessing để chạy mỗi GPU trên 1 process riêng
+    with multiprocessing.Pool(processes=num_gpus) as pool:
+        process_results = pool.starmap(worker_process, enumerate(chunks))
+
+    # Gom kết quả từ các GPU
+    flat_results = [item for sublist in process_results for item in sublist]
+    
+    if not flat_results:
+        print("Không có kết quả."); exit()
+
+    # 3. Gom nhóm Unique Speaker (Chạy trên CPU)
+    print("Đang lọc trùng Speaker trên toàn bộ tập dữ liệu...")
+    valid_ids, valid_paths, valid_embs = zip(*flat_results)
+    embs_matrix = np.array(valid_embs)
+    embs_matrix = embs_matrix / np.linalg.norm(embs_matrix, axis=1, keepdims=True)
+
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=1 - UNIQUE_THRESHOLD,
+        metric='cosine', linkage='average'
+    )
+    labels = clustering.fit_predict(embs_matrix)
+
+    # 4. Lưu kết quả
+    unique_indices = []
+    seen = set()
+    for i, lb in enumerate(labels):
+        if lb not in seen:
+            seen.add(lb)
+            unique_indices.append(i)
+
+    # Đọc file ANS để map
+    ans_map = {}
+    with open(INPUT_ANS, 'r') as f:
+        for line in f:
+            p = line.strip().split(maxsplit=1)
+            if len(p) >= 1: ans_map[p[0]] = p[1] if len(p) > 1 else ""
+
+    with open(OUTPUT_SCP, 'w') as f_s, open(OUTPUT_ANS, 'w') as f_a:
+        for idx in unique_indices:
+            uid = valid_ids[idx]
+            f_s.write(f"{uid} {valid_paths[idx]}\n")
+            if uid in ans_map: f_a.write(f"{uid} {ans_map[uid]}\n")
+
+    print(f"Xử lý xong! Giữ lại {len(unique_indices)} speakers duy nhất.")
+
+
+
+
+
+
+
+import torch
+import torchaudio
+from speechbrain.inference.speaker import EncoderClassifier
+from sklearn.cluster import AgglomerativeClustering
+from torch.nn.functional import cosine_similarity
+import numpy as np
+from tqdm import tqdm
 
 # ================= CẤU HÌNH =================
 INPUT_SCP = "data.scp"
