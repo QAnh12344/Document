@@ -1,3 +1,144 @@
+import os
+import torch
+import numpy as np
+import onnx
+import onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
+from huggingface_hub import snapshot_download
+
+# ============================================
+# CONFIG
+# ============================================
+MODEL_ID = "nvidia/canary-1b"
+EXPORT_DIR = "canary1b_onnx_cpu"
+OPSET = 17
+NUM_THREADS = 8
+
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# ============================================
+# DOWNLOAD MODEL FROM HUGGINGFACE
+# ============================================
+print("Downloading model from HuggingFace...")
+model_path = snapshot_download(repo_id=MODEL_ID)
+
+# ============================================
+# LOAD WITH NEMO
+# ============================================
+from nemo.collections.asr.models import ASRModel
+
+print("Loading NeMo model...")
+model = ASRModel.restore_from(os.path.join(model_path, "model.nemo"))
+model.eval()
+model.to("cpu")
+
+encoder = model.encoder
+decoder = model.decoder
+
+# ============================================
+# EXPORT ENCODER
+# ============================================
+print("Exporting encoder...")
+
+dummy_feats = torch.randn(1, 200, 80)
+
+encoder_path = os.path.join(EXPORT_DIR, "encoder.onnx")
+
+torch.onnx.export(
+    encoder,
+    dummy_feats,
+    encoder_path,
+    input_names=["features"],
+    output_names=["encoder_out"],
+    dynamic_axes={
+        "features": {0:"batch",1:"time"},
+        "encoder_out": {0:"batch",1:"time"},
+    },
+    opset_version=OPSET,
+    do_constant_folding=True,
+)
+
+onnx.checker.check_model(encoder_path)
+print("Encoder exported")
+
+# ============================================
+# DECODER WITH PAST WRAPPER
+# ============================================
+
+class DecoderWithPast(torch.nn.Module):
+    def __init__(self, decoder):
+        super().__init__()
+        self.decoder = decoder
+
+    def forward(self, input_ids, encoder_hidden_states):
+        outputs = self.decoder(
+            input_ids=input_ids,
+            encoder_hidden_states=encoder_hidden_states,
+            use_cache=False  # Canary HF version thường không expose past
+        )
+        return outputs.logits
+
+decoder_wrapper = DecoderWithPast(decoder)
+decoder_wrapper.eval()
+
+hidden_dim = decoder.d_model
+
+dummy_ids = torch.ones(1,1).long()
+dummy_enc = torch.randn(1,150,hidden_dim)
+
+decoder_path = os.path.join(EXPORT_DIR,"decoder.onnx")
+
+print("Exporting decoder...")
+
+torch.onnx.export(
+    decoder_wrapper,
+    (dummy_ids,dummy_enc),
+    decoder_path,
+    input_names=["input_ids","encoder_hidden_states"],
+    output_names=["logits"],
+    dynamic_axes={
+        "input_ids":{0:"batch",1:"seq"},
+        "encoder_hidden_states":{0:"batch",1:"time"},
+        "logits":{0:"batch",1:"seq"},
+    },
+    opset_version=OPSET,
+    do_constant_folding=True,
+)
+
+onnx.checker.check_model(decoder_path)
+print("Decoder exported")
+
+# ============================================
+# QUANTIZE FOR CPU
+# ============================================
+print("Quantizing INT8...")
+
+encoder_int8 = os.path.join(EXPORT_DIR,"encoder_int8.onnx")
+decoder_int8 = os.path.join(EXPORT_DIR,"decoder_int8.onnx")
+
+quantize_dynamic(encoder_path, encoder_int8, weight_type=QuantType.QInt8)
+quantize_dynamic(decoder_path, decoder_int8, weight_type=QuantType.QInt8)
+
+print("Quantization done")
+
+# ============================================
+# INIT ONNX RUNTIME
+# ============================================
+sess_opt = ort.SessionOptions()
+sess_opt.intra_op_num_threads = NUM_THREADS
+sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+enc_sess = ort.InferenceSession(encoder_int8, sess_opt, providers=["CPUExecutionProvider"])
+dec_sess = ort.InferenceSession(decoder_int8, sess_opt, providers=["CPUExecutionProvider"])
+
+print("\n✅ Canary-1B (HF) converted to ONNX CPU successfully")
+
+
+
+
+
+
+
 from speechbrain.inference.classifiers import EncoderClassifier
 
 # 1. Khởi tạo thêm model Gender
