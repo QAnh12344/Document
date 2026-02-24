@@ -1,3 +1,42 @@
+from tqdm import tqdm
+
+ans_path = "ans.txt"
+label_path = "label.txt"
+output_path = "output.txt"
+
+# Nếu bạn biết chính xác số dòng
+TOTAL_LINES = 5_000_000
+
+with open(ans_path, "r", encoding="utf-8") as fa, \
+     open(label_path, "r", encoding="utf-8") as fl, \
+     open(output_path, "w", encoding="utf-8") as out:
+
+    prev_label = None
+    buffer = []
+
+    for sent, label in tqdm(zip(fa, fl), total=TOTAL_LINES):
+        sent = sent.strip()
+        label = label.strip()
+
+        if prev_label is None:
+            prev_label = label
+
+        if label == prev_label:
+            buffer.append(sent)
+        else:
+            out.write("\t".join(buffer) + "\n")
+            buffer = [sent]
+            prev_label = label
+
+    # ghi group cuối
+    if buffer:
+        out.write("\t".join(buffer) + "\n")
+
+
+
+
+
+
 import torch
 import numpy as np
 import onnxruntime as ort
