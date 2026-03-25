@@ -1,3 +1,61 @@
+import pandas as pd
+
+def extract_en_column(input_file, output_file):
+    try:
+        # Đọc tất cả sheet
+        all_sheets = pd.read_excel(input_file, sheet_name=None)
+
+        en_data = []
+
+        for sheet_name, df in all_sheets.items():
+            print(f"Đang xử lý sheet: {sheet_name}")
+
+            # Kiểm tra có cột EN không
+            if "EN" in df.columns:
+                # Lấy cột EN, bỏ NaN
+                en_col = df["EN"].dropna()
+
+                # Thêm vào list
+                en_data.append(en_col)
+            else:
+                print(f"Sheet {sheet_name} không có cột EN")
+
+        if not en_data:
+            print("Không tìm thấy cột EN ở bất kỳ sheet nào")
+            return
+
+        # Gộp tất cả lại
+        all_en = pd.concat(en_data, ignore_index=True)
+
+        # Xóa trùng
+        all_en = all_en.drop_duplicates()
+
+        # Reset index
+        all_en = all_en.reset_index(drop=True)
+
+        # Lưu ra file mới
+        all_en.to_excel(output_file, index=False, header=["EN"])
+
+        print(f"\nDone! Đã lưu vào: {output_file}")
+        print(f"Tổng số dòng: {len(all_en)}")
+
+    except Exception as e:
+        print("Lỗi:", e)
+
+
+# ================== RUN ==================
+input_file = "input.xlsx"   # file của bạn
+output_file = "output.xlsx"
+
+extract_en_column(input_file, output_file)
+
+
+
+
+
+
+
+
 from tqdm import tqdm
 
 ans_path = "ans.txt"
