@@ -1,3 +1,63 @@
+import subprocess
+import tempfile
+import os
+
+def save_bytes_to_wav_16k_mono(audio_bytes, output_filename="output_audio.wav"):
+    """
+    Chuyển đổi bytes audio sang định dạng WAV 16k Mono và lưu ra file.
+    Trả về: Đường dẫn tuyệt đối của file đã lưu.
+    """
+    # 1. Tạo đường dẫn lưu file (Sử dụng thư mục hiện tại hoặc thư mục tạm)
+    # Nếu bạn muốn lưu vào thư mục tạm của hệ thống, hãy dùng tempfile
+    output_path = os.path.abspath(output_filename)
+
+    # 2. Thiết lập lệnh FFmpeg
+    # -y: Ghi đè nếu file đã tồn tại
+    # -f wav: Định dạng đầu ra
+    # -ac 1: Mono
+    # -ar 16000: Sample rate 16k
+    command = [
+        'ffmpeg', '-y',
+        '-i', 'pipe:0',          # Đọc từ stdin
+        '-ac', '1',              # Chuyển về 1 kênh (Mono)
+        '-ar', '16000',          # Set 16000Hz
+        '-f', 'wav',             # Ép kiểu đầu ra là wav
+        output_path              # Lưu vào đường dẫn này
+    ]
+
+    try:
+        # 3. Chạy FFmpeg và đẩy bytes vào stdin
+        process = subprocess.Popen(
+            command, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        
+        # Đẩy dữ liệu bytes và chờ kết thúc
+        stdout, stderr = process.communicate(input=audio_bytes)
+
+        if process.returncode != 0:
+            print(f"Lỗi FFmpeg: {stderr.decode()}")
+            return None
+
+        # 4. Trả về đường dẫn file
+        return output_path
+
+    except Exception as e:
+        print(f"Có lỗi xảy ra: {e}")
+        return None
+
+# --- VÍ DỤ SỬ DỤNG ---
+# Giả sử bạn đã có biến 'my_audio_bytes' (từ API hoặc đọc file thô)
+# path = save_bytes_to_wav_16k_mono(my_audio_bytes, "task1_sample.wav")
+# print(f"File đã được lưu tại: {path}")
+
+
+
+
+
+
 import os
 import subprocess
 import numpy as np
