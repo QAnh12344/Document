@@ -1,3 +1,153 @@
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import uuid
+from dataclasses import dataclass
+from typing import Iterable, List, Dict, Any, Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
+from fastembed import TextEmbedding
+
+# Giả định ingest_utils nằm cùng thư mục hoặc bạn có thể copy code vào đây
+# Ở đây mình viết lại hàm đơn giản để script chạy độc lập được
+def normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+def read_file(file_path: str) -> str:
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+@dataclass
+class Chunk:
+    id: str
+    text: str
+    metadata: Dict[str, Any]
+
+def iter_local_files(path: str, patterns: List[str]) -> Iterable[str]:
+    for pat in patterns:
+        # Hỗ trợ tìm kiếm đệ quy trong các thư mục con
+        search_path = os.path.join(path, "**", pat)
+        yield from sorted(glob.glob(search_path, recursive=True))
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    text = normalize_whitespace(text)
+    if not text:
+        return []
+    
+    chunks: List[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+def ensure_collection(client: QdrantClient, collection: str, vector_size: int):
+    existing = {c.name for c in client.get_collections().collections}
+    if collection in existing:
+        return
+    client.create_collection(
+        collection_name=collection,
+        vectors_config=qm.VectorParams(size=vector_size, distance=qm.Distance.COSINE),
+    )
+
+def upsert_chunks(
+    client: QdrantClient,
+    collection: str,
+    embedder: TextEmbedding,
+    chunks: List[Chunk],
+    batch_size: int = 64,
+):
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        texts = [c.text for c in batch]
+        # Chuyển generator của fastembed thành list
+        vectors = [v.tolist() for v in embedder.embed(texts)]
+        
+        points = [
+            qm.PointStruct(
+                id=ch.id,
+                vector=vec,
+                payload={"text": ch.text, "metadata": ch.metadata},
+            )
+            for ch, vec in zip(batch, vectors)
+        ]
+        client.upsert(collection_name=collection, points=points)
+
+def main():
+    ap = argparse.ArgumentParser(description="Local Ingestion Pipeline for Qdrant RAG.")
+    ap.add_argument("--qdrant-url", default="http://localhost:6333", help="Qdrant server URL")
+    ap.add_argument("--collection", default="medical_docs", help="Target collection name")
+    ap.add_argument("--embedding-model", default="BAAI/bge-small-en-v1.5", help="FastEmbed model name")
+    ap.add_argument("--input-path", required=True, help="Path to your documents folder")
+    ap.add_argument("--source-name", default="local_corpus")
+    ap.add_argument("--patterns", default="*.txt,*.md,*.jsonl", help="Comma-separated glob patterns")
+    ap.add_argument("--chunk-size", type=int, default=900)
+    ap.add_argument("--overlap", type=int, default=150)
+    ap.add_argument("--batch-size", type=int, default=64)
+    args = ap.parse_args()
+
+    patterns = [p.strip() for p in args.patterns.split(",") if p.strip()]
+    
+    # 1. Setup Clients
+    qclient = QdrantClient(url=args.qdrant_url)
+    embedder = TextEmbedding(model_name=args.embedding_model)
+
+    # 2. Prepare Collection
+    vec_size = len(next(embedder.embed(["probe"])).tolist())
+    ensure_collection(qclient, args.collection, vec_size)
+
+    # 3. Process Files
+    files = list(iter_local_files(args.input_path, patterns))
+    if not files:
+        print(f"⚠️ No files found in {args.input_path} with patterns {patterns}")
+        return
+
+    all_chunks: List[Chunk] = []
+    for fp in files:
+        raw_text = read_file(fp)
+        rel_path = os.path.relpath(fp, args.input_path)
+        
+        segments = chunk_text(raw_text, args.chunk_size, args.overlap)
+        for idx, seg in enumerate(segments):
+            all_chunks.append(
+                Chunk(
+                    id=str(uuid.uuid4()),
+                    text=seg,
+                    metadata={
+                        "source": args.source_name,
+                        "file_path": rel_path,
+                        "chunk_index": idx
+                    }
+                )
+            )
+
+    # 4. Upsert to Qdrant
+    if all_chunks:
+        upsert_chunks(qclient, args.collection, embedder, all_chunks, args.batch_size)
+        print(f"✅ Successfully upserted {len(all_chunks)} chunks from {len(files)} files.")
+    else:
+        print("❌ No valid chunks generated.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
 import subprocess
 import tempfile
 import os
