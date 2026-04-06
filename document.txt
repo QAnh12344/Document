@@ -1,3 +1,86 @@
+import time
+import random
+import uvicorn
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+app = FastAPI()
+
+# --- 1. Định nghĩa các chỉ số Prometheus ---
+REQUEST_COUNTER = Counter(
+    'llm_requests_total', 'Tổng số request đến LLM', ['model', 'status']
+)
+TOKEN_COUNTER = Counter(
+    'llm_tokens_total', 'Tổng số token đã xử lý', ['model', 'type']
+)
+LATENCY_HISTOGRAM = Histogram(
+    'llm_response_duration_seconds', 'Thời gian phản hồi của LLM', ['model'],
+    buckets=[0.5, 1, 2, 5, 10, 20, 60]
+)
+TPS_GAUGE = Gauge(
+    'llm_tokens_per_second', 'Tốc độ xử lý token (Tokens/s)', ['model']
+)
+
+# --- 2. Hàm giả lập xử lý LLM ---
+def fake_llm_inference(prompt: str):
+    # Giả lập thời gian suy luận từ 1 đến 3 giây
+    process_time = random.uniform(1.0, 3.0)
+    time.sleep(process_time)
+    
+    # Giả lập số lượng token dựa trên độ dài prompt
+    input_tokens = len(prompt.split())
+    output_tokens = random.randint(50, 200)
+    
+    return process_time, input_tokens, output_tokens
+
+# --- 3. Các Routes ---
+
+@app.get("/metrics")
+def metrics():
+    """Endpoint để Prometheus server vào lấy dữ liệu"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.post("/generate")
+async def generate(prompt: str, model: str = "gpt-4o"):
+    start_time = time.time()
+    
+    try:
+        # Chạy model
+        duration, in_tokens, out_tokens = fake_llm_inference(prompt)
+        
+        # Cập nhật Metrics
+        REQUEST_COUNTER.labels(model=model, status="success").inc()
+        TOKEN_COUNTER.labels(model=model, type="input").inc(in_tokens)
+        TOKEN_COUNTER.labels(model=model, type="output").inc(out_tokens)
+        LATENCY_HISTOGRAM.labels(model=model).observe(time.time() - start_time)
+        
+        # Tính TPS (Tokens Per Second)
+        tps = out_tokens / duration
+        TPS_GAUGE.labels(model=model).set(tps)
+        
+        return {
+            "model": model,
+            "response": f"Đây là câu trả lời giả lập cho: {prompt[:20]}...",
+            "usage": {"input": in_tokens, "output": out_tokens},
+            "tps": round(tps, 2)
+        }
+    except Exception:
+        REQUEST_COUNTER.labels(model=model, status="error").inc()
+        return {"error": "Something went wrong"}
+
+# --- 4. Hàm Main để chạy thử ---
+if __name__ == "__main__":
+    print("--- LLM Monitoring Service đang khởi chạy ---")
+    print("1. Truy cập http://127.0.0.1:8000/metrics để xem dữ liệu thô.")
+    print("2. Dùng Postman hoặc cURL gọi POST http://127.0.0.1:8000/generate?prompt=hello để tạo dữ liệu.")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
 from __future__ import annotations
 
 import argparse
