@@ -1,3 +1,59 @@
+# --- Python & Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.venv
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# --- AI Models & Data (Quan trọng) ---
+# Không bao giờ push file model nặng (bin, pt, h5) lên Git
+# Thay vào đó hãy dùng script download hoặc mount volume
+models/
+weights/
+*.bin
+*.pt
+*.pth
+*.h5
+*.onnx
+.cache/
+huggingface/
+
+# --- Docker & OS ---
+.docker/
+*.log
+.DS_Store
+Thumbs.db
+
+# --- Monitoring & Database ---
+prometheus_data/
+grafana_data/
+redis_data/
+*.db
+*.sqlite3
+
+# --- Streamlit ---
+.streamlit/
+
+
+
+
+
+
 import streamlit as st
 import redis
 import os
