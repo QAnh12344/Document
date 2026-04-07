@@ -1,3 +1,93 @@
+import redis
+import os
+import json
+import time
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from prometheus_client import start_http_server, Counter, Histogram
+from shared.tracking import AITracker
+
+# 1. Khởi tạo Prometheus Metrics (Dành cho Grafana)
+# Đo thời gian xử lý AI (Latency)
+AI_LATENCY = Histogram('ai_inference_duration_seconds', 'Thời gian xử lý Model PhoBERT')
+# Đếm tổng số task đã hoàn thành
+TASKS_COUNTER = Counter('ai_processed_tasks_total', 'Tổng số task AI đã hoàn thành')
+
+# 2. Cấu hình Tracking & Redis
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
+tracker = AITracker("ai-worker-phobert")
+
+# 3. Load Model PhoBERT (Thực tế)
+# Lưu ý: Trong Docker, nên mount folder weights để tránh tải lại mỗi lần khởi động
+MODEL_NAME = "vinai/phobert-base" # Hoặc đường dẫn tới model đã fine-tune của bạn
+print(f"--- Đang tải Model {MODEL_NAME}... ---")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME) 
+# (Bỏ comment dòng trên khi bạn đã sẵn sàng chạy với GPU/RAM đủ lớn)
+
+def process_sentiment(text):
+    """
+    Hàm xử lý logic AI thực tế. 
+    Ở đây demo luồng Tokenize và giả lập kết quả.
+    """
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+    # logic: result = model(**inputs)
+    time.sleep(0.5) # Giả lập thời gian Model chạy thực tế
+    return "Tích cực (Positive)"
+
+def main():
+    # Mở cổng 8000 để Prometheus vào lấy dữ liệu
+    start_http_server(8000)
+    
+    r = redis.Redis(host=REDIS_HOST, port=6379, db=0)
+    print("🚀 Worker AI đã sẵn sàng và đang lắng nghe hàng đợi 'ai_queue'...")
+
+    while True:
+        # Đợi Task từ Redis (Blocking Pop)
+        task_data = r.brpop('ai_queue', timeout=5)
+        
+        if task_data:
+            # Giải mã dữ liệu JSON từ Producer
+            raw_payload = task_data[1].decode('utf-8')
+            data = json.loads(raw_payload)
+            
+            # Lấy context từ request để Tracking đồng bộ
+            # (Sử dụng lại request_id từ Producer để liên kết log)
+            ctx = {
+                "id": data.get("request_id"),
+                "start": time.time(),
+                "type": "sentiment_analysis"
+            }
+            
+            try:
+                # Bắt đầu đo thời gian xử lý cho Prometheus và Logging
+                with AI_LATENCY.time():
+                    sentiment_result = process_sentiment(data['content'])
+                
+                # Cập nhật số lượng task hoàn thành
+                TASKS_COUNTER.inc()
+                
+                # Log thành công chuẩn JSON (Sẵn sàng cho ELK)
+                tracker.end_track(ctx, status="success", extra_info={
+                    "sentiment": sentiment_result,
+                    "content_preview": data['content'][:50],
+                    "priority": data.get("priority")
+                })
+                
+                print(f"✅ Xong Request {ctx['id']}: {sentiment_result}")
+
+            except Exception as e:
+                # Log lỗi chi tiết nếu Model sập
+                tracker.end_track(ctx, status="error", extra_info={"error": str(e)})
+                print(f"❌ Lỗi xử lý Request {ctx['id']}: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
 import logging
 import json
 import time
