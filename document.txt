@@ -4,6 +4,103 @@ import json
 import time
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from pyvi import ViTokenizer
+from prometheus_client import start_http_server, Counter, Histogram
+from shared.tracking import AITracker
+
+# 1. Khởi tạo Giám sát & Logging
+# Histogram đo latency thực tế từ model
+AI_LATENCY = Histogram('ai_inference_seconds', 'Thơi gian inference PhoBERT trên CPU')
+TASKS_COUNTER = Counter('ai_tasks_total', 'Tổng số task đã hoàn thành')
+tracker = AITracker("ai-worker-cpu-native")
+
+# 2. Cấu hình Redis
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
+
+# 3. Load Model "Thật" (PhoBERT)
+# Sử dụng Torch trên CPU
+device = torch.device("cpu")
+MODEL_NAME = "vinai/phobert-base" # Hoặc "vinai/phobert-base-v2"
+
+print(f"--- Đang tải Model {MODEL_NAME} vào CPU... ---")
+# Dùng tokenizer đặc thù cho PhoBERT
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Tải model Classification (giả định 3 nhãn: Tiêu cực, Trung tính, Tích cực)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=3)
+model.to(device)
+model.eval() # Chế độ dự đoán, không phải training
+
+def main():
+    # Mở cổng metrics cho Prometheus
+    start_http_server(8000)
+    
+    r = redis.Redis(host=REDIS_HOST, port=6379, db=0)
+    print("🚀 Worker CPU (PyTorch Native) đang lắng nghe...")
+
+    while True:
+        # Lấy Task từ Redis
+        task_data = r.brpop('ai_queue', timeout=5)
+        
+        if task_data:
+            data = json.loads(task_data[1].decode('utf-8'))
+            
+            # Đồng bộ Request ID từ Producer để Tracking
+            ctx = {
+                "id": data.get("request_id"),
+                "start": time.time(),
+                "type": "sentiment_analysis"
+            }
+            
+            try:
+                # Bắt đầu đo hiệu năng và Inference
+                with AI_LATENCY.time():
+                    # Bước 1: Tách từ tiếng Việt (PyVi) - Quan trọng để PhoBERT hiểu
+                    text = ViTokenizer.tokenize(data['content'])
+                    
+                    # Bước 2: Chuyển text sang Tensor
+                    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+                    
+                    # Bước 3: Dự đoán (Inference)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        # Lấy nhãn có xác suất cao nhất
+                        prediction = torch.argmax(outputs.logits, dim=1).item()
+                    
+                    # Giả định nhãn (Tùy theo model bạn đã train)
+                    labels = {0: "Tiêu cực", 1: "Trung tính", 2: "Tích cực"}
+                    result = labels.get(prediction, "N/A")
+
+                # Cập nhật số liệu cho Prometheus
+                TASKS_COUNTER.inc()
+                
+                # Ghi Log JSON chuẩn để sau này cắm ELK
+                tracker.end_track(ctx, status="success", extra_info={
+                    "sentiment": result,
+                    "text_length": len(data['content']),
+                    "device": "cpu"
+                })
+                
+                print(f"✅ Đã xử lý [{ctx['id']}]: {result}")
+
+            except Exception as e:
+                tracker.end_track(ctx, status="error", extra_info={"error": str(e)})
+                print(f"❌ Lỗi: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+import redis
+import os
+import json
+import time
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from prometheus_client import start_http_server, Counter, Histogram
 from shared.tracking import AITracker
 
