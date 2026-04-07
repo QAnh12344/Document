@@ -1,3 +1,78 @@
+import logging
+import json
+import time
+import uuid
+import sys
+from pythonjsonlogger import jsonlogger
+
+def get_logger(service_name):
+    """Khởi tạo logger xuất ra định dạng JSON chuẩn ELK"""
+    logger = logging.getLogger(service_name)
+    
+    # Kiểm tra nếu logger đã có handler thì không add thêm (tránh lặp log)
+    if not logger.handlers:
+        logHandler = logging.StreamHandler(sys.stdout)
+        
+        # Cấu hình các trường (fields) mà ELK sẽ tự động bắt được
+        # %(asctime)s: Thời gian | %(levelname)s: Mức độ (INFO/ERROR)
+        # %(name)s: Tên service (Producer/Worker) | %(message)s: Nội dung chính
+        formatter = jsonlogger.JsonFormatter(
+            fmt='%(asctime)s %(levelname)s %(name)s %(message)s'
+        )
+        
+        logHandler.setFormatter(formatter)
+        logger.addHandler(logHandler)
+        logger.setLevel(logging.INFO)
+    
+    return logger
+
+class AITracker:
+    def __init__(self, service_name):
+        self.logger = get_logger(service_name)
+        self.service_name = service_name
+
+    def start_track(self, task_type, metadata=None):
+        """
+        Khởi tạo một phiên làm việc (Context)
+        Trả về một Dictionary chứa ID duy nhất để truy vết toàn hệ thống.
+        """
+        request_id = str(uuid.uuid4())
+        return {
+            "request_id": request_id,
+            "start_time": time.time(),
+            "task_type": task_type,
+            "metadata": metadata or {}
+        }
+
+    def end_track(self, context, status="success", extra_info=None):
+        """
+        Kết thúc phiên làm việc, tính toán Latency và đẩy log JSON ra console.
+        """
+        latency_ms = (time.time() - context["start_time"]) * 1000
+        
+        # Gom tất cả thông tin thành một Object JSON
+        log_payload = {
+            "request_id": context["request_id"],
+            "task_type": context["task_type"],
+            "latency_ms": round(latency_ms, 2),
+            "status": status,
+            "service": self.service_name
+        }
+        
+        # Bổ sung thông tin extra (ví dụ: độ dài văn bản, kết quả AI)
+        if extra_info:
+            log_payload.update(extra_info)
+
+        if status == "success":
+            self.logger.info("Task processed", extra=log_payload)
+        else:
+            self.logger.error("Task failed", extra=log_payload)
+            
+        return log_payload
+
+
+
+
 import time
 import random
 import uvicorn
