@@ -1,3 +1,77 @@
+version: '3.8'
+
+services:
+  # 1. Message Broker: Nơi lưu trữ hàng đợi tasks
+  redis:
+    image: redis:alpine
+    container_name: redis_broker
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 2. Producer: Giao diện Streamlit (Nơi nhận văn bản)
+  producer:
+    build:
+      context: .
+      dockerfile: apps/producer/Dockerfile
+    container_name: ai_producer
+    environment:
+      - REDIS_HOST=redis
+    ports:
+      - "8501:8501"
+    depends_on:
+      - redis
+    restart: always
+
+  # 3. Worker: Bộ não AI xử lý PhoBERT trên CPU
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    container_name: ai_worker
+    environment:
+      - REDIS_HOST=redis
+      - TRANSFORMERS_CACHE=/app/.cache # Lưu model vào folder này
+    ports:
+      - "8000:8000" # Port xuất metrics cho Prometheus
+    volumes:
+      - huggingface_cache:/app/.cache # Cache model tránh tải lại nhiều lần
+    depends_on:
+      - redis
+    restart: always
+
+  # 4. Prometheus: Hệ thống giám sát (Scrape data mỗi 5s)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus_monitor
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: always
+
+  # 5. Grafana: Dashboard vẽ biểu đồ Latency & Throughput
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_viz
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # User: admin / Pass: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: always
+
+# Khai báo các Volume để lưu trữ dữ liệu bền vững
+volumes:
+  huggingface_cache:
+  prometheus_data:
+  grafana_data:
+
+
+
+
 # --- Python & Environment ---
 __pycache__/
 *.py[cod]
