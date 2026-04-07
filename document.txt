@@ -1,3 +1,117 @@
+import streamlit as st
+import redis
+import os
+import json
+import time
+from shared.tracking import AITracker
+
+# 1. Cấu hình kết nối
+# Lấy biến môi trường từ Docker Compose, mặc định là localhost để test local
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = 6379
+
+# Khởi tạo Tracker cho UI
+tracker = AITracker("streamlit-producer")
+
+# Kết nối tới Redis Broker
+try:
+    r = redis.Redis(
+        host=REDIS_HOST, 
+        port=REDIS_PORT, 
+        db=0, 
+        decode_responses=True, # Tự động decode bytes thành string
+        socket_timeout=5
+    )
+except Exception as e:
+    st.error(f"Lỗi kết nối Redis: {e}")
+
+# 2. Giao diện người dùng (UI)
+st.set_page_config(page_title="VN AI Analysis", page_icon="🕵️")
+
+st.title("🕵️ Vietnamese Sentiment Pipeline")
+st.caption("Hệ thống phân tích cảm xúc thời gian thực sử dụng PhoBERT & Redis")
+
+# Sidebar hiển thị thông tin kỹ thuật
+st.sidebar.header("📊 Trạng thái hệ thống")
+try:
+    q_size = r.llen('ai_queue')
+    st.sidebar.metric("Hàng đợi hiện tại", f"{q_size} tasks")
+    if q_size > 50:
+        st.sidebar.warning("⚠️ Hệ thống đang quá tải nhẹ")
+except:
+    st.sidebar.error("❌ Redis Offline")
+
+# Khu vực nhập liệu
+with st.form("input_form"):
+    text_input = st.text_area(
+        "Nhập nội dung cần phân tích:", 
+        placeholder="Ví dụ: Đồ ăn ở đây rất ngon nhưng phục vụ hơi chậm...",
+        height=150
+    )
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        priority = st.selectbox("Mức độ ưu tiên:", ["Normal", "High", "Critical"])
+    with col2:
+        source = st.text_input("Nguồn dữ liệu:", "Web App")
+
+    submit = st.form_submit_button("Gửi phân tích")
+
+# 3. Logic xử lý khi Submit
+if submit:
+    if not text_input.strip():
+        st.error("Vui lòng nhập văn bản!")
+    else:
+        # Bắt đầu Tracking cho Request này
+        # Metadata giúp ELK sau này lọc được log theo mức độ ưu tiên
+        ctx = tracker.start_track(
+            task_type="sentiment_analysis", 
+            metadata={"priority": priority, "source": source}
+        )
+        
+        try:
+            # Đóng gói dữ liệu thành JSON để gửi qua Redis
+            payload = {
+                "request_id": ctx["request_id"],
+                "content": text_input,
+                "priority": priority,
+                "timestamp": time.time()
+            }
+            
+            # Đẩy vào list 'ai_queue' (L-Push)
+            r.lpush('ai_queue', json.dumps(payload))
+            
+            # Log thành công (JSON log cho ELK)
+            tracker.end_track(ctx, status="success", extra_info={
+                "char_count": len(text_input),
+                "queue_status": "pushed"
+            })
+            
+            st.success(f"✅ Đã gửi thành công!")
+            st.info(f"**Request ID:** `{ctx['request_id']}`")
+            st.toast("Dữ liệu đang được Worker xử lý...")
+            
+        except Exception as e:
+            # Log lỗi nếu Redis sập hoặc lỗi logic
+            tracker.end_track(ctx, status="error", extra_info={"error_detail": str(e)})
+            st.error(f"Lỗi hệ thống: {e}")
+
+# Hướng dẫn xem kết quả
+st.divider()
+st.markdown("""
+### 💡 Lưu ý cho AI Engineer:
+1. Bạn có thể theo dõi biểu đồ Latency trên **Grafana (Port 3000)**.
+2. Log chi tiết định dạng JSON đang được xuất ra console, sẵn sàng cho **ELK Stack**.
+3. Sử dụng `docker-compose up --scale worker=3` nếu muốn xử lý nhanh hơn.
+""")
+
+
+
+
+
+
+
+
 import redis
 import os
 import json
