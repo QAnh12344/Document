@@ -1,3 +1,46 @@
+def compute_port_numbering(edge_index, timestamp):
+    row, col = edge_index
+    E = row.size(0)
+
+    in_port = torch.zeros(E, dtype=torch.long)
+    out_port = torch.zeros(E, dtype=torch.long)
+
+    # =========================
+    # INCOMING (LOCAL PER NODE)
+    # =========================
+    for v in torch.unique(col):
+        idx = (col == v).nonzero(as_tuple=True)[0]
+
+        if idx.numel() == 0:
+            continue
+
+        # local sort ONLY inside N_in(v)
+        local_time = timestamp[idx]
+        order = torch.argsort(local_time)
+
+        in_port[idx[order]] = torch.arange(len(idx))
+
+    # =========================
+    # OUTGOING (LOCAL PER NODE)
+    # =========================
+    for v in torch.unique(row):
+        idx = (row == v).nonzero(as_tuple=True)[0]
+
+        if idx.numel() == 0:
+            continue
+
+        local_time = timestamp[idx]
+        order = torch.argsort(local_time)
+
+        out_port[idx[order]] = torch.arange(len(idx))
+
+    return in_port, out_port
+
+
+
+
+
+
 import pandas as pd
 import torch
 import numpy as np
