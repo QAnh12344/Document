@@ -1,3 +1,64 @@
+import torch
+
+def compute_port_numbering(edge_index, timestamp):
+    """
+    Paper-style port numbering (clean + fast)
+
+    Args:
+        edge_index: [2, E]
+        timestamp:  [E]
+
+    Returns:
+        in_port:  [E]
+        out_port: [E]
+    """
+
+    row, col = edge_index
+    E = row.size(0)
+
+    # =====================================================
+    # INCOMING PORT NUMBERING
+    # =====================================================
+
+    # sort by (col, timestamp)
+    in_order = torch.argsort(col * (timestamp.max() + 1) + timestamp)
+
+    in_port = torch.empty(E, dtype=torch.long)
+
+    sorted_col = col[in_order]
+
+    # group boundaries
+    unique_nodes, counts = torch.unique_consecutive(sorted_col, return_counts=True)
+
+    start = 0
+    for c in counts:
+        in_port[in_order[start:start + c]] = torch.arange(c)
+        start += c
+
+    # =====================================================
+    # OUTGOING PORT NUMBERING
+    # =====================================================
+
+    out_order = torch.argsort(row * (timestamp.max() + 1) + timestamp)
+
+    out_port = torch.empty(E, dtype=torch.long)
+
+    sorted_row = row[out_order]
+
+    unique_nodes, counts = torch.unique_consecutive(sorted_row, return_counts=True)
+
+    start = 0
+    for c in counts:
+        out_port[out_order[start:start + c]] = torch.arange(c)
+        start += c
+
+    return in_port, out_port
+
+
+
+
+.
+
 def compute_port_numbering(edge_index, timestamp):
     row, col = edge_index
     E = row.size(0)
