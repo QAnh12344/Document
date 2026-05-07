@@ -1,3 +1,129 @@
+import pandas as pd
+import torch
+import numpy as np
+
+# =========================
+# 1. LOAD & PARSE TIME
+# =========================
+df = pd.read_csv("HI-Small_Trans.csv")
+
+df['Timestamp'] = pd.to_datetime(df['Timestamp'])  # yyyy-mm-dd hh:mm:ss
+df = df.sort_values('Timestamp')
+
+# =========================
+# 2. ENCODE TIME → INTEGER
+# =========================
+df['ts_enc'] = df['Timestamp'].astype('int64') // 10**9  # seconds
+
+# =========================
+# 3. BUILD EDGE INDEX
+# =========================
+all_nodes = pd.unique(df[['Account', 'Account.1']].values.ravel())
+id_map = {n:i for i, n in enumerate(all_nodes)}
+
+src = df['Account'].map(id_map).values
+dst = df['Account.1'].map(id_map).values
+
+edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+# timestamp per edge
+timestamp = torch.tensor(df['ts_enc'].values, dtype=torch.long)
+
+# =========================
+# 4. PORT NUMBERING (PAPER CORRECT)
+# =========================
+def compute_port_numbering(edge_index, timestamp):
+    row, col = edge_index
+    E = row.size(0)
+
+    in_port = torch.zeros(E, dtype=torch.long)
+    out_port = torch.zeros(E, dtype=torch.long)
+
+    # ------------------
+    # INCOMING
+    # ------------------
+    in_order = torch.argsort(col * 10**10 + timestamp)
+
+    counter = {}
+    for idx in in_order:
+        v = col[idx].item()
+        if v not in counter:
+            counter[v] = 0
+        in_port[idx] = counter[v]
+        counter[v] += 1
+
+    # ------------------
+    # OUTGOING
+    # ------------------
+    out_order = torch.argsort(row * 10**10 + timestamp)
+
+    counter = {}
+    for idx in out_order:
+        v = row[idx].item()
+        if v not in counter:
+            counter[v] = 0
+        out_port[idx] = counter[v]
+        counter[v] += 1
+
+    return in_port, out_port
+
+in_port, out_port = compute_port_numbering(edge_index, timestamp)
+
+# =========================
+# 5. EDGE FEATURES
+# =========================
+df['log_amount'] = np.log1p(df['Amount Paid'])
+df['hour'] = df['Timestamp'].dt.hour
+df['weekday'] = df['Timestamp'].dt.weekday
+df['time_diff'] = df.groupby('Account')['Timestamp'].diff().dt.total_seconds().fillna(0)
+
+edge_attr = torch.tensor(
+    df[['log_amount', 'hour', 'weekday', 'time_diff']].values,
+    dtype=torch.float
+)
+
+# =========================
+# 6. ADD PORT FEATURES
+# =========================
+port_feat = torch.stack([in_port, out_port], dim=1).float()
+edge_attr = torch.cat([edge_attr, port_feat], dim=-1)
+
+# =========================
+# 7. NODE FEATURES (simple version)
+# =========================
+num_nodes = len(all_nodes)
+
+in_deg = torch.zeros(num_nodes)
+out_deg = torch.zeros(num_nodes)
+
+for i in range(edge_index.size(1)):
+    out_deg[edge_index[0, i]] += 1
+    in_deg[edge_index[1, i]] += 1
+
+x = torch.stack([in_deg, out_deg], dim=1).float()
+
+# =========================
+# 8. FINAL DATA OBJECT
+# =========================
+from torch_geometric.data import Data
+
+data = Data(
+    x=x,
+    edge_index=edge_index,
+    edge_attr=edge_attr,
+    y=torch.tensor(df['Is Laundering'].values, dtype=torch.float)
+)
+
+print(data)
+
+
+
+
+
+
+
+
+
 def compute_port_numbering_paper(edge_index, timestamp, num_nodes):
     row, col = edge_index
     E = row.size(0)
