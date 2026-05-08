@@ -1,3 +1,45 @@
+def inject_ego_ids(batch):
+
+    num_nodes = batch.x.size(0)
+
+    # 1 ego feature duy nhất
+    ego = torch.zeros(
+        (num_nodes, 1),
+        device=batch.x.device
+    )
+
+    ########################################
+    # target transaction nodes
+    ########################################
+
+    src_nodes = batch.edge_label_index[0]
+    dst_nodes = batch.edge_label_index[1]
+
+    ego_nodes = torch.unique(
+        torch.cat([src_nodes, dst_nodes])
+    )
+
+    ego[ego_nodes] = 1.0
+
+    ########################################
+    # append vào node features
+    ########################################
+
+    x_new = torch.cat(
+        [batch.x, ego],
+        dim=-1
+    )
+
+    return x_new
+
+
+
+
+
+
+
+
+
 def compute_port_numbering(edge_index, timestamp):
 
     row, col = edge_index
