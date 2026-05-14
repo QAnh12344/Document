@@ -1,3 +1,77 @@
+class AdvancedTemporalEmbedding(nn.Module):
+    def __init__(self, dt):
+        super().__init__()
+
+        d1 = dt // 4
+        d2 = dt // 2
+        d3 = dt // 4
+
+        self.dt = dt
+        self.d2 = d2
+
+        self.basic_proj = nn.Linear(1, d1)
+
+        self.multi_scale_proj = nn.Linear(3, d3)
+
+        self.pos_proj = nn.Linear(d2 * 2, d2)
+
+        self.fusion = nn.Sequential(
+            nn.Linear(d1 + d2 + d3, dt),
+            nn.LayerNorm(dt),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+    def positional_encoding(self, t, dim):
+        device = t.device
+
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, device=device).float()
+            * (-math.log(10000.0) / dim)
+        )
+
+        pe = torch.zeros(t.size(0), dim, device=device)
+
+        pe[:, 0::2] = torch.sin(t.unsqueeze(1) * div_term)
+        pe[:, 1::2] = torch.cos(t.unsqueeze(1) * div_term)
+
+        return pe
+
+    def forward(self, src_t, dst_t):
+
+        delta_t = torch.abs(src_t - dst_t).unsqueeze(-1)
+
+        # basic
+        f_delta = self.basic_proj(delta_t)
+
+        # multi-scale
+        short = delta_t
+        medium = torch.log1p(delta_t)
+        long = torch.sqrt(delta_t + 1)
+
+        ms = torch.cat([short, medium, long], dim=-1)
+
+        f_ms = self.multi_scale_proj(ms)
+
+        # positional
+        pe_src = self.positional_encoding(src_t, self.d2)
+        pe_dst = self.positional_encoding(dst_t, self.d2)
+
+        pe = torch.cat([pe_src, pe_dst], dim=-1)
+
+        f_pos = self.pos_proj(pe)
+
+        out = torch.cat([f_delta, f_ms, f_pos], dim=-1)
+
+        return self.fusion(out)
+
+
+
+
+
+
+
+
 c++ -O3 -Wall -shared -std=c++17 -fPIC \
 $(python3.8 -m pybind11 --includes) \
 ports_cpp.cpp \
