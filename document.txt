@@ -1,3 +1,643 @@
+class GnnHelper(nn.Module):
+
+    def __init__(
+        self,
+        num_gnn_layers,
+        n_hidden,
+        edge_updates,
+        final_dropout,
+        index_,
+        deg,
+        args
+    ):
+        super().__init__()
+
+        self.args = args
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.edge_mlps = nn.ModuleList()
+
+        for _ in range(num_gnn_layers):
+
+            # =====================================================
+            # MESSAGE FUNCTION
+            # =====================================================
+            nn_edge = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden),
+                nn.ReLU(),
+                nn.Linear(n_hidden, n_hidden)
+            )
+
+            if args.conv_type == 'gine':
+
+                conv = GINEConv(
+                    nn=nn_edge,
+                    edge_dim=n_hidden
+                )
+
+            elif args.conv_type == 'gat':
+
+                conv = GATConv(
+                    in_channels=n_hidden,
+                    out_channels=n_hidden // args.n_heads,
+                    heads=args.n_heads,
+                    edge_dim=n_hidden,
+                    dropout=final_dropout,
+                    concat=True
+                )
+
+            elif args.conv_type == 'pna':
+
+                aggregators = [
+                    'mean',
+                    'min',
+                    'max',
+                    'std'
+                ]
+
+                scalers = [
+                    'identity',
+                    'amplification',
+                    'attenuation'
+                ]
+
+                conv = PNAConv(
+                    in_channels=n_hidden,
+                    out_channels=n_hidden,
+                    aggregators=aggregators,
+                    scalers=scalers,
+                    deg=deg,
+                    edge_dim=n_hidden,
+                    towers=1,
+                    pre_layers=1,
+                    post_layers=1,
+                    divide_input=False
+                )
+
+            else:
+                raise ValueError(
+                    f'Unknown conv_type {args.conv_type}'
+                )
+
+            self.convs.append(conv)
+
+            self.norms.append(
+                nn.LayerNorm(n_hidden)
+            )
+
+            # =====================================================
+            # EDGE UPDATE
+            # =====================================================
+            if edge_updates:
+
+                self.edge_mlps.append(
+                    nn.Sequential(
+
+                        nn.Linear(
+                            n_hidden * 3,
+                            n_hidden
+                        ),
+
+                        nn.ReLU(),
+
+                        nn.Dropout(final_dropout),
+
+                        nn.Linear(
+                            n_hidden,
+                            n_hidden
+                        )
+                    )
+                )
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr,
+        simp_edge_batch=None
+    ):
+
+        for layer in range(self.num_gnn_layers):
+
+            x_res = x
+
+            # =====================================================
+            # NODE UPDATE
+            # =====================================================
+            x = self.convs[layer](
+                x,
+                edge_index,
+                edge_attr
+            )
+
+            x = self.norms[layer](x)
+
+            x = F.relu(x)
+
+            x = x + x_res
+
+            # =====================================================
+            # EDGE UPDATE
+            # =====================================================
+            if self.edge_updates:
+
+                src = edge_index[0]
+                dst = edge_index[1]
+
+                edge_input = torch.cat(
+                    [
+                        x[src],
+                        x[dst],
+                        edge_attr
+                    ],
+                    dim=-1
+                )
+
+                edge_res = edge_attr
+
+                edge_attr = self.edge_mlps[layer](
+                    edge_input
+                )
+
+                edge_attr = edge_attr + edge_res
+
+            # =====================================================
+            # FLATTEN EDGES
+            # =====================================================
+            if (
+                self.args.flatten_edges
+                and simp_edge_batch is not None
+            ):
+
+                edge_attr = scatter(
+                    edge_attr,
+                    simp_edge_batch,
+                    dim=0,
+                    reduce='mean'
+                )
+
+        return x, edge_attr
+
+
+
+
+class MultiMPNN(torch.nn.Module):
+
+    def __init__(
+        self,
+        num_features,
+        num_gnn_layers,
+        n_classes=2,
+        n_hidden=100,
+        edge_updates=False,
+        edge_dim=None,
+        final_dropout=0.5,
+        index_=None,
+        deg=None,
+        args=None
+    ):
+        super().__init__()
+
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+
+        # =========================================================
+        # NODE EMBEDDING
+        # =========================================================
+        self.node_emb = nn.Sequential(
+            nn.Linear(num_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.ReLU()
+        )
+
+        # =========================================================
+        # EDGE EMBEDDING
+        # =========================================================
+        self.edge_emb = nn.Sequential(
+            nn.Linear(edge_dim, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.ReLU()
+        )
+
+        if args.reverse_mp or args.reverse_mp_lp:
+
+            self.edge_emb_rev = nn.Sequential(
+                nn.Linear(edge_dim, n_hidden),
+                nn.LayerNorm(n_hidden),
+                nn.ReLU()
+            )
+
+        # =========================================================
+        # TEMPORAL ENCODER
+        # =========================================================
+        self.use_time_encoder = getattr(
+            args,
+            "use_time_encoder",
+            True
+        )
+
+        if self.use_time_encoder:
+
+            self.temporal_encoder = AdvancedTemporalEncoder(
+                dt=n_hidden,
+                dropout=0.1
+            )
+
+            self.time_gate = nn.Sequential(
+
+                nn.Linear(
+                    n_hidden * 2,
+                    n_hidden
+                ),
+
+                nn.ReLU(),
+
+                nn.Linear(
+                    n_hidden,
+                    n_hidden
+                ),
+
+                nn.Sigmoid()
+            )
+
+            self.time_norm = nn.LayerNorm(
+                n_hidden
+            )
+
+        # =========================================================
+        # EDGE DIRECTION
+        # =========================================================
+        if args.edge_agg_type == 'adamm':
+
+            self.edge_direction_encoder = (
+                DiscreteEncoder(
+                    n_hidden,
+                    max_num_values=4
+                )
+            )
+
+        # =========================================================
+        # GNN
+        # =========================================================
+        self.gnn = GnnHelper(
+            num_gnn_layers=num_gnn_layers,
+            n_hidden=n_hidden,
+            edge_updates=edge_updates,
+            final_dropout=final_dropout,
+            index_=index_,
+            deg=deg,
+            args=args
+        )
+
+        # =========================================================
+        # HETERO
+        # =========================================================
+        if args.reverse_mp or args.reverse_mp_lp:
+
+            self.gnn = to_hetero(
+                self.gnn,
+                metadata=(
+                    ['node'],
+                    [
+                        ('node', 'to', 'node'),
+                        ('node', 'rev_to', 'node')
+                    ]
+                ),
+                aggr='mean'
+            )
+
+        # =========================================================
+        # HEAD
+        # =========================================================
+        if args.task == 'edge_class':
+
+            self.mlp = nn.Sequential(
+
+                nn.Linear(
+                    n_hidden * 3,
+                    128
+                ),
+
+                nn.ReLU(),
+
+                nn.Dropout(final_dropout),
+
+                nn.Linear(
+                    128,
+                    64
+                ),
+
+                nn.ReLU(),
+
+                nn.Dropout(final_dropout),
+
+                nn.Linear(
+                    64,
+                    n_classes
+                )
+            )
+
+        elif args.task == 'node_class':
+
+            self.mlp = nn.Sequential(
+
+                nn.Linear(
+                    n_hidden,
+                    128
+                ),
+
+                nn.ReLU(),
+
+                nn.Dropout(final_dropout),
+
+                nn.Linear(
+                    128,
+                    64
+                ),
+
+                nn.ReLU(),
+
+                nn.Dropout(final_dropout),
+
+                nn.Linear(
+                    64,
+                    n_classes
+                )
+            )
+
+        elif args.task == 'lp':
+
+            self.edge_readout = LinkPredHead(
+                n_hidden=n_hidden,
+                n_classes=1,
+                final_dropout=final_dropout
+            )
+
+    # =============================================================
+    # TEMPORAL FUSION
+    # =============================================================
+    def add_temporal_embedding(
+        self,
+        edge_attr,
+        edge_index,
+        timestamps
+    ):
+
+        src = edge_index[0]
+        dst = edge_index[1]
+
+        ts_src = timestamps[src]
+        ts_dst = timestamps[dst]
+
+        temb = self.temporal_encoder(
+            timestamps_src=ts_src,
+            timestamps_dst=ts_dst
+        )
+
+        gate = self.time_gate(
+            torch.cat(
+                [edge_attr, temb],
+                dim=-1
+            )
+        )
+
+        edge_attr = edge_attr + gate * temb
+
+        edge_attr = self.time_norm(
+            edge_attr
+        )
+
+        return edge_attr
+
+    # =============================================================
+    # FORWARD
+    # =============================================================
+    def forward(self, data):
+
+        # =========================================================
+        # HETERO GRAPH
+        # =========================================================
+        if isinstance(data, HeteroData):
+
+            x_dict = {
+                'node': self.node_emb(
+                    data['node'].x
+                )
+            }
+
+            edge_attr_to = self.edge_emb(
+                data[
+                    'node',
+                    'to',
+                    'node'
+                ].edge_attr
+            )
+
+            edge_attr_rev = self.edge_emb_rev(
+                data[
+                    'node',
+                    'rev_to',
+                    'node'
+                ].edge_attr
+            )
+
+            # -----------------------------------------------------
+            # TEMPORAL
+            # -----------------------------------------------------
+            if self.use_time_encoder:
+
+                edge_attr_to = (
+                    self.add_temporal_embedding(
+                        edge_attr=edge_attr_to,
+                        edge_index=data[
+                            'node',
+                            'to',
+                            'node'
+                        ].edge_index,
+                        timestamps=data[
+                            'node',
+                            'to',
+                            'node'
+                        ].timestamps.float()
+                    )
+                )
+
+                edge_attr_rev = (
+                    self.add_temporal_embedding(
+                        edge_attr=edge_attr_rev,
+                        edge_index=data[
+                            'node',
+                            'rev_to',
+                            'node'
+                        ].edge_index,
+                        timestamps=data[
+                            'node',
+                            'rev_to',
+                            'node'
+                        ].timestamps.float()
+                    )
+                )
+
+            edge_attr_dict = {
+
+                (
+                    'node',
+                    'to',
+                    'node'
+                ): edge_attr_to,
+
+                (
+                    'node',
+                    'rev_to',
+                    'node'
+                ): edge_attr_rev
+            }
+
+            simp_edge_batch_dict = (
+                data.simp_edge_batch_dict
+                if self.args.flatten_edges
+                else None
+            )
+
+            x_dict, edge_attr_dict = self.gnn(
+                x_dict,
+                data.edge_index_dict,
+                edge_attr_dict,
+                simp_edge_batch_dict
+            )
+
+            x = x_dict['node']
+
+            edge_attr = edge_attr_dict[
+                (
+                    'node',
+                    'to',
+                    'node'
+                )
+            ]
+
+            # -----------------------------------------------------
+            # TASK
+            # -----------------------------------------------------
+            if self.args.task == 'edge_class':
+
+                edge_index = data[
+                    'node',
+                    'to',
+                    'node'
+                ].edge_index
+
+                x_edge = x[
+                    edge_index.T
+                ].reshape(
+                    -1,
+                    2 * self.n_hidden
+                )
+
+                x_edge = F.relu(x_edge)
+
+                x_edge = torch.cat(
+                    [
+                        x_edge,
+                        edge_attr
+                    ],
+                    dim=-1
+                )
+
+                out = self.mlp(x_edge)
+
+            elif self.args.task == 'node_class':
+
+                out = self.mlp(x)
+
+        # =========================================================
+        # HOMO GRAPH
+        # =========================================================
+        else:
+
+            x = self.node_emb(data.x)
+
+            edge_attr = self.edge_emb(
+                data.edge_attr
+            )
+
+            if self.use_time_encoder:
+
+                edge_attr = (
+                    self.add_temporal_embedding(
+                        edge_attr=edge_attr,
+                        edge_index=data.edge_index,
+                        timestamps=data.timestamps.float()
+                    )
+                )
+
+            if self.args.edge_agg_type == 'adamm':
+
+                edge_attr = (
+                    edge_attr
+                    + self.edge_direction_encoder(
+                        data.edge_direction
+                    )
+                )
+
+            simp_edge_batch = (
+                data.simp_edge_batch
+                if self.args.flatten_edges
+                else None
+            )
+
+            x, edge_attr = self.gnn(
+                x,
+                data.edge_index,
+                edge_attr,
+                simp_edge_batch
+            )
+
+            # -----------------------------------------------------
+            # TASK
+            # -----------------------------------------------------
+            if self.args.task == 'edge_class':
+
+                x_edge = x[
+                    data.edge_index.T
+                ].reshape(
+                    -1,
+                    2 * self.n_hidden
+                )
+
+                x_edge = F.relu(x_edge)
+
+                x_edge = torch.cat(
+                    [
+                        x_edge,
+                        edge_attr
+                    ],
+                    dim=-1
+                )
+
+                out = self.mlp(x_edge)
+
+            elif self.args.task == 'node_class':
+
+                out = self.mlp(x)
+
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
 class MultiMPNN(torch.nn.Module):
     def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100,
                  edge_updates=False, edge_dim=None, final_dropout=0.5,
