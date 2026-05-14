@@ -1,3 +1,360 @@
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100,
+                 edge_updates=False, edge_dim=None, final_dropout=0.5,
+                 index_=None, deg=None, args=None):
+        super().__init__()
+
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+
+        # =========================
+        # NODE / EDGE EMBEDDING
+        # =========================
+        self.node_emb = nn.Linear(num_features, n_hidden)
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+
+        if args.reverse_mp or args.reverse_mp_lp:
+            self.edge_emb_rev = nn.Linear(edge_dim, n_hidden)
+
+        # =========================
+        # TEMPORAL ENCODER
+        # =========================
+        self.use_time_encoder = getattr(args, "use_time_encoder", True)
+
+        if self.use_time_encoder:
+            self.temporal_encoder = AdvancedTemporalEncoder(
+                dt=n_hidden,
+                dropout=0.1
+            )
+
+        # =========================
+        # EDGE DIRECTION
+        # =========================
+        if args.edge_agg_type == 'adamm':
+            self.edge_direction_encoder = DiscreteEncoder(
+                n_hidden,
+                max_num_values=4
+            )
+
+        # =========================
+        # GNN
+        # =========================
+        self.gnn = GnnHelper(
+            num_gnn_layers=num_gnn_layers,
+            n_hidden=n_hidden,
+            edge_updates=edge_updates,
+            final_dropout=final_dropout,
+            index_=index_,
+            deg=deg,
+            args=args
+        )
+
+        # hetero
+        if args.reverse_mp or args.reverse_mp_lp:
+            self.gnn = to_hetero(
+                self.gnn,
+                metadata=(
+                    ['node'],
+                    [
+                        ('node', 'to', 'node'),
+                        ('node', 'rev_to', 'node')
+                    ]
+                ),
+                aggr='mean'
+            )
+
+        # =========================
+        # HEADS
+        # =========================
+        if args.task == 'edge_class':
+            self.mlp = nn.Sequential(
+                Linear(n_hidden * 3, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+
+                Linear(50, 25),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+
+                Linear(25, n_classes)
+            )
+
+        elif args.task == 'node_class':
+            self.mlp = nn.Sequential(
+                Linear(n_hidden, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+
+                Linear(50, 25),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+
+                Linear(25, n_classes)
+            )
+
+        elif args.task == 'lp':
+
+            if args.ports_batch:
+                self.edge_emb_new = nn.Linear(edge_dim - 2, n_hidden)
+
+            self.edge_readout = LinkPredHead(
+                n_hidden=n_hidden,
+                n_classes=1,
+                final_dropout=final_dropout
+            )
+
+    def forward(self, data):
+
+        # =========================================================
+        # HETERO GRAPH
+        # =========================================================
+        if isinstance(data, HeteroData):
+
+            # -------------------------
+            # node embedding
+            # -------------------------
+            x_dict = {
+                "node": self.node_emb(data['node'].x)
+            }
+
+            # -------------------------
+            # edge embedding
+            # -------------------------
+            edge_attr_to = self.edge_emb(
+                data['node', 'to', 'node'].edge_attr
+            )
+
+            edge_attr_rev = self.edge_emb_rev(
+                data['node', 'rev_to', 'node'].edge_attr
+            )
+
+            # =====================================================
+            # TEMPORAL ENCODING
+            # =====================================================
+            if self.use_time_encoder:
+
+                # timestamps KHÔNG normalize
+                t_to = data['node', 'to', 'node'].timestamps.float()
+
+                # src/dst
+                edge_index_to = data['node', 'to', 'node'].edge_index
+                src_to = edge_index_to[0]
+                dst_to = edge_index_to[1]
+
+                # temporal embedding
+                temb_to = self.temporal_encoder(
+                    timestamps_src=t_to[src_to],
+                    timestamps_dst=t_to[dst_to]
+                )
+
+                edge_attr_to = edge_attr_to + temb_to
+
+                # reverse edge
+                t_rev = data['node', 'rev_to', 'node'].timestamps.float()
+
+                edge_index_rev = data['node', 'rev_to', 'node'].edge_index
+                src_rev = edge_index_rev[0]
+                dst_rev = edge_index_rev[1]
+
+                temb_rev = self.temporal_encoder(
+                    timestamps_src=t_rev[src_rev],
+                    timestamps_dst=t_rev[dst_rev]
+                )
+
+                edge_attr_rev = edge_attr_rev + temb_rev
+
+            edge_attr_dict = {
+                ('node', 'to', 'node'): edge_attr_to,
+                ('node', 'rev_to', 'node'): edge_attr_rev,
+            }
+
+            simp_edge_batch_dict = (
+                data.simp_edge_batch_dict
+                if self.args.flatten_edges
+                else None
+            )
+
+            # =====================================================
+            # GNN
+            # =====================================================
+            x_dict, edge_attr_dict = self.gnn(
+                x_dict,
+                data.edge_index_dict,
+                edge_attr_dict,
+                simp_edge_batch_dict
+            )
+
+            x = x_dict['node']
+            edge_attr = edge_attr_dict[('node', 'to', 'node')]
+
+            # =====================================================
+            # TASK HEAD
+            # =====================================================
+            if self.args.task == 'edge_class':
+
+                edge_index = data['node', 'to', 'node'].edge_index
+
+                x_edge = x[edge_index.T].reshape(
+                    -1,
+                    2 * self.n_hidden
+                ).relu()
+
+                x_edge = torch.cat(
+                    (
+                        x_edge,
+                        edge_attr.view(-1, edge_attr.shape[1])
+                    ),
+                    dim=1
+                )
+
+                out = self.mlp(x_edge)
+
+            elif self.args.task == 'node_class':
+
+                out = self.mlp(x)
+
+            elif self.args.task == 'lp':
+
+                if self.args.ports_batch:
+                    neg_edge_attr = self.edge_emb_new(
+                        data['node', 'to', 'node'].neg_edge_attr
+                    )
+
+                    pos_edge_attr = self.edge_emb_new(
+                        data['node', 'to', 'node'].pos_edge_attr
+                    )
+
+                else:
+                    neg_edge_attr = self.edge_emb(
+                        data['node', 'to', 'node'].neg_edge_attr
+                    )
+
+                    pos_edge_attr = self.edge_emb(
+                        data['node', 'to', 'node'].pos_edge_attr
+                    )
+
+                out = self.edge_readout(
+                    x,
+                    data['node', 'to', 'node'].pos_edge_index,
+                    pos_edge_attr,
+                    data['node', 'to', 'node'].neg_edge_index,
+                    neg_edge_attr
+                )
+
+        # =========================================================
+        # HOMO GRAPH
+        # =========================================================
+        else:
+
+            # -------------------------
+            # embeddings
+            # -------------------------
+            x = self.node_emb(data.x)
+
+            edge_attr = self.edge_emb(data.edge_attr)
+
+            simp_edge_batch = (
+                data.simp_edge_batch
+                if self.args.flatten_edges
+                else None
+            )
+
+            # =====================================================
+            # TEMPORAL ENCODING
+            # =====================================================
+            if self.use_time_encoder:
+
+                timestamps = data.timestamps.float()
+
+                src = data.edge_index[0]
+                dst = data.edge_index[1]
+
+                temb = self.temporal_encoder(
+                    timestamps_src=timestamps[src],
+                    timestamps_dst=timestamps[dst]
+                )
+
+                edge_attr = edge_attr + temb
+
+            # =====================================================
+            # EDGE DIRECTION
+            # =====================================================
+            if self.args.edge_agg_type == 'adamm':
+
+                edge_attr = (
+                    edge_attr
+                    + self.edge_direction_encoder(
+                        data.edge_direction
+                    )
+                )
+
+            # =====================================================
+            # GNN
+            # =====================================================
+            x, edge_attr = self.gnn(
+                x,
+                data.edge_index,
+                edge_attr,
+                simp_edge_batch
+            )
+
+            # =====================================================
+            # HEADS
+            # =====================================================
+            if self.args.task == 'edge_class':
+
+                x_edge = x[data.edge_index.T].reshape(
+                    -1,
+                    2 * self.n_hidden
+                ).relu()
+
+                x_edge = torch.cat(
+                    (
+                        x_edge,
+                        edge_attr.view(-1, edge_attr.shape[1])
+                    ),
+                    dim=1
+                )
+
+                out = self.mlp(x_edge)
+
+            elif self.args.task == 'node_class':
+
+                out = self.mlp(x)
+
+            elif self.args.task == 'lp':
+
+                if self.args.ports_batch:
+                    neg_edge_attr = self.edge_emb_new(data.neg_edge_attr)
+                    pos_edge_attr = self.edge_emb_new(data.pos_edge_attr)
+
+                else:
+                    neg_edge_attr = self.edge_emb(data.neg_edge_attr)
+                    pos_edge_attr = self.edge_emb(data.pos_edge_attr)
+
+                out = self.edge_readout(
+                    x,
+                    data.pos_edge_index,
+                    pos_edge_attr,
+                    data.neg_edge_index,
+                    neg_edge_attr
+                )
+
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
+
 class AdvancedTemporalEmbedding(nn.Module):
     def __init__(self, dt):
         super().__init__()
