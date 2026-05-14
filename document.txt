@@ -1,3 +1,122 @@
+class AdvancedTemporalEncoder(nn.Module):
+
+    def __init__(self, dt, dropout=0.1):
+        super().__init__()
+
+        self.dt = dt
+
+        d1 = dt // 4
+        d2 = dt // 2
+        d3 = dt // 4
+
+        # basic delta projection
+        self.delta_proj = nn.Linear(1, d1)
+
+        # multi-scale
+        self.ms_proj = nn.Linear(3, d3)
+
+        # positional reduction
+        self.pos_reduce = nn.Linear(dt, d2)
+
+        # fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(d1 + d2 + d3, dt),
+            nn.LayerNorm(dt),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+    def positional_encoding(self, t, d_model):
+
+        device = t.device
+
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, device=device).float()
+            * (-math.log(10000.0) / d_model)
+        )
+
+        pe = torch.zeros(t.shape[0], d_model, device=device)
+
+        t = t.unsqueeze(1)
+
+        pe[:, 0::2] = torch.sin(t * div_term)
+        pe[:, 1::2] = torch.cos(t * div_term)
+
+        return pe
+
+    def forward(self, timestamps_src, timestamps_dst):
+
+        # =====================================================
+        # delta time
+        # =====================================================
+
+        delta_t = torch.abs(
+            timestamps_src - timestamps_dst
+        ).float().unsqueeze(-1)
+
+        # LOG SCALE QUAN TRỌNG
+        delta_t = torch.log1p(delta_t)
+
+        # =====================================================
+        # basic projection
+        # =====================================================
+
+        f_delta = self.delta_proj(delta_t)
+
+        # =====================================================
+        # multi-scale
+        # =====================================================
+
+        f_short = delta_t
+        f_medium = torch.log1p(delta_t)
+        f_long = torch.sqrt(delta_t + 1)
+
+        multi_scale = torch.cat(
+            [f_short, f_medium, f_long],
+            dim=-1
+        )
+
+        f_ms = self.ms_proj(multi_scale)
+
+        # =====================================================
+        # positional encoding
+        # =====================================================
+
+        d2_half = self.dt // 4
+
+        pe_src = self.positional_encoding(
+            timestamps_src.float(),
+            d2_half
+        )
+
+        pe_dst = self.positional_encoding(
+            timestamps_dst.float(),
+            d2_half
+        )
+
+        pe_cat = torch.cat([pe_src, pe_dst], dim=-1)
+
+        f_pos = self.pos_reduce(pe_cat)
+
+        # =====================================================
+        # fusion
+        # =====================================================
+
+        out = torch.cat(
+            [f_delta, f_ms, f_pos],
+            dim=-1
+        )
+
+        return self.fusion(out)
+
+
+
+
+
+
+
+
+
 class GnnHelper(nn.Module):
 
     def __init__(
