@@ -1,3 +1,39 @@
+if args.reverse_mp or args.adamm_hetero:
+        tr_data = create_hetero_obj(...)
+        val_data = create_hetero_obj(...)
+        te_data = create_hetero_obj(...)
+        
+        logging.info("Start: detecting node communities based on TRAIN graph topology")
+        
+        # 1. Chỉ lấy cấu trúc cạnh của tập TRAIN để tìm cụm
+        e_idx_tr = tr_data['node', 'to', 'node'].edge_index 
+        num_nodes = tr_data['node'].x.shape[0]
+        
+        G = nx.Graph()
+        G.add_nodes_from(range(num_nodes))
+        G.add_edges_from(e_idx_tr.t().cpu().numpy())
+        
+        partition = nx.community.louvain_communities(G)
+        
+        # 2. Tạo bản đồ cụm chung
+        community_mapping = torch.zeros(num_nodes, dtype=torch.long)
+        for comm_id, comm_nodes in enumerate(partition):
+            for node in comm_nodes:
+                community_mapping[node] = comm_id
+                
+        # 3. Gán bản đồ CHUNG này cho cả 3 tập tr, val, te
+        tr_data['node'].node_communities = community_mapping
+        val_data['node'].node_communities = community_mapping
+        te_data['node'].node_communities = community_mapping
+
+        logging.info("Done: assigned unified node communities")
+
+
+
+
+
+
+
 import torch.nn as nn
 from torch_geometric.nn import GINEConv, BatchNorm, Linear, GATConv, PNAConv, RGCNConv, to_hetero
 from torch_geometric.nn.aggr import DegreeScalerAggregation
