@@ -1,3 +1,92 @@
+class FlowTemporalAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden // 4)
+        )
+
+        # Giảm bớt sự cồng kềnh đầu vào, tập trung vào edge và time
+        self.flow_gate = nn.Sequential(
+            nn.Linear(n_hidden + n_hidden // 4, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_agg = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        self.pna_lin = nn.Sequential(
+            nn.Linear(len(aggregators) * len(scalers) * n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.flow_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+
+        self.norm = nn.BatchNorm1d(n_hidden)
+        self.reset_parameters()
+
+    def forward(self, edge_attr, index, timestamps):
+        if timestamps is None:
+            timestamps = torch.zeros(edge_attr.size(0), device=edge_attr.device, dtype=edge_attr.dtype)
+        
+        # 1. Xử lý thời gian
+        mean_time = scatter(timestamps, index, dim=0, reduce='mean')
+        delta_t = torch.abs(timestamps - mean_time[index]).unsqueeze(-1)
+        delta_t = torch.log1p(delta_t)
+        time_emb = self.time_encoder(delta_t)
+
+        # 2. Cơ chế Attention (Flow) gọn nhẹ và đúng đắn
+        # Chỉ kết hợp thuộc tính cạnh và thời gian để tính trọng số thay vì nhồi nhét quá nhiều
+        att_input = torch.cat([F.layer_norm(edge_attr, edge_attr.shape[-1:]), 
+                               F.layer_norm(time_emb, time_emb.shape[-1:])], dim=-1)
+        
+        att_score = self.flow_gate(att_input).squeeze(-1)
+        att_weight = softmax(att_score, index).unsqueeze(-1) # Đã bỏ chia căn bậc hai sai bản chất
+
+        flow_out = scatter(edge_attr * att_weight, index, dim=0, reduce='sum')
+        flow_out = self.flow_lin(flow_out)
+
+        # 3. Nhánh PNA giữ nguyên sức mạnh vốn có
+        pna_out = self.pna_agg(edge_attr, index)
+        pna_out = self.pna_lin(pna_out)
+
+        # 4. Gating Mechanism (Hòa trộn mạch lạc)
+        alpha = torch.sigmoid(self.alpha_mlp(torch.cat([flow_out, pna_out], dim=-1)))
+        fused = alpha * flow_out + (1 - alpha) * pna_out
+
+        return self.norm(fused)
+
+    def reset_parameters(self):
+        # Khởi tạo an toàn giống như class PnaAgg cũ của bạn
+        for name, param in self.named_parameters():
+            if 'weight' in name and param.dim() >= 2:
+                nn.init.kaiming_normal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
+
+
+
+
+
+
+
+
+
 if args.reverse_mp or args.adamm_hetero:
         tr_data = create_hetero_obj(...)
         val_data = create_hetero_obj(...)
