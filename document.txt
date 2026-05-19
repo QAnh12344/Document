@@ -1,3 +1,69 @@
+# ====================================================
+# original view
+# ====================================================
+
+out1, proj1 = model(batch)
+
+pred = out1[mask]
+
+ground_truth = batch['node', 'to', 'node'].y[mask]
+
+# ====================================================
+# augmented temporal graph
+# ====================================================
+
+aug_batch = copy.deepcopy(batch)
+
+aug_edge_attr, aug_timestamps = augment_edge_attr(
+    aug_batch['node', 'to', 'node'].edge_attr,
+    aug_batch['node', 'to', 'node'].edge_index,
+    aug_batch['node', 'to', 'node'].timestamps,
+)
+
+aug_batch['node', 'to', 'node'].edge_attr = aug_edge_attr
+
+aug_batch['node', 'to', 'node'].timestamps = aug_timestamps
+
+# reverse edges
+
+aug_batch['node', 'rev_to', 'node'].edge_attr = aug_edge_attr
+
+aug_batch['node', 'rev_to', 'node'].timestamps = aug_timestamps
+
+# ====================================================
+# forward augmented view
+# ====================================================
+
+out2, proj2 = model(aug_batch)
+
+# ====================================================
+# losses
+# ====================================================
+
+sup_loss = loss_fn(
+    pred,
+    ground_truth
+)
+
+cl_loss = temporal_contrastive_loss(
+    proj1[mask],
+    proj2[mask],
+    temperature=0.2
+)
+
+loss = sup_loss + 0.05 * cl_loss
+
+
+
+
+
+
+
+
+
+
+
+
 # =========================================================
 # imports
 # =========================================================
