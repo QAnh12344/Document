@@ -1,3 +1,60 @@
+class TemporalEdgeGate(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden // 4)
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden + n_hidden // 4, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Sigmoid()
+        )
+
+    def forward(self, edge_attr, index, timestamps):
+
+        if timestamps is None:
+            return edge_attr
+
+        mean_time = scatter(
+            timestamps,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        delta_t = torch.abs(
+            timestamps - mean_time[index]
+        ).unsqueeze(-1)
+
+        delta_t = torch.log1p(delta_t)
+
+        time_emb = self.time_encoder(delta_t)
+
+        gate_input = torch.cat(
+            [edge_attr, time_emb],
+            dim=-1
+        )
+
+        gate = self.gate(gate_input)
+
+        # residual temporal modulation
+        edge_attr = edge_attr * (1 + 0.1 * gate)
+
+        return edge_attr
+
+
+
+
+
+
+
+
+
 class FlowTemporalAgg(nn.Module):
     def __init__(self, n_hidden, deg):
         super().__init__()
