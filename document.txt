@@ -1,3 +1,197 @@
+# =========================================================
+# imports
+# =========================================================
+
+import copy
+import math
+import torch
+import torch.nn.functional as F
+
+# =========================================================
+# temporal graph augmentation
+# =========================================================
+
+def augment_edge_attr(
+    edge_attr,
+    edge_index,
+    timestamps,
+    noise_scale=0.005,
+    mix_prob=0.03,
+    temporal_strength=0.10,
+    feature_mask_prob=0.02,
+):
+
+    orig = edge_attr.clone()
+
+    # ====================================================
+    # temporal-aware noise
+    # ====================================================
+
+    t = timestamps.float()
+    t = (t - t.min()) / (t.max() - t.min() + 1e-8)
+
+    noise = torch.randn_like(edge_attr) * noise_scale
+
+    time_weight = torch.exp(
+        temporal_strength * t.unsqueeze(-1)
+    )
+
+    edge_attr = edge_attr + noise * time_weight
+
+    # ====================================================
+    # temporal local mixup
+    # ====================================================
+
+    E = edge_attr.size(0)
+
+    with torch.no_grad():
+
+        sample_size = min(E, 2048)
+
+        sample_ids = torch.randperm(E, device=edge_attr.device)[:sample_size]
+
+        sample_t = timestamps[sample_ids]
+
+        time_diff = torch.abs(
+            sample_t.unsqueeze(1) -
+            sample_t.unsqueeze(0)
+        )
+
+        threshold = timestamps.float().std() * 0.15
+
+        temporal_mask = (
+            time_diff < threshold
+        )
+
+    perm = torch.arange(E, device=edge_attr.device)
+
+    rand_ids = torch.randint(
+        0,
+        sample_size,
+        (E,),
+        device=edge_attr.device
+    )
+
+    for i in range(sample_size):
+
+        candidates = torch.where(
+            temporal_mask[i]
+        )[0]
+
+        if len(candidates) > 0:
+
+            chosen = candidates[
+                torch.randint(
+                    0,
+                    len(candidates),
+                    (1,),
+                    device=edge_attr.device
+                )
+            ]
+
+            perm[sample_ids[i]] = sample_ids[chosen]
+
+    mix_mask = (
+        torch.rand(E, device=edge_attr.device)
+        < mix_prob
+    )
+
+    alpha = 0.7
+
+    mixed_attr = (
+        alpha * edge_attr +
+        (1 - alpha) * edge_attr[perm]
+    )
+
+    edge_attr[mix_mask] = mixed_attr[mix_mask]
+
+    # ====================================================
+    # feature masking
+    # ====================================================
+
+    feature_mask = (
+        torch.rand_like(edge_attr)
+        < feature_mask_prob
+    )
+
+    edge_attr = edge_attr.masked_fill(
+        feature_mask,
+        0.0
+    )
+
+    # ====================================================
+    # residual stabilization
+    # ====================================================
+
+    edge_attr = (
+        0.7 * orig +
+        0.3 * edge_attr
+    )
+
+    edge_attr = F.layer_norm(
+        edge_attr,
+        [edge_attr.shape[-1]]
+    )
+
+    # ====================================================
+    # timestamp augmentation
+    # ====================================================
+
+    time_noise = (
+        torch.randn_like(
+            timestamps.float()
+        )
+        * timestamps.float().std()
+        * 0.005
+    )
+
+    aug_timestamps = timestamps + time_noise
+
+    return edge_attr, aug_timestamps
+
+# =========================================================
+# temporal contrastive loss
+# =========================================================
+
+def temporal_contrastive_loss(
+    z1,
+    z2,
+    temperature=0.2
+):
+
+    z1 = F.normalize(z1, dim=-1)
+    z2 = F.normalize(z2, dim=-1)
+
+    sim = torch.mm(
+        z1,
+        z2.t()
+    ) / temperature
+
+    labels = torch.arange(
+        z1.size(0),
+        device=z1.device
+    )
+
+    loss_1 = F.cross_entropy(
+        sim,
+        labels
+    )
+
+    loss_2 = F.cross_entropy(
+        sim.t(),
+        labels
+    )
+
+    return (loss_1 + loss_2) * 0.5
+
+
+
+
+
+
+
+
+
 class TemporalEdgeGate(nn.Module):
     def __init__(self, n_hidden):
         super().__init__()
