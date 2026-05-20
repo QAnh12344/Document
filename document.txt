@@ -3,6 +3,151 @@ class TemporalWalkAgg(nn.Module):
     def __init__(self, n_hidden):
         super().__init__()
 
+        self.n_hidden = n_hidden
+
+        self.gru = nn.GRU(
+            input_size=n_hidden,
+            hidden_size=n_hidden,
+            batch_first=True
+        )
+
+        self.out_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+
+        self.norm = nn.LayerNorm(n_hidden)
+
+        self.reset_parameters()
+
+    def forward(
+        self,
+        edge_attr,
+        simp_edge_batch,
+        timestamps
+    ):
+
+        device = edge_attr.device
+
+        timestamps = timestamps.float()
+
+        uniq_batches = torch.unique(simp_edge_batch)
+
+        walk_out = torch.zeros_like(edge_attr)
+
+        for b in uniq_batches:
+
+            mask = simp_edge_batch == b
+
+            if mask.sum() == 0:
+                continue
+
+            e = edge_attr[mask]
+
+            t = timestamps[mask]
+
+            # temporal normalization
+            t = t - t.min()
+
+            t = torch.log1p(t)
+
+            # sort temporal order
+            order = torch.argsort(t)
+
+            e = e[order]
+
+            # [1, seq_len, hidden]
+            e_seq = e.unsqueeze(0)
+
+            # GRU encoding
+            _, h = self.gru(e_seq)
+
+            # [hidden]
+            h_last = h[-1].squeeze(0)
+
+            # mean pooled context
+            mean_emb = e.mean(dim=0)
+
+            # combine local statistics + temporal evolution
+            seq_emb = mean_emb + h_last
+
+            seq_emb = self.out_lin(seq_emb)
+
+            seq_emb = self.norm(seq_emb)
+
+            # broadcast back
+            walk_out[mask] = seq_emb
+
+        # adaptive fusion
+        gate = torch.sigmoid(
+            self.gate(
+                torch.cat(
+                    [edge_attr, walk_out],
+                    dim=-1
+                )
+            )
+        )
+
+        out = (
+            (1 - gate) * edge_attr
+            + gate * walk_out
+        )
+
+        return out
+
+    def reset_parameters(self):
+
+        for name, param in self.gru.named_parameters():
+
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+
+        for m in self.out_lin:
+
+            if isinstance(m, nn.Linear):
+
+                nn.init.kaiming_normal_(m.weight)
+
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        for m in self.gate:
+
+            if isinstance(m, nn.Linear):
+
+                nn.init.xavier_uniform_(m.weight)
+
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.norm.reset_parameters()
+
+
+
+
+
+
+
+
+
+class TemporalWalkAgg(nn.Module):
+
+    def __init__(self, n_hidden):
+        super().__init__()
+
         self.gru = nn.GRU(
             input_size=n_hidden,
             hidden_size=n_hidden,
