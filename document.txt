@@ -1,3 +1,99 @@
+class FlowTemporalAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden // 4)
+        )
+
+        self.flow_gate = nn.Sequential(
+            nn.Linear(n_hidden + n_hidden // 4, n_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 2, 1)
+        )
+
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_agg = DegreeScalerAggregation(
+            aggregators,
+            scalers,
+            deg
+        )
+
+        self.pna_lin = nn.Sequential(
+            nn.Linear(len(aggregators)*len(scalers)*n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.flow_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.norm = nn.LayerNorm(n_hidden)
+
+    def forward(self, edge_attr, index, timestamps):
+
+        if timestamps is None:
+            timestamps = torch.zeros(
+                edge_attr.size(0),
+                device=edge_attr.device
+            )
+
+        mean_time = scatter(
+            timestamps,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        delta_t = torch.abs(
+            timestamps - mean_time[index]
+        ).unsqueeze(-1)
+
+        delta_t = torch.log1p(delta_t)
+
+        time_emb = self.time_encoder(delta_t)
+
+        att_input = torch.cat([
+            edge_attr,
+            time_emb
+        ], dim=-1)
+
+        att_score = self.flow_gate(att_input)
+
+        # sigmoid thay vì softmax
+        att_weight = torch.sigmoid(att_score)
+
+        flow_out = scatter(
+            edge_attr * att_weight,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        flow_out = self.flow_lin(flow_out)
+
+        pna_out = self.pna_lin(
+            self.pna_agg(edge_attr, index)
+        )
+
+        # residual fusion ổn định hơn
+        fused = pna_out + 0.2 * flow_out
+
+        return self.norm(fused)
+
+
+
+
+
+
+
 # ====================================================
 # augment forward edges
 # ====================================================
