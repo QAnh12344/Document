@@ -1,3 +1,108 @@
+class TemporalPNA(nn.Module):
+
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna = DegreeScalerAggregation(
+            aggregators,
+            scalers,
+            deg
+        )
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden)
+        )
+
+        self.time_scale = nn.Parameter(
+            torch.tensor(0.05)
+        )
+
+        self.out_lin = nn.Sequential(
+            nn.Linear(
+                len(aggregators)
+                * len(scalers)
+                * n_hidden,
+                n_hidden
+            ),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.norm = nn.LayerNorm(n_hidden)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+
+        for m in self.modules():
+
+            if isinstance(m, nn.Linear):
+
+                nn.init.kaiming_normal_(
+                    m.weight,
+                    nonlinearity='relu'
+                )
+
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.LayerNorm):
+
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        edge_attr,
+        index,
+        timestamps
+    ):
+
+        timestamps = timestamps.float()
+
+        mean_t = scatter(
+            timestamps,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        recency = (
+            timestamps - mean_t[index]
+        ).unsqueeze(-1)
+
+        recency = torch.clamp(recency, min=0)
+
+        recency = torch.log1p(recency)
+
+        time_bias = self.time_mlp(recency)
+
+        edge_attr = (
+            edge_attr
+            + self.time_scale * time_bias
+        )
+
+        out = self.pna(
+            edge_attr,
+            index
+        )
+
+        out = self.out_lin(out)
+
+        return self.norm(out)
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
