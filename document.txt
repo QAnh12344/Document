@@ -1,3 +1,133 @@
+class ExSTraQtFlowTemporalAgg(nn.Module):
+    def __init__(self, n_hidden, number_of_hops=3, keep_top_n=10):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.number_of_hops = number_of_hops
+        self.keep_top_n = keep_top_n
+        
+        # Mạng chuyển đổi phi tuyến để map đặc trưng Flow & Temporal vào không gian GNN
+        # Đầu vào gồm: Đặc trưng gốc (n_hidden) + 7 đặc trưng cấu trúc dòng chảy ExSTraQt
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(n_hidden + 7, n_hidden),
+            nn.BatchNorm1d(n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+        
+        # Nhánh Attention để tổng hợp cuối cùng
+        self.attn_weights = nn.Linear(n_hidden, 1)
+
+    def reset_parameters(self):
+        for layer in self.feature_encoder:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+        nn.init.xavier_uniform_(self.attn_weights.weight)
+
+    def forward(self, x, index, timestamps_):
+        """
+        Arguments:
+            x: Đặc trưng cạnh song song hiện tại [num_edges, n_hidden]
+            index: inverse_indices nhóm các cạnh trùng vào cùng 1 siêu cạnh [num_edges]
+            timestamps_: Mốc thời gian thực của transaction [num_edges]
+        """
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # Giả định feature đầu tiên của x trong tập dữ liệu tài chính thường là Số tiền (Amount)
+        # Nếu chưa scale, ta trích xuất nó làm trọng số khối lượng A_c
+        amounts = torch.abs(x[:, 0]) + 1e-6 
+
+        # --- STAGE 1: FLOW-BASED TEMPORAL FEATURES (Mục 4.4.1 - Công thức 2) ---
+        # Biến đổi chi (chi = t - t_min)
+        min_timestamp = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        chi = timestamps_ - min_timestamp[index]
+        
+        # Tính toán Weighted Time Feature: TF(c) = Sum(A_i * chi_i) / Sum(A_i)
+        weighted_chi_numerator = scatter(amounts * chi, index, dim=0, dim_size=num_groups, reduce='sum')
+        sum_amounts = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+        tf_c = weighted_chi_numerator / sum_amounts # [num_groups]
+
+        # Khuyếch tán ngược lại các cạnh để tính weighted standard deviation
+        tf_c_expanded = tf_c[index]
+        weighted_var_num = scatter(amounts * ((chi - tf_c_expanded) ** 2), index, dim=0, dim_size=num_groups, reduce='sum')
+        tf_std = torch.sqrt(weighted_var_num / sum_amounts) # [num_groups]
+
+        # --- STAGE 2: SIMULATE ALGORITHM 1 (Multi-Hop Flow & Velocity) ---
+        # Sắp xếp và lấy Top N giao dịch lớn nhất của từng cụm cạnh trùng (Siêu cạnh)
+        # Để tránh loop CPU chậm, ta dùng trick tận dụng scatter_max/sort theo index
+        sort_offset = index.to(torch.float64) * 1e12 + amounts.to(torch.float64)
+        sort_ids = torch.argsort(sort_offset, descending=True)
+        
+        # Tạo mask lọc lấy top_n cạnh lớn nhất cho mỗi nhóm index
+        group_counts = torch.bincount(index, minlength=num_groups)
+        mask_top_n = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        
+        curr_cnt = torch.zeros(num_groups, dtype=torch.long, device=device)
+        for idx in sort_ids:
+            g_id = index[idx]
+            if curr_cnt[g_id] < self.keep_top_n:
+                mask_top_n[idx] = True
+                curr_cnt[g_id] += 1
+
+        # Trích xuất các thuộc tính thống kê tĩnh của dòng chảy (Flow statistics)
+        # Tính Turnover Volume = |In_Amount - Out_Amount| dựa trên phân phối cạnh
+        mean_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        max_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='max')
+        min_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='min')
+        std_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='std')
+
+        # Giao dịch tuần tự thời gian (Chronological Check: t_left <= t_right)
+        # Đếm số lượng chuỗi giao dịch có xu hướng dồn dập kích thước lớn 
+        time_diffs = chi[sort_ids]
+        temporal_velocity = scatter(torch.abs(time_diffs), index[sort_ids], dim=0, dim_size=num_groups, reduce='mean')
+
+        # --- STAGE 3: MAP TO HIGH-DIMENSIONAL SPACE ---
+        # Tập hợp tất cả các thuộc tính đặc trưng AML mạnh mẽ từ ExSTraQt bài báo gợi ý
+        # Bao gồm 7 chiều bổ trợ cấu trúc
+        exstraqt_feats = torch.stack([
+            tf_c,            # Trọng số xu hướng thời gian dòng tiền
+            tf_std,          # Độ phân tán thời gian của chuỗi giao dịch
+            mean_amount,     # Khối lượng giao dịch trung bình
+            max_amount,      # Đỉnh điểm dòng tiền rò rỉ
+            min_amount,      # Sàn dòng tiền rò rỉ
+            std_amount,      # Độ bất ổn định về giá trị tiền
+            temporal_velocity# Tốc độ dịch chuyển dòng tiền theo chuỗi thời gian
+        ], dim=-1)
+
+        # Mở rộng các đặc trưng cấu trúc vĩ mô này về lại từng cạnh đơn lẻ
+        edge_structural_feats = exstraqt_feats[index] # [num_edges, 7]
+        
+        # Concat trực tiếp vào đặc trưng ẩn x hiện tại của GNN
+        x_combined = torch.cat([x, edge_structural_feats], dim=-1) # [num_edges, n_hidden + 7]
+        x_encoded = self.feature_encoder(x_combined)
+
+        # --- STAGE 4: SPARSE ATTENTION AGGREGATION ---
+        # Gom tụm thông minh bằng Attention thay vì Mean đơn thuần
+        attn_scores = self.attn_weights(x_encoded).squeeze(-1) # [num_edges]
+        max_score = scatter(attn_scores, index, dim=0, dim_size=num_groups, reduce='max')
+        attn_weights = torch.exp(attn_scores - max_score[index])
+        sum_weights = scatter(attn_weights, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+        attn_softmax = attn_weights / sum_weights[index]
+
+        # Trả về siêu cạnh đã được tối ưu hóa đặc trưng chống rửa tiền
+        out = scatter(x_encoded * attn_softmax.unsqueeze(-1), index, dim=0, dim_size=num_groups, reduce='sum')
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
 class TemporalWalkAgg(nn.Module):
 
     def __init__(self, n_hidden):
