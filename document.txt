@@ -1,3 +1,195 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter
+from torch_geometric.utils import degree
+
+
+class FlowTemporalAgg(nn.Module):
+
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+
+        # ===== Time Encoder =====
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, n_hidden // 4),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 4, n_hidden // 4)
+        )
+
+        # ===== Lightweight Temporal Gate =====
+        self.flow_gate = nn.Sequential(
+            nn.Linear(n_hidden + n_hidden // 4, n_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(n_hidden // 2, 1)
+        )
+
+        # ===== PNA =====
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_agg = DegreeScalerAggregation(
+            aggregators=aggregators,
+            scalers=scalers,
+            deg=deg
+        )
+
+        pna_dim = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_lin = nn.Sequential(
+            nn.Linear(pna_dim, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        # ===== Temporal Flow Projection =====
+        self.flow_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        # ===== Stable Norm =====
+        self.norm = nn.LayerNorm(n_hidden)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+
+        for m in self.modules():
+
+            if isinstance(m, nn.Linear):
+
+                nn.init.kaiming_normal_(
+                    m.weight,
+                    nonlinearity='relu'
+                )
+
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.LayerNorm):
+
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        # Flow branch init nhỏ hơn
+        with torch.no_grad():
+
+            self.flow_gate[-1].weight.mul_(0.1)
+
+            if self.flow_gate[-1].bias is not None:
+                self.flow_gate[-1].bias.zero_()
+
+            self.flow_lin[-1].weight.mul_(0.1)
+
+            if self.flow_lin[-1].bias is not None:
+                self.flow_lin[-1].bias.zero_()
+
+        # reset PNA nếu có
+        if hasattr(self.pna_agg, 'reset_parameters'):
+            self.pna_agg.reset_parameters()
+
+    def forward(
+        self,
+        edge_attr,
+        index,
+        timestamps=None
+    ):
+
+        device = edge_attr.device
+
+        # ===== Timestamp fallback =====
+        if timestamps is None:
+            timestamps = torch.zeros(
+                edge_attr.size(0),
+                device=device,
+                dtype=edge_attr.dtype
+            )
+
+        timestamps = timestamps.float()
+
+        # =====================================================
+        # 1. Temporal Encoding
+        # =====================================================
+
+        mean_time = scatter(
+            timestamps,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        delta_t = torch.abs(
+            timestamps - mean_time[index]
+        ).unsqueeze(-1)
+
+        # ổn định hơn
+        delta_t = torch.log1p(delta_t)
+
+        time_emb = self.time_encoder(delta_t)
+
+        # =====================================================
+        # 2. Lightweight Temporal Attention
+        # =====================================================
+
+        att_input = torch.cat(
+            [edge_attr, time_emb],
+            dim=-1
+        )
+
+        att_score = self.flow_gate(att_input)
+
+        # sigmoid ổn định hơn softmax
+        att_weight = torch.sigmoid(att_score)
+
+        flow_msg = edge_attr * att_weight
+
+        flow_out = scatter(
+            flow_msg,
+            index,
+            dim=0,
+            reduce='mean'
+        )
+
+        flow_out = self.flow_lin(flow_out)
+
+        # =====================================================
+        # 3. PNA Branch
+        # =====================================================
+
+        pna_out = self.pna_agg(
+            edge_attr,
+            index
+        )
+
+        pna_out = self.pna_lin(pna_out)
+
+        # =====================================================
+        # 4. Stable Residual Fusion
+        # =====================================================
+
+        fused = pna_out + 0.2 * flow_out
+
+        # =====================================================
+        # 5. Output Norm
+        # =====================================================
+
+        fused = self.norm(fused)
+
+        return fused
+
+
+
+
+
+
+
+
 class FlowTemporalAgg(nn.Module):
     def __init__(self, n_hidden, deg):
         super().__init__()
