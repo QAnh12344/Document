@@ -1,3 +1,70 @@
+class TemporalWalkAgg(nn.Module):
+
+    def __init__(self, n_hidden):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=n_hidden,
+            hidden_size=n_hidden,
+            batch_first=True
+        )
+
+        self.out_lin = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.norm = nn.LayerNorm(n_hidden)
+
+    def forward(
+        self,
+        edge_attr,
+        simp_edge_batch,
+        timestamps
+    ):
+
+        device = edge_attr.device
+
+        uniq = torch.unique(simp_edge_batch)
+
+        out = torch.zeros_like(edge_attr)
+
+        for u in uniq:
+
+            mask = simp_edge_batch == u
+
+            e = edge_attr[mask]
+
+            t = timestamps[mask]
+
+            # sort temporal order
+            order = torch.argsort(t)
+
+            e = e[order]
+
+            # [1, seq_len, hidden]
+            e = e.unsqueeze(0)
+
+            _, h = self.gru(e)
+
+            seq_emb = h[-1].squeeze(0)
+
+            seq_emb = self.out_lin(seq_emb)
+
+            seq_emb = self.norm(seq_emb)
+
+            out[mask] = seq_emb
+
+        return out
+
+
+
+
+
+
+
+
 class TemporalPNA(nn.Module):
 
     def __init__(self, n_hidden, deg):
