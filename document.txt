@@ -1,3 +1,105 @@
+import torch
+import torch.nn as nn
+from torch_scatter import scatter
+
+class ExSTraQtFlowTemporalAgg(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # Tối ưu bộ nhớ: Ánh xạ đặc trưng thô từ đồ thị sang không gian nhúng trước khi Aggregation
+        self.raw_encoder = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU()
+        )
+        
+        # Mạng kết hợp đặc trưng đồ thị tĩnh và các đặc trưng Temporal/Flow đã được nén
+        # Tổng cộng 5 đặc trưng Flow/Temporal cốt lõi nhất sau khi đã gom tụm vĩ mô
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(n_hidden + 5, n_hidden),
+            nn.BatchNorm1d(n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+        
+    def reset_parameters(self):
+        for layer in self.raw_encoder:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+        for layer in self.feature_encoder:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+
+    def forward(self, x, index, timestamps_):
+        """
+        Arguments:
+            x: Đặc trưng cạnh [num_edges, n_hidden]
+            index: inverse_indices nhóm các cạnh trùng vào siêu cạnh [num_edges]
+            timestamps_: Mốc thời gian thực của transaction [num_edges]
+        """
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # Trích xuất khối lượng giao dịch (giả định là cột số 0)
+        amounts = torch.abs(x[:, 0]) + 1e-6 
+
+        # --- STAGE 1: VECTORIZED TEMPORAL FEATURES (Công thức 2) ---
+        # Tính thời gian tương đối (chi = t - t_min) bằng toán tử song song hoàn toàn
+        min_timestamp = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        chi = timestamps_ - min_timestamp[index]
+        
+        # Tính TF(c) = Sum(A_i * chi_i) / Sum(A_i)
+        weighted_chi_numerator = scatter(amounts * chi, index, dim=0, dim_size=num_groups, reduce='sum')
+        sum_amounts = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+        tf_c = weighted_chi_numerator / sum_amounts  # [num_groups]
+
+        # --- STAGE 2: VECTORIZED FLOW STATISTICS (Bỏ cơ chế lọc Top-N bằng vòng lặp) ---
+        # Thay vì dùng vòng lặp Python tìm Top-N rất chậm, ta trực tiếp dùng cơ chế gom tụm 
+        # bất đối xứng của Scatter để mô tả dòng chảy: Mean, Max, Min và Tốc độ chuyển tiền
+        mean_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        max_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='max')
+        min_amount = scatter(amounts, index, dim=0, dim_size=num_groups, reduce='min')
+        
+        # Tốc độ dòng chảy theo thời gian (Thời gian trung bình giữa các giao dịch trong cùng siêu cạnh)
+        temporal_velocity = scatter(chi, index, dim=0, dim_size=num_groups, reduce='mean')
+
+        # Gom các đặc trưng ExSTraQt ở cấp độ Siêu cạnh (Group level) -> Không kéo dãn bộ nhớ ra num_edges nữa
+        exstraqt_feats = torch.stack([
+            tf_c, 
+            mean_amount, 
+            max_amount, 
+            min_amount, 
+            temporal_velocity
+        ], dim=-1)  # Kích thước gọn nhẹ: [num_groups, 5]
+
+        # --- STAGE 3: LIGHTWEIGHT AGGREGATION ---
+        # Ánh xạ đặc trưng thô của cạnh sang không gian nhúng
+        x_projected = self.raw_encoder(x)
+        
+        # Gom tụm thông tin cạnh gốc về cấp độ siêu cạnh trước (Dùng Sum để giữ thuộc tính Volume)
+        x_grouped = scatter(x_projected, index, dim=0, dim_size=num_groups, reduce='sum') # [num_groups, n_hidden]
+        
+        # Kết hợp thông tin đồ thị tĩnh + Đặc trưng cấu trúc dòng chảy thời gian ExSTraQt
+        combined_feats = torch.cat([x_grouped, exstraqt_feats], dim=-1) # [num_groups, n_hidden + 5]
+        
+        # Đi qua bộ mã hóa cuối cùng ở cấp độ Siêu Cạnh (Tính toán cực nhẹ vì num_groups << num_edges)
+        out = self.feature_encoder(combined_feats)
+        
+        return out
+
+
+
+
+
+
+
+
+
+
 class ExSTraQtFlowTemporalAgg(nn.Module):
     def __init__(self, n_hidden, number_of_hops=3, keep_top_n=10):
         super().__init__()
