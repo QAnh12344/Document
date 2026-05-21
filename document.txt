@@ -3,6 +3,137 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class UrbanGCLContrastiveLoss(nn.Module):
+    def __init__(self, n_hidden, tau=0.07, lambda_1=0.1, lambda_2=0.1, time_window_threshold=60):
+        """
+        Arguments:
+            n_hidden: Số chiều đặc trưng ẩn của Cạnh/Node
+            tau: Tham số nhiệt độ cho hàm InfoNCE
+            lambda_1, lambda_2: Hệ số phạt điều chỉnh Lsc và Ltc
+            time_window_threshold: Khoảng cách thời gian tối thiểu (giây/phút tùy unit của timestamps) 
+                                   để coi một transaction là thực sự khác biệt về mặt temporal.
+        """
+        super().__init__()
+        self.tau = tau
+        self.lambda_1 = lambda_1
+        self.lambda_2 = lambda_2
+        self.time_window_threshold = time_window_threshold
+        
+        # Projection Heads: Đưa các biểu diễn về không gian tương phản (Bảo vệ tính tổng quát hóa)
+        self.proj_spatial_local = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden)
+        )
+        self.proj_spatial_global = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden)
+        )
+        self.proj_temporal = nn.Sequential(
+            nn.Linear(n_hidden * 3, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+    def compute_spatial_loss(self, h_local, h_global):
+        """
+        Eq (12): Spatial Contrastive Loss InfoNCE
+        Ép đặc trưng cấu trúc tĩnh (h_local) phải khớp nối thông tin 
+        với đặc trưng dòng chảy không gian (h_global).
+        """
+        p_l = F.normalize(self.proj_spatial_local(h_local), p=2, dim=-1)
+        p_g = F.normalize(self.proj_spatial_global(h_global), p=2, dim=-1)
+        
+        # Ma trận Dot-product similarity giữa local và global
+        sim_matrix = torch.matmul(p_l, p_g.T) / self.tau 
+        
+        # Các cặp positive nằm ở đường chéo chính (cùng một index transaction)
+        labels = torch.arange(h_local.size(0), device=h_local.device)
+        return F.cross_entropy(sim_matrix, labels)
+
+    def compute_temporal_loss(self, h_fused, timestamps):
+        """
+        Eq (13) & (14): Temporal Contrastive Loss nâng cấp với Time-Window Masking
+        """
+        batch_size = h_fused.size(0)
+        if batch_size < 3 or timestamps is None:
+            return torch.tensor(0.0, device=h_fused.device)
+            
+        # Biến đổi đặc trưng sang không gian Temporal đại diện
+        h_t = F.normalize(self.proj_temporal(h_fused), p=2, dim=-1)
+        
+        # Tính toán ma trận khoảng cách Euclide bình phương nội bộ batch
+        with torch.no_grad():
+            dist_matrix = torch.cdist(h_t.unsqueeze(0), h_t.unsqueeze(0), p=2).squeeze(0) ** 2
+            
+            # --- CƠ CHẾ NÂNG CẤP: TEMPORAL MASKING ---
+            # Tính ma trận khoảng cách thời gian giữa các mẫu trong Batch: |t_i - t_j|
+            time_diff = torch.abs(timestamps.unsqueeze(0) - timestamps.unsqueeze(1))
+            
+            # Mặt nạ loại bỏ: 
+            # 1. Chính nó (i == j)
+            # 2. Hoặc các mẫu diễn ra quá sát nhau trong khoảng thời gian threshold (tránh nhiễu dữ liệu nền)
+            invalid_mask = (time_diff < self.time_window_threshold)
+            
+            # Hard Positive (H+_t): Mẫu nằm NGOÀI khoảng thời gian threshold nhưng tương đồng nhất (Dist MIN)
+            dist_for_pos = dist_matrix.clone()
+            dist_for_pos[invalid_mask] = float('inf') 
+            
+            # Đề phòng trường hợp trong batch không tìm được mẫu nào thỏa mãn điều kiện thời gian
+            valid_pos_rows = (dist_for_pos != float('inf')).any(dim=-1)
+            pos_indices = torch.argmin(dist_for_pos, dim=-1)
+            
+            # Hard Negative (H-_t): Mẫu nằm NGOÀI khoảng thời gian threshold và khác biệt nhất (Dist MAX)
+            dist_for_neg = dist_matrix.clone()
+            dist_for_neg[invalid_mask] = -float('inf')
+            valid_neg_rows = (dist_for_neg != -float('inf')).any(dim=-1)
+            neg_indices = torch.argmax(dist_for_neg, dim=-1)
+            
+            # Chỉ lấy các hàng (anchor) tìm được cặp mẫu cứng hợp lệ để tính toán
+            valid_mask_final = valid_pos_rows & valid_neg_rows
+            
+        # Nếu batch quá nghèo nàn mốc thời gian, bỏ qua để tránh lỗi nan
+        if not valid_mask_final.any():
+            return torch.tensor(0.0, device=h_fused.device)
+            
+        # Trích xuất các anchor và các mẫu đối sánh tương ứng
+        h_anchor = h_t[valid_mask_final]
+        h_pos = h_t[pos_indices[valid_mask_final]]
+        h_neg = h_t[neg_indices[valid_mask_final]]
+        
+        # Tính toán độ tương đồng Cosine
+        sim_pos = torch.sum(h_anchor * h_pos, dim=-1) / self.tau  
+        sim_neg = torch.sum(h_anchor * h_neg, dim=-1) / self.tau  
+        
+        # InfoNCE Loss tối ưu hóa: kéo gần mẫu tương đồng thời gian khác biệt, đẩy xa mẫu dị biệt
+        loss_temporal = -torch.mean(sim_pos - torch.log(torch.exp(sim_pos) + torch.exp(sim_neg) + 1e-6))
+        return loss_temporal
+
+    def forward(self, h_local, h_global, h_fused, timestamps, loss_pred):
+        """
+        Joint Learning Optimization (Eq 15)
+        """
+        l_sc = self.compute_spatial_loss(h_local, h_global)
+        l_tc = self.compute_temporal_loss(h_fused, timestamps)
+        
+        total_loss = loss_pred + (self.lambda_1 * l_sc) + (self.lambda_2 * l_tc)
+        return total_loss
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class UrbanGCLContrastiveLoss(nn.Module):
     def __init__(self, n_hidden, tau=0.07, lambda_1=0.1, lambda_2=0.1, device='cpu'):
         """
         Arguments:
