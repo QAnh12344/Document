@@ -1,6 +1,110 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
+# Import trực tiếp module PNA gốc từ PyG của bạn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Khởi tạo lõi PNA chuẩn của bạn (Bảo toàn nguyên vẹn sức mạnh gốc)
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        # Kích thước đầu ra của PNA gốc: 3 scalers * 4 aggregators * n_hidden = 12 * n_hidden
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        
+        # 2. Bộ Fusion Gated: Kết hợp 12 nhánh PNA tĩnh + 6 nhánh dòng chảy ExSTraQt động
+        # Đầu vào: (12 * n_hidden) + 6
+        self.lin = nn.Sequential(
+            nn.Linear(pna_out_features + 6, n_hidden * 2),
+            nn.BatchNorm1d(n_hidden * 2),
+            nn.SiLU(),  # Đổi sang SiLU để gradient mượt hơn, tránh chết neuron như ReLU
+            nn.Dropout(p=0.4), # Chống overfit cực mạnh khi sang tập Test ẩn
+            nn.Linear(n_hidden * 2, n_hidden)
+        )
+
+    def reset_parameters(self):
+        # Reset parameters chuẩn Kaiming Normal y hệt như code cũ của bạn
+        for layer in self.lin:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x, index, timestamps_):
+        """
+        Arguments:
+            x: [num_edges, n_hidden] - Đặc trưng ẩn của cạnh
+            index: [num_edges] - Chỉ số siêu cạnh trùng
+            timestamps_: [num_edges] - Mốc thời gian thực hiện giao dịch
+        """
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: CHẠY LÕI PNA GỐC CỦA BẠN (Tốc độ C++ cực nhanh) ===
+        pna_out = self.pna_core(x, index) # [num_groups, 12 * n_hidden]
+
+        # === NHÁNH 2: VECTORIZED EXSTRAQT CAUSAL FLOW STATS (Siêu nhẹ, không dùng vòng lặp) ===
+        # 1. Chuẩn hóa Log-Amount chống nhiễu quy mô tiền giữa các tập dữ liệu
+        log_amounts = torch.log1p(torch.abs(x[:, 0])) + 1e-6
+        sum_log_amounts = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        # 2. Causal Delta-Time (Tính toán thời gian tương đối nội bộ siêu cạnh)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        chi = timestamps_ - min_t[index]
+        duration = max_t - min_t
+
+        # 3. Trích xuất đúng 6 đặc trưng ExSTraQt cốt lõi đánh bạt PNA mù thời gian:
+        tf_c = scatter(log_amounts * chi, index, dim=0, dim_size=num_groups, reduce='sum') / (sum_log_amounts + 1e-6)
+        
+        weighted_var = scatter(log_amounts * ((chi - tf_c[index]) ** 2), index, dim=0, dim_size=num_groups, reduce='sum') / (sum_log_amounts + 1e-6)
+        tf_std = torch.sqrt(weighted_var + 1e-6)
+
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        burst_density = torch.log1p(edge_counts)
+
+        money_velocity = sum_log_amounts / (torch.log1p(duration) + 1e-6)
+
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='mean') + 1e-6) ** 1.5
+        flow_skew = skew_num / skew_den 
+
+        avg_inter_arrival = duration / (edge_counts + 1e-6)
+
+        # Gom tụm 6 đặc trưng động
+        exstraqt_feats = torch.stack([
+            tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival
+        ], dim=-1) # [num_groups, 6]
+
+        # === TẦNG 3: FUSION GATED ===
+        # Concat 12 nhánh tĩnh của PNA và 6 nhánh động của ExSTraQt lại với nhau
+        final_combined = torch.cat([pna_out, exstraqt_feats], dim=-1) # [num_groups, (12 * n_hidden) + 6]
+        
+        # Đẩy qua tầng tuyến tính tích hợp để sinh ra đặc trưng siêu cạnh tối ưu nhất
+        return self.lin(final_combined)
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter
 
 class ExSTraQtSuperAgg(nn.Module):
     def __init__(self, n_hidden):
