@@ -1,6 +1,131 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
+
+class ExSTraQtGenAggFusion(nn.Module):
+    def __init__(self, n_hidden, f_net=None, a_param=None, b_param=None):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Khởi tạo lõi GenAgg chuẩn (Bảo toàn nguyên vẹn Autoencoder phi tuyến)
+        self.gen_agg_core = GenAgg(f=f_net, a=a_param, b=b_param)
+        
+        # 2. Khóa overfit tập Test: Chuẩn hóa LayerNorm nội bộ cho 6 đặc trưng ExSTraQt
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+        
+        # 3. BỘ CỔNG ĐIỀU TIẾT (Gated Fusion) - Bảo hiểm Precision cho tập Test
+        # Ép mô hình học cách cân nhắc kỹ lưỡng giữa cấu trúc đồ thị (GenAgg) và động lực thời gian (ExSTraQt)
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.5), # Tăng cường Dropout để chống học vẹt dòng thời gian
+            nn.Linear(n_hidden, 1),
+            nn.Sigmoid()
+        )
+        
+        # Tầng chuyển đổi trạng thái sau Fusion
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden), # Thay đổi hoàn toàn BatchNorm thành LayerNorm tại đây
+            nn.SiLU(),
+            nn.Dropout(p=0.4)
+        )
+
+    def reset_parameters(self):
+        self.gen_agg_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        for m in [self.exstraqt_project, self.gate, self.post_transition]:
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x, index, timestamps_):
+        """
+        Arguments:
+            x: [num_edges, n_hidden] - Đặc trưng ẩn của cạnh/giao dịch
+            index: [num_edges] - Chỉ số gom siêu cạnh trùng
+            timestamps_: [num_edges] - Mốc thời gian thực hiện giao dịch
+        """
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: CHẠY LÕI GENAGG PHI TUYẾN TOÁN HỌC ===
+        genagg_out = self.gen_agg_core(x, index=index, dim_size=num_groups) # Out: [num_groups, n_hidden]
+
+        # === NHÁNH 2: EXSTRAQT BẤT BIẾN THỜI GIAN (Đã gia cố bảo vệ Scale) ===
+        log_amounts = torch.log1p(torch.abs(x[:, 0])) + 1e-6
+        sum_log_amounts = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        chi = timestamps_ - min_t[index]
+        duration = max_t - min_t
+
+        tf_c = scatter(log_amounts * chi, index, dim=0, dim_size=num_groups, reduce='sum') / sum_log_amounts
+        
+        weighted_var = scatter(log_amounts * ((chi - tf_c[index]) ** 2), index, dim=0, dim_size=num_groups, reduce='sum') / sum_log_amounts
+        tf_std = torch.sqrt(weighted_var + 1e-6)
+
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        burst_density = torch.log1p(edge_counts)
+
+        # Gia cố 1: Bọc log1p bảo vệ Vận tốc tiền không bị bùng nổ biên độ ở tập Test tương lai
+        money_velocity = torch.log1p(sum_log_amounts / (torch.log1p(duration) + 1e-6))
+
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='mean') + 1e-6) ** 1.5
+        flow_skew = skew_num / skew_den 
+
+        # Gia cố 2: Bọc log1p cho khoảng thời gian giữa các giao dịch liên tiếp
+        avg_inter_arrival = torch.log1p(duration / (edge_counts + 1e-6))
+
+        # Gom 6 đặc trưng động thành tensor cấu trúc
+        exstraqt_raw = torch.stack([
+            tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival
+        ], dim=-1) # [num_groups, 6]
+
+        # Gia cố 3: Ép phẳng phân phối qua LayerNorm, bất biến với Data Shift thời gian
+        exstraqt_feats = self.exstraqt_project(self.exstraqt_ln(exstraqt_raw))
+
+        # === NHÁNH 3: GATED FUSION + RESIDUAL CONNECTION ===
+        combined_context = torch.cat([genagg_out, exstraqt_feats], dim=-1)
+        alpha = self.gate(combined_context) # Học tỷ lệ đóng mở cổng động
+
+        # Fusion mềm dẻo bằng cơ chế nội suy tuyến tính có cổng bảo vệ
+        fused_feats = (1.0 - alpha) * genagg_out + alpha * exstraqt_feats
+        
+        # Kết nối tắt (Residual) cộng thẳng genagg_out bảo vệ mô hình.
+        # Nếu dòng chảy thời gian ở tập Test bị nhiễu nặng, cấu trúc GenAgg tĩnh vẫn gánh được Precision.
+        output = self.post_transition(fused_feats) + genagg_out
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
 class ExSTraQtPnaGatedFusionAgg(nn.Module):
