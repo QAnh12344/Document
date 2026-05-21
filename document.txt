@@ -1,6 +1,147 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Khởi tạo lõi PNA tĩnh (Bảo toàn nguyên vẹn 100% độ ổn định của PNA gốc)
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.BatchNorm1d(n_hidden),
+            nn.SiLU()
+        )
+        
+        # 2. Bộ ước lượng cường độ dòng tiền ẩn
+        self.implicit_amount = nn.Sequential(
+            nn.Linear(n_hidden, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+            nn.Softplus()
+        )
+        
+        # Khóa overfit: Dùng LayerNorm thay vì BatchNorm cho đặc trưng thời gian.
+        # BatchNorm tính Mean/Var trên toàn bộ Batch (vốn bị lệch phân phối giữa Val và Test).
+        # LayerNorm chuẩn hóa nội bộ trên từng siêu cạnh đơn lẻ, bất biến với mọi dịch chuyển thời gian!
+        self.exstraqt_ln = nn.LayerNorm(6)
+        
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden), # Giữ an toàn phân phối xuyên suốt
+            nn.SiLU()
+        )
+        
+        # 3. CỔNG CHÚ Ý KHÁNH KIỆT (Chống Overfit sang tập Test)
+        # Tăng mạnh Dropout lên 0.5 ở tầng Gate để ép mô hình không phụ thuộc quá đà vào ExSTraQt
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.5), 
+            nn.Linear(n_hidden, 1),
+            nn.Sigmoid() 
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.BatchNorm1d(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.4)
+        )
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        for m in [self.pna_project, self.implicit_amount, self.exstraqt_project, self.gate, self.post_transition]:
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0)
+        self.exstraqt_ln.reset_parameters()
+
+    def forward(self, x, index, timestamps_):
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: KHÔNG GIAN TĨNH PNA ===
+        pna_raw = self.pna_core(x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+
+        # === NHÁNH 2: EXSTRAQT BẤT BIẾN THỜI GIAN TUYỆT ĐỐI ===
+        amounts = self.implicit_amount(x).squeeze(-1) + 1e-6
+        log_amounts = torch.log1p(amounts)
+        sum_log_amounts = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        # BẤT BIẾN TOÁN HỌC: chi và duration là khoảng cách thời gian tương đối nội bộ.
+        # Cho dù tập Test diễn ra ở tương lai 1 năm sau, hiệu số này vẫn giữ nguyên tính chất kinh tế.
+        chi = timestamps_ - min_t[index]
+        duration = max_t - min_t
+
+        tf_c = scatter(log_amounts * chi, index, dim=0, dim_size=num_groups, reduce='sum') / sum_log_amounts
+        weighted_var = scatter(log_amounts * ((chi - tf_c[index]) ** 2), index, dim=0, dim_size=num_groups, reduce='sum') / sum_log_amounts
+        tf_std = torch.sqrt(weighted_var + 1e-6)
+
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        burst_density = torch.log1p(edge_counts)
+
+        # Tránh bão hòa Velocity khi sang tập Test: Áp dụng log1p bảo vệ
+        money_velocity = torch.log1p(sum_log_amounts / (torch.log1p(duration) + 1e-6))
+
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='mean')
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='mean') + 1e-6) ** 1.5
+        flow_skew = skew_num / skew_den 
+
+        avg_inter_arrival = torch.log1p(duration / (edge_counts + 1e-6))
+
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # Dùng LayerNorm để ép phân phối của tập Test khớp hoàn toàn với tập Val/Train
+        exstraqt_feats = self.exstraqt_project(self.exstraqt_ln(exstraqt_raw)) 
+
+        # === NHÁNH 3: FUSION GATED + RESIDUAL ===
+        combined_context = torch.cat([pna_feats, exstraqt_feats], dim=-1)
+        alpha = self.gate(combined_context) 
+
+        fused_feats = (1.0 - alpha) * pna_feats + alpha * exstraqt_feats
+        
+        # Kết nối tắt (Residual) cộng trực tiếp pna_feats. 
+        # Đây là tấm bùa hộ mệnh: Nếu đặc trưng thời gian có dấu hiệu lạ ở tập Test,
+        # mô hình vẫn dựa vào pna_feats để giữ vững mốc F1 cũ (Precision cũ).
+        output = self.post_transition(fused_feats) + pna_feats
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter
 # Giả định các class GenAgg và MLPAutoencoder bạn đã import ở file nguồn
 
 class ExSTraQtGenAggFusion(nn.Module):
