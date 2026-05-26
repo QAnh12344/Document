@@ -1,5 +1,154 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Lõi PNA Tĩnh (Bắt cấu trúc Fan-In / Fan-Out)
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+        
+        # 2. Nhánh ExSTraQt - Khớp 100% toán học phẳng của bài báo
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+        
+        # 3. Cổng đa chiều chống Attention Collapse (Sắp xếp lại đa tầng phi tuyến)
+        self.gate_proj1 = nn.Linear(n_hidden * 2, n_hidden)
+        self.gate_ln = nn.LayerNorm(n_hidden)
+        self.gate_silu = nn.SiLU()
+        self.gate_proj2 = nn.Linear(n_hidden, n_hidden)
+        self.gate_activation = nn.Sigmoid()
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.35) # Tối ưu hóa Dropout chống học vẹt nhãn Normal
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if hasattr(self.pna_core, "reset_parameters"):
+            self.pna_core.reset_parameters()
+        
+        for m in [self.pna_project, self.exstraqt_project, self.post_transition]:
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                    if layer.bias is not None: nn.init.zeros_(layer.bias)
+                elif isinstance(layer, nn.LayerNorm):
+                    layer.reset_parameters()
+                    
+        nn.init.kaiming_normal_(self.gate_proj1.weight, nonlinearity='relu')
+        nn.init.zeros_(self.gate_proj1.bias)
+        self.gate_ln.reset_parameters()
+        nn.init.xavier_normal_(self.gate_proj2.weight)
+        nn.init.zeros_(self.gate_proj2.bias)
+
+    def forward(self, x, index, timestamps_, log_amounts):
+        # Đảm bảo tensor 1D tuyệt đối chống lỗi bùng nổ bộ nhớ (Broadcasting OOM)
+        timestamps_ = timestamps_.flatten()
+        log_amounts = log_amounts.flatten()
+
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: TĨNH (PNA) ===
+        pna_raw = self.pna_core(x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+
+        # === NHÁNH 2: ĐỘNG (EXSTRAQT TOÁN HỌC CHUẨN) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # SỬA CHIẾN THUẬT: Dùng Softplus để khôi phục scale dòng tiền tuyến tính mà không lo tràn số NaN
+        raw_amounts = F.softplus(log_amounts) + 1e-6
+        sum_amounts = scatter(raw_amounts, index, dim=0, dim_size=num_groups, reduce='sum') + 1e-6
+
+        # 1. TF(c) - Trọng tâm thời gian có trọng số tiền chính xác theo Công thức (2)
+        tf_c = scatter(raw_amounts * tau, index, dim=0, dim_size=num_groups, reduce='sum') / sum_amounts
+        
+        # 2. Weighted Standard Deviation - Phương sai thời gian có trọng số tiền chuẩn bài báo
+        weighted_time_var = scatter(raw_amounts * ((tau - tf_c[index]) ** 2), index, dim=0, dim_size=num_groups, reduce='sum') / sum_amounts
+        tf_std = torch.sqrt(weighted_time_var + 1e-6)
+
+        # 3. Burst Density 
+        burst_density = torch.log1p(edge_counts)
+        
+        # 4. Money Velocity đồng bộ thứ nguyên không gian Log
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount) / (torch.log1p(duration_safe) + 1.0)
+        money_velocity = torch.tanh(money_velocity)
+
+        # 5. Flow Skewness
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)) ** 1.5 + 1e-5
+        flow_skew = torch.tanh(skew_num / skew_den) 
+
+        # 6. Inter Arrival Time
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-6))
+
+        # Đóng gói và cào bằng nhiễu phân phối chéo nhóm qua LayerNorm
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_feats = self.exstraqt_project(self.exstraqt_ln(exstraqt_raw)) 
+
+        # === NHÁNH 3: FUSION GATED MULTI-DIMENSIONAL ===
+        combined_context = torch.cat([pna_feats, exstraqt_feats], dim=-1)
+        
+        # Tầng tính toán cổng đa lớp phi tuyến tính
+        gate_h = self.gate_silu(self.gate_ln(self.gate_proj1(combined_context)))
+        alpha = self.gate_activation(self.gate_proj2(gate_h))
+
+        # KHÓA BẢO HIỂM: Giới hạn biên độ alpha từ 0.10 đến 0.90 để triệt tiêu hiện tượng sụp đổ Gate trên tập Test
+        beta = 0.10 + 0.80 * alpha
+        fused_feats = (1.0 - beta) * pna_feats + beta * exstraqt_feats
+        
+        # Kết nối tắt bảo hiểm dòng chảy Gradient (+ pna_feats gốc)
+        output = self.post_transition(fused_feats) + pna_feats
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
