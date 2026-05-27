@@ -49,6 +49,290 @@ class ExSTraQtPnaStableAgg(nn.Module):
         # =====================================================
         self.pna_head = nn.Linear(n_hidden, 2)
         self.ex_head = nn.Linear(n_hidden, 2)
+        self.final_head = nn.Linear(n_hidden, 2)  # final classifier
+
+        # =====================================================
+        # 4. FUSION
+        # =====================================================
+        self.fusion_alpha = nn.Parameter(torch.tensor(0.0))
+        self.res_beta = nn.Parameter(torch.tensor(0.0))
+
+        self.post = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+            nn.Dropout(0.15),
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna.reset_parameters()
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        nn.init.constant_(self.fusion_alpha, 0.0)
+        nn.init.constant_(self.res_beta, 0.0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        index: torch.Tensor,
+        timestamps_: torch.Tensor,
+        log_amounts: torch.Tensor,
+        num_groups: int = None,
+    ) -> torch.Tensor:
+
+        device = x.device
+        eps = self.eps
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = int(index.max().item()) + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, 2, device=device)
+
+        # =====================================================
+        # 1. PNA VIEW
+        # =====================================================
+        pna_raw = self.pna(x, index)
+        pna_feats = self.pna_proj(pna_raw)
+
+        # =====================================================
+        # 2. BASIC STATS
+        # =====================================================
+        edge_counts = scatter(
+            torch.ones_like(index, dtype=torch.float32),
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="sum",
+        )
+        edge_counts_safe = edge_counts + eps
+
+        # =====================================================
+        # 3. TIME NORMALIZATION
+        # =====================================================
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="min")
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="max")
+
+        duration = (max_t - min_t).clamp(min=1.0)
+        tau = (timestamps_ - min_t[index]) / (duration[index] + eps)
+
+        # =====================================================
+        # 4. AMOUNT NORMALIZATION
+        # =====================================================
+        mean_amt = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce="mean")
+        centered_amt = log_amounts - mean_amt[index]
+
+        amt_std = torch.sqrt(
+            scatter(
+                centered_amt.pow(2),
+                index,
+                dim=0,
+                dim_size=num_groups,
+                reduce="mean",
+            ) + eps
+        )
+
+        normalized_amt = centered_amt / (amt_std[index] + eps)
+        normalized_amt = torch.clamp(normalized_amt, min=-3.0, max=3.0)
+
+        # =====================================================
+        # 5. TEMPORAL ATTENTION
+        # =====================================================
+        temperature = 2.0
+        amt_weights = scatter_softmax(normalized_amt / temperature, index, dim=0)
+
+        # =====================================================
+        # 6. ExSTraQT FEATURES
+        # =====================================================
+        # temporal center
+        tf_center = scatter(
+            amt_weights * tau, index, dim=0, dim_size=num_groups, reduce="sum"
+        )
+
+        # temporal std
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce="mean")
+        centered_tau = tau - mean_tau[index]
+
+        tau_std = torch.sqrt(
+            scatter(
+                centered_tau.pow(2), index, dim=0, dim_size=num_groups, reduce="mean"
+            ) + eps
+        )
+        tau_std = torch.log1p(tau_std)
+
+        # temporal skew
+        tau_skew = scatter(
+            centered_tau.pow(3), index, dim=0, dim_size=num_groups, reduce="mean"
+        ) / (tau_std.pow(3) + 1e-4)
+        tau_skew = torch.tanh(tau_skew / 5.0)
+
+        # entropy
+        temporal_entropy = -scatter(
+            amt_weights * torch.log(amt_weights + eps),
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="sum",
+        )
+        temporal_entropy = temporal_entropy / torch.log1p(edge_counts_safe + 1.0)
+
+        # burst density
+        burst_density = torch.log1p(edge_counts_safe)
+
+        # activity ratio
+        activity_ratio = torch.log1p(edge_counts_safe / (duration + eps))
+
+        # money velocity
+        money_velocity = mean_amt / torch.log1p(duration)
+        money_velocity = torch.sign(money_velocity) * torch.log1p(torch.abs(money_velocity))
+
+        # =====================================================
+        # 7. STACK FEATURES
+        # =====================================================
+        ex_features = torch.stack(
+            [
+                tf_center,
+                tau_std,
+                tau_skew,
+                temporal_entropy,
+                burst_density,
+                activity_ratio,
+                money_velocity,
+            ],
+            dim=-1,
+        )
+
+        ex_features = torch.nan_to_num(
+            ex_features, nan=0.0, posinf=5.0, neginf=-5.0
+        )
+
+        # =====================================================
+        # 8. ExSTraQT VIEW
+        # =====================================================
+        ex_feats = self.ex_proj(self.ex_ln(ex_features))
+
+        # =====================================================
+        # 9. VIEW PREDICTIONS
+        # =====================================================
+        pna_logits = self.pna_head(pna_feats)
+        ex_logits = self.ex_head(ex_feats)
+
+        pna_prob = torch.softmax(pna_logits, dim=-1)[:, 1]
+        ex_prob = torch.softmax(ex_logits, dim=-1)[:, 1]
+
+        # disagreement và agreement score
+        view_gap = torch.abs(pna_prob - ex_prob)
+        agreement = torch.exp(-2.0 * view_gap)
+
+        # =====================================================
+        # 10. ADAPTIVE FUSION
+        # =====================================================
+        alpha = 0.20 + 0.40 * torch.sigmoid(self.fusion_alpha)
+        fused = (1.0 - alpha) * pna_feats + alpha * ex_feats
+
+        # disagreement-aware fusion
+        agreement_unsqueezed = agreement.unsqueeze(-1)
+        fused = (
+            agreement_unsqueezed * fused
+            + (1.0 - agreement_unsqueezed) * pna_feats
+        )
+
+        # =====================================================
+        # 11. OUTPUT
+        # =====================================================
+        out = self.post(fused)
+        beta = 0.10 + 0.20 * torch.sigmoid(self.res_beta)
+        out = out + beta * pna_feats
+
+        # =====================================================
+        # 12. FINAL CLASSIFICATION
+        # =====================================================
+        final_logits = self.final_head(out)
+        final_prob = torch.softmax(final_logits, dim=-1)[:, 1]
+
+        # =====================================================
+        # 13. MULTI-VIEW CONFORMAL FILTER
+        # =====================================================
+        conformal_score = (1.0 - final_prob) + 0.5 * view_gap
+        uncertain_mask = (conformal_score > 0.55) & (final_prob > 0.5)
+
+        # giảm overconfident FP
+        final_logits = final_logits.clone()
+        final_logits[uncertain_mask, 1] *= 0.75
+        final_logits[uncertain_mask, 0] *= 1.10
+
+        return final_logits
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter, scatter_softmax
+
+
+class ExSTraQtPnaStableAgg(nn.Module):
+
+    def __init__(self, n_hidden: int, deg: torch.Tensor):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.eps = 1e-6
+
+        # =====================================================
+        # 1. PNA VIEW
+        # =====================================================
+        aggregators = ["mean", "max", "std"]
+        scalers = ["identity", "amplification"]
+
+        self.pna = DegreeScalerAggregation(
+            aggregators=aggregators, scalers=scalers, deg=deg
+        )
+
+        pna_dim = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_proj = nn.Sequential(
+            nn.Linear(pna_dim, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+            nn.Dropout(0.10),
+        )
+
+        # =====================================================
+        # 2. ExSTraQT VIEW
+        # =====================================================
+        self.num_feats = 7
+        self.ex_ln = nn.LayerNorm(self.num_feats)
+
+        self.ex_proj = nn.Sequential(
+            nn.Linear(self.num_feats, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+            nn.Dropout(0.20),
+        )
+
+        # =====================================================
+        # 3. VIEW HEADS
+        # =====================================================
+        self.pna_head = nn.Linear(n_hidden, 2)
+        self.ex_head = nn.Linear(n_hidden, 2)
 
         # =====================================================
         # 4. FUSION
