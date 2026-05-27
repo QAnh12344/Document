@@ -1,5 +1,186 @@
 import torch
 import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter, scatter_softmax
+
+
+class ExSTraQtPnaStableAgg(nn.Module):
+
+    def __init__(self, n_hidden: int, deg: torch.Tensor):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.eps = 1e-6
+        # Tăng lên 8 features để bắt trọn thông tin phân phối thời gian
+        self.num_feats = 8
+
+        # 1. PNA BRANCH (Giữ cấu trúc cô đọng tránh overfitting)
+        aggregators = ["mean", "max", "std"]
+        scalers = ["identity", "amplification"]
+
+        self.pna = DegreeScalerAggregation(
+            aggregators=aggregators, scalers=scalers, deg=deg
+        )
+        pna_dim = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_proj = nn.Sequential(
+            nn.Linear(pna_dim, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+        )
+
+        # 2. ExSTraQT BRANCH (Nâng cấp kiến trúc xử lý feature thống kê)
+        self.ex_ln = nn.LayerNorm(self.num_feats)
+        self.ex_proj = nn.Sequential(
+            nn.Linear(self.num_feats, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+        )
+
+        # 3. HIGH-STABILITY FUSION (Learnable nhưng static trong Forward)
+        self.fusion_alpha = nn.Parameter(torch.tensor(0.35))
+        self.res_beta = nn.Parameter(torch.tensor(0.5))  # Khóa học residual tự động
+
+        # 4. OUTPUT LAYER (Thêm Dropout thông minh bảo vệ F1 khi Test)
+        self.post = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.GELU(),
+            nn.Dropout(0.2),  # Tăng nhẹ để chống nhiễu dữ liệu ảo khi test
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna.reset_parameters()
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Dùng xavier_normal giúp các trọng số hội tụ chặt chẽ hơn quanh 0
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Đưa các hệ số parameter về trạng thái cân bằng ban đầu
+        nn.init.constant_(self.fusion_alpha, 0.35)
+        nn.init.constant_(self.res_beta, 0.5)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        index: torch.Tensor,
+        timestamps_: torch.Tensor,
+        log_amounts: torch.Tensor,
+        num_groups: int = None,
+    ) -> torch.Tensor:
+
+        device = x.device
+        num_edges = x.size(0)
+        eps = self.eps
+
+        if num_groups is None:
+            num_groups = int(index.max().item() + 1) if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # =====================================================
+        # 1. PNA PROCESSING
+        # =====================================================
+        pna_raw = self.pna(x, index)
+        pna_feats = self.pna_proj(pna_raw)
+
+        # =====================================================
+        # 2. ROBUST STATS ENGINE (Sửa đổi để tăng F1)
+        # =====================================================
+        # Dùng scatter tính số lượng cạnh an toàn tuyệt đối, tránh bincount lệch index
+        edge_counts = scatter(
+            torch.ones_like(index, dtype=torch.float32), 
+            index, dim=0, dim_size=num_groups, reduce="sum"
+        )
+        edge_counts_safe = edge_counts + eps
+
+        # Time Normalization
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="min")
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce="max")
+        duration = (max_t - min_t).clamp(min=1.0)
+        tau = (timestamps_ - min_t[index]) / (duration[index] + eps)
+
+        # --- OUTLIER-RESISTANT AMOUNT NORMALIZATION ---
+        mean_amt = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce="mean")
+        centered_amt = log_amounts - mean_amt[index]
+
+        amt_std = torch.sqrt(
+            scatter(centered_amt.pow(2), index, dim=0, dim_size=num_groups, reduce="mean") + eps
+        )
+        
+        # Soft-clipping để triệt tiêu nhiễu từ các giao dịch cực đoan (Cá voi rửa tiền)
+        normalized_amt = centered_amt / (amt_std[index] + eps)
+        normalized_amt = torch.clamp(normalized_amt, min=-3.0, max=3.0) 
+        amt_weights = scatter_softmax(normalized_amt, index, dim=0)
+
+        # =====================================================
+        # 3. FEATURE EXTRACTION (8 Core Features)
+        # =====================================================
+        # Feature 1: Temporal Center (Trọng tâm chuỗi)
+        tf_center = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce="sum")
+
+        # Feature 2: Temporal Variance (Độ phân tán thời gian)
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce="mean")
+        centered_tau = tau - mean_tau[index]
+        tau_std = torch.sqrt(
+            scatter(centered_tau.pow(2), index, dim=0, dim_size=num_groups, reduce="mean") + eps
+        )
+
+        # Feature 3: Temporal Skewness (MỚI - Bắt bài phân phối dồn cục của Fraud)
+        tau_skew = scatter(centered_tau.pow(3), index, dim=0, dim_size=num_groups, reduce="mean") / (tau_std.pow(3) + 1e-4)
+        tau_skew = torch.tanh(tau_skew / 3.0)
+
+        # Feature 4: Normalized Temporal Entropy
+        temporal_entropy = -scatter(amt_weights * torch.log(amt_weights + eps), index, dim=0, dim_size=num_groups, reduce="sum")
+        temporal_entropy = temporal_entropy / torch.log1p(edge_counts + 1)
+
+        # Feature 5 & 6: Density Metrics
+        burst_density = torch.log1p(edge_counts)
+        activity_ratio = torch.log1p(edge_counts / (duration + eps))
+
+        # Feature 7: Velocity Metrics
+        money_velocity = mean_amt / torch.log1p(duration)
+        money_velocity = torch.sign(money_velocity) * torch.log1p(torch.abs(money_velocity))
+
+        # Feature 8: Flow Skewness
+        flow_skew = scatter(centered_amt.pow(3), index, dim=0, dim_size=num_groups, reduce="mean") / (amt_std.pow(3) + 1e-4)
+        flow_skew = torch.tanh(flow_skew / 3.0)
+
+        # =====================================================
+        # 4. STACK, FUSION & OUTPUT
+        # =====================================================
+        ex_features = torch.stack(
+            [tf_center, tau_std, tau_skew, temporal_entropy, burst_density, activity_ratio, money_velocity, flow_skew],
+            dim=-1,
+        )
+        ex_feats = self.ex_proj(self.ex_ln(ex_features))
+
+        # Khóa thiết bị an toàn cho tham số học alpha và beta
+        alpha = torch.sigmoid(self.fusion_alpha.to(device))
+        beta = torch.tanh(self.res_beta.to(device))  # Tránh bùng nổ gradient nhờ kích hoạt tanh
+
+        fused = (1.0 - alpha) * pna_feats + alpha * ex_feats
+        out = self.post(fused)
+
+        # Kết nối tắt (Skip connection) linh hoạt giúp tối ưu hóa đồ thị Loss tốt hơn
+        return out + beta * pna_feats
+
+
+
+
+
+
+
+.
+
+
+
+import torch
+import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
