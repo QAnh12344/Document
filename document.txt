@@ -22,6 +22,188 @@ class ExSTraQtPnaHybridAgg(nn.Module):
             nn.SiLU()
         )
 
+        # 2. Feature Projector
+        self.ex_ln = nn.LayerNorm(6)
+        self.ex_project = nn.Sequential(
+            nn.Linear(6, n_hidden), 
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+
+        # 3. MẠCH ĐIỀU PHỐI NÂNG CẤP (ELEMENT-WISE GATING) - CHÌA KHÓA GIẢM FP
+        # Thay vì ra 1 kênh, mạch ra n_hidden kênh để kiểm soát chi tiết từng đặc trưng ẩn
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Linear(n_hidden, n_hidden), # Đầu ra bằng đúng kích thước n_hidden
+        )
+
+        # 4. Output Stabilizer
+        self.post = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(0.4),
+        )
+        self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if hasattr(self.pna_core, 'reset_parameters'):
+            self.pna_core.reset_parameters()
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.ex_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.gate[0].weight, nonlinearity='relu')
+        
+        for layer in [self.pna_project[0], self.ex_project[0], self.post[0], self.gate[0]]:
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+
+        # Khởi tạo mạch Gate phân rã bằng Xavier Normal
+        nn.init.xavier_normal_(self.gate[3].weight)
+        if self.gate[3].bias is not None:
+            nn.init.zeros_(self.gate[3].bias)
+
+        self.pna_project[1].reset_parameters()
+        self.ex_ln.reset_parameters()
+        self.ex_project[1].reset_parameters()
+        self.gate[1].reset_parameters()
+        self.post[1].reset_parameters()
+
+        nn.init.constant_(self.beta, 0.5)
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        index: torch.Tensor, 
+        timestamps_: torch.Tensor, 
+        log_amounts: torch.Tensor,
+        num_nodes: int = None  
+    ) -> torch.Tensor:
+        
+        num_edges = x.size(0)
+        device = x.device
+        
+        if num_nodes is None:
+            num_groups = int(index.max().item() + 1) if num_edges > 0 else 0
+        else:
+            num_groups = num_nodes
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        index_long = index.long()
+
+        # PNA BRANCH
+        pna_raw = self.pna_core(x, index_long, dim_size=num_groups)
+        pna = self.pna_project(pna_raw)
+
+        # DYNAMIC TEMPORAL-FLOW BRANCH
+        with torch.cuda.amp.autocast(enabled=False):
+            timestamps_f32 = timestamps_.float()
+            log_amounts_f32 = log_amounts.float()
+            
+            edge_cnt = torch.bincount(index_long, minlength=num_groups).float()
+            eps_edge_cnt = edge_cnt + 1e-6
+
+            # Time-based features
+            min_t = scatter(timestamps_f32, index_long, 0, dim_size=num_groups, reduce="min")
+            max_t = scatter(timestamps_f32, index_long, 0, dim_size=num_groups, reduce="max")
+            duration = (max_t - min_t) + 1.0
+
+            safe_index = index_long.clamp(0, num_groups - 1)
+            
+            tau = (timestamps_f32 - min_t[safe_index]) / duration[safe_index]
+            mean_tau = scatter(tau, index_long, 0, dim_size=num_groups, reduce="mean")
+            
+            tf_std = torch.sqrt(
+                scatter((tau - mean_tau[safe_index]) ** 2, index_long, 0, dim_size=num_groups, reduce="sum") 
+                / eps_edge_cnt + 1e-8
+            )
+
+            # Amount-based features
+            log_amt = log_amounts_f32 / (log_amounts_f32.std() + 1e-6)
+            
+            positive_amt = F.softplus(log_amt)
+            sum_amt = scatter(positive_amt, index_long, 0, dim_size=num_groups, reduce="sum") + 1e-6
+            amt_w = positive_amt / sum_amt[safe_index]  
+            tf_c = scatter(amt_w * tau, index_long, 0, dim_size=num_groups, reduce="sum")
+
+            # Structural & Velocity features
+            burst = torch.log1p(edge_cnt)
+            mean_amt = scatter(log_amt, index_long, 0, dim_size=num_groups, reduce="mean") 
+            
+            velocity = torch.log1p(F.softplus(mean_amt) / torch.log1p(duration))
+            inter_arrival = torch.log1p(duration / eps_edge_cnt)
+
+            # Skewness calculation (Bảo toàn Outlier toán học chuẩn xác)
+            diff_amt = log_amt - mean_amt[safe_index]
+            diff_amt_sq = diff_amt ** 2
+            
+            variance = scatter(diff_amt_sq, index_long, 0, dim_size=num_groups, reduce="sum") / eps_edge_cnt
+            skew_num = scatter(diff_amt_sq * diff_amt, index_long, 0, dim_size=num_groups, reduce="sum") / eps_edge_cnt
+            
+            skew_den = (variance + 1e-5) ** 1.5 
+            skew = skew_num / skew_den
+
+            ex_raw = torch.stack([tf_c, tf_std, burst, velocity, skew, inter_arrival], dim=-1)
+
+        ex_raw = ex_raw.to(x.dtype)
+        ex = self.ex_project(self.ex_ln(ex_raw))
+
+        # -----------------------------------------------------------------
+        # GATING PHÂN RÃ THEO PHẦN TỬ (Element-wise Fusion)
+        # -----------------------------------------------------------------
+        ctx = torch.cat([pna, ex], dim=-1)
+        # alpha bây giờ là một ma trận trọng số kích thước [num_groups, n_hidden]
+        alpha = torch.sigmoid(self.gate(ctx))
+        alpha = alpha.clamp(0.15, 0.85)  
+
+        # Từng chiều (dimension) ẩn sẽ được hòa trộn độc lập để triệt tiêu nhiễu FP
+        fused = (1 - alpha) * pna + alpha * ex
+
+        # OUTPUT BLOCK
+        out = self.post(fused) + self.beta.to(device) * pna
+
+        return out
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter
+
+
+class ExSTraQtPnaHybridAgg(nn.Module):
+    def __init__(self, n_hidden: int, deg: torch.Tensor):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # 1. PNA Branch Core
+        aggregators = ["mean", "min", "max", "std"]
+        scalers = ["identity", "amplification", "attenuation"]
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden), 
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+
         # 2. Feature Projector (6 đặc trưng động lực học dòng chảy)
         self.ex_ln = nn.LayerNorm(6)
         self.ex_project = nn.Sequential(
