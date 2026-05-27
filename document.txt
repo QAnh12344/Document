@@ -1,6 +1,159 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter
+
+
+class ExSTraQtPnaHybridAgg(nn.Module):
+    def __init__(self, n_hidden: int, deg: torch.Tensor):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # 1. PNA Branch Core
+        aggregators = ["mean", "min", "max", "std"]
+        scalers = ["identity", "amplification", "attenuation"]
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden), 
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+
+        # 2. Feature Projector (6 đặc trưng động lực học dòng chảy)
+        self.ex_ln = nn.LayerNorm(6)
+        self.ex_project = nn.Sequential(
+            nn.Linear(6, n_hidden), 
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+
+        # 3. Gating Mechanism (Hòa trộn thích ứng tránh sụp đổ thông tin)
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Linear(n_hidden, 1),
+        )
+
+        # 4. Output Stabilizer & Learnable Residual Balance
+        self.post = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(0.4),
+        )
+        self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        index: torch.Tensor, 
+        timestamps_: torch.Tensor, 
+        log_amounts: torch.Tensor,
+        num_nodes: int = None  # Cố định chiều ra tránh lệch ma trận khi batching
+    ) -> torch.Tensor:
+        
+        num_edges = x.size(0)
+        device = x.device
+        
+        # Xác định số lượng nút (nhóm) trong batch
+        if num_nodes is None:
+            num_groups = int(index.max().item() + 1) if num_edges > 0 else 0
+        else:
+            num_groups = num_nodes
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # Đảm bảo index ở kiểu Long tránh lỗi bincount trên CUDA phần cứng
+        index_long = index.long()
+
+        # -----------------------------------------------------------------
+        # PNA BRANCH (Cấu trúc tĩnh đồ thị)
+        # -----------------------------------------------------------------
+        pna_raw = self.pna_core(x, index_long, dim_size=num_groups)
+        pna = self.pna_project(pna_raw)
+
+        # -----------------------------------------------------------------
+        # DYNAMIC TEMPORAL-FLOW BRANCH (Đặc trưng hành vi vi mô cấp Nút)
+        # -----------------------------------------------------------------
+        edge_cnt = torch.bincount(index_long, minlength=num_groups).float()
+        eps_edge_cnt = edge_cnt + 1e-6
+
+        # Time-based features
+        min_t = scatter(timestamps_, index_long, 0, dim_size=num_groups, reduce="min")
+        max_t = scatter(timestamps_, index_long, 0, dim_size=num_groups, reduce="max")
+        duration = (max_t - min_t) + 1.0
+
+        # Kẹp biên an toàn tuyệt đối tránh lỗi Index Out of Bounds khi subgraphing
+        safe_index = index_long.clamp(0, num_groups - 1)
+        
+        tau = (timestamps_ - min_t[safe_index]) / duration[safe_index]
+        mean_tau = scatter(tau, index_long, 0, dim_size=num_groups, reduce="mean")
+        
+        tf_std = torch.sqrt(
+            scatter((tau - mean_tau[safe_index]) ** 2, index_long, 0, dim_size=num_groups, reduce="sum") 
+            / eps_edge_cnt + 1e-8
+        )
+
+        # Amount-based features
+        log_amt = log_amounts / (log_amounts.std() + 1e-6)
+        
+        positive_amt = F.softplus(log_amt)
+        sum_amt = scatter(positive_amt, index_long, 0, dim_size=num_groups, reduce="sum") + 1e-6
+        amt_w = positive_amt / sum_amt[safe_index]  
+        tf_c = scatter(amt_w * tau, index_long, 0, dim_size=num_groups, reduce="sum")
+
+        # Structural & Velocity features
+        burst = torch.log1p(edge_cnt)
+        mean_amt = scatter(log_amt, index_long, 0, dim_size=num_groups, reduce="mean") 
+        
+        velocity = torch.log1p(F.softplus(mean_amt) / torch.log1p(duration))
+        inter_arrival = torch.log1p(duration / eps_edge_cnt)
+
+        # Skewness calculation (Tối ưu hóa toán tử nhân trên GPU để tăng tốc độ)
+        diff_amt = log_amt - mean_amt[safe_index]
+        diff_amt_sq = diff_amt ** 2
+        
+        variance = scatter(diff_amt_sq, index_long, 0, dim_size=num_groups, reduce="sum") / eps_edge_cnt
+        skew_num = scatter(diff_amt_sq * diff_amt, index_long, 0, dim_size=num_groups, reduce="sum") / eps_edge_cnt
+        
+        skew_den = (variance + 1e-6) ** 1.5 
+        skew = skew_num / skew_den
+
+        # Kết hợp thành dạng ma trận đặc trưng phẳng cấp Nút [num_groups, 6]
+        ex_raw = torch.stack([tf_c, tf_std, burst, velocity, skew, inter_arrival], dim=-1)
+        ex = self.ex_project(self.ex_ln(ex_raw))
+
+        # -----------------------------------------------------------------
+        # GATING & FUSION (Hòa trộn thích ứng)
+        # -----------------------------------------------------------------
+        ctx = torch.cat([pna, ex], dim=-1)
+        alpha = torch.sigmoid(self.gate(ctx))
+        alpha = alpha.clamp(0.15, 0.85)  
+
+        fused = (1 - alpha) * pna + alpha * ex
+
+        # -----------------------------------------------------------------
+        # OUTPUT BLOCK (Kết nối tắt Residual cân bằng)
+        # -----------------------------------------------------------------
+        out = self.post(fused) + self.beta.to(device) * pna
+
+        return out
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
