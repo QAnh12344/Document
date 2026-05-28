@@ -1,5 +1,179 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class StableExSTraQtPNAFusion(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # ===================== PNA =====================
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna = DegreeScalerAggregation(aggregators, scalers, deg)
+
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_proj = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # ===================== EXSTRAQT (STABLE) =====================
+        self.ex_ln = nn.LayerNorm(6)
+
+        self.ex_proj = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(0.1)
+        )
+
+        # ===================== GATE (BOUNDED) =====================
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Linear(n_hidden, n_hidden)
+        )
+
+        self.gate_temp = nn.Parameter(torch.tensor(1.5))
+
+        # ===================== FUSION =====================
+        self.fuse = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(0.2)
+        )
+
+        # global balance (important for stability)
+        self.alpha_pna = nn.Parameter(torch.tensor(0.7))
+        self.alpha_ex = nn.Parameter(torch.tensor(0.3))
+
+    # ===================== RESET =====================
+    def reset_parameters(self):
+        self.pna.reset_parameters()
+
+        for m in self.pna_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                m.reset_parameters()
+
+        self.ex_ln.reset_parameters()
+
+        for m in self.ex_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                m.reset_parameters()
+
+        for m in self.gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=0.2)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                m.reset_parameters()
+
+        for m in self.fuse:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                m.reset_parameters()
+
+        nn.init.constant_(self.gate_temp, 1.5)
+
+        with torch.no_grad():
+            self.alpha_pna.fill_(0.7)
+            self.alpha_ex.fill_(0.3)
+
+    # ===================== FORWARD =====================
+    def forward(self, x, index, timestamps_, log_amounts):
+
+        num_nodes = index.max().item() + 1 if x.size(0) > 0 else 0
+        if x.size(0) == 0:
+            return torch.zeros(num_nodes, self.n_hidden, device=x.device)
+
+        # ===================== PNA =====================
+        pna = self.pna(x, index)
+        pna = self.pna_proj(pna)
+
+        # ===================== EXSTRAQT =====================
+        edge_counts = torch.bincount(index, minlength=num_nodes).float().clamp(min=1.0)
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_nodes, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_nodes, reduce='max')
+
+        duration = (max_t - min_t).clamp(min=1.0)
+
+        tau = (timestamps_ - min_t[index]) / duration[index]
+
+        # ===== stable weighting (NO global_std leakage) =====
+        amt_norm = (log_amounts - log_amounts.mean()) / (log_amounts.std() + 1e-6)
+        w = scatter_softmax(amt_norm, index, dim=0)
+        w = w / edge_counts[index]
+
+        tf_c = scatter(w * tau, index, dim=0, dim_size=num_nodes, reduce='sum')
+
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_nodes, reduce='mean')
+        tf_std = scatter((tau - mean_tau[index])**2, index, dim=0,
+                         dim_size=num_nodes, reduce='mean').sqrt()
+
+        burst = torch.log1p(edge_counts)
+
+        mean_amt = scatter(log_amounts, index, dim=0, dim_size=num_nodes, reduce='mean')
+
+        velocity = torch.log1p((mean_amt + 1e-6) / torch.log1p(duration))
+
+        avg_gap = torch.log1p(duration / edge_counts)
+
+        # ⚠️ skew removed (too unstable for test)
+        skew = torch.zeros_like(mean_amt)
+
+        ex = torch.stack([tf_c, tf_std, burst, velocity, skew, avg_gap], dim=-1)
+
+        ex = self.ex_ln(ex)
+        ex = self.ex_proj(ex)
+
+        # ===================== GATE =====================
+        gate_in = torch.cat([pna, ex], dim=-1)
+
+        g = self.gate(gate_in)
+
+        # bounded + temperature smoothing
+        g = torch.tanh(g / self.gate_temp)
+
+        alpha = torch.sigmoid(g)
+
+        # ===================== FUSION =====================
+        fused = self.alpha_pna * pna + self.alpha_ex * ex + alpha * (pna - ex)
+
+        out = self.fuse(fused)
+
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
