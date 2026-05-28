@@ -27,6 +27,197 @@ class SafeExSTraQtPNA(nn.Module):
             nn.SiLU(),
         )
 
+        # ===================== EX FEATURES =====================
+        self.ex_proj = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+        )
+
+        # ===================== GATE =====================
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden * 2, n_hidden),
+            nn.SiLU(),
+            nn.Linear(n_hidden, 1),
+        )
+
+        # global fusion control
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+        self.reset_parameters()
+
+    # =====================================================
+    # RESET PARAMETERS (FULL FIX)
+    # =====================================================
+    def reset_parameters(self):
+
+        if hasattr(self.pna, "reset_parameters"):
+            self.pna.reset_parameters()
+
+        for m in self.modules():
+
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            if isinstance(m, nn.LayerNorm):
+                m.reset_parameters()
+
+        nn.init.constant_(self.alpha, 0.5)
+
+    # =====================================================
+    # SAFE CAST
+    # =====================================================
+    def _cast(self, x, device, dtype):
+        if not torch.is_tensor(x):
+            x = torch.tensor(x)
+        return x.to(device=device, dtype=dtype)
+
+    # =====================================================
+    # SAFE SCATTER MIN/MAX (IMPORTANT FIX)
+    # =====================================================
+    def safe_min_max(self, values, index, num_nodes):
+
+        if values.numel() == 0:
+            z = torch.zeros(num_nodes, device=values.device)
+            return z, z
+
+        # safer than raw min/max
+        min_v = scatter(-values, index, 0, num_nodes, reduce="max").neg()
+        max_v = scatter(values, index, 0, num_nodes, reduce="max")
+
+        return min_v, max_v
+
+    # =====================================================
+    # FORWARD
+    # =====================================================
+    def forward(self, x, index, timestamps_, log_amounts):
+
+        device = x.device
+
+        # ---------------- SAFE INPUT ----------------
+        index = self._cast(index, device, torch.long)
+        timestamps_ = self._cast(timestamps_, device, torch.float32)
+        log_amounts = self._cast(log_amounts, device, torch.float32)
+
+        num_nodes = int(index.max().item()) + 1 if index.numel() > 0 else 0
+
+        if x.size(0) == 0 or num_nodes == 0:
+            return torch.zeros(num_nodes, self.n_hidden, device=device)
+
+        # ===================== PNA =====================
+        pna = self.pna(x, index)
+        pna = self.pna_proj(pna)
+
+        # ===================== EDGE COUNT =====================
+        edge_count = scatter(
+            torch.ones_like(index, dtype=torch.float32, device=device),
+            index,
+            dim=0,
+            dim_size=num_nodes,
+            reduce="sum",
+        ).clamp(min=1.0)
+
+        # ===================== TIME (FIXED) =====================
+        min_t, max_t = self.safe_min_max(timestamps_, index, num_nodes)
+
+        duration = (max_t - min_t).clamp(min=1.0)
+
+        tau = (timestamps_ - min_t[index]) / (duration[index] + self.eps)
+
+        # ===================== AMOUNT =====================
+        mean_amt = scatter(
+            log_amounts,
+            index,
+            0,
+            num_nodes,
+            reduce="mean",
+        )
+
+        velocity = torch.log1p(mean_amt / torch.log1p(duration))
+
+        burst = torch.log1p(edge_count)
+
+        tf_center = scatter(
+            tau,
+            index,
+            0,
+            num_nodes,
+            reduce="mean",
+        )
+
+        tf_std = scatter(
+            (tau - tf_center[index]) ** 2,
+            index,
+            0,
+            num_nodes,
+            reduce="mean",
+        ).sqrt()
+
+        avg_gap = torch.log1p(duration / edge_count)
+
+        skew = torch.zeros_like(tf_center)
+
+        # ===================== EX =====================
+        ex = torch.stack(
+            [tf_center, tf_std, burst, velocity, skew, avg_gap],
+            dim=-1,
+        )
+
+        ex = self.ex_proj(ex)
+
+        # ===================== GATE =====================
+        g = self.gate(torch.cat([pna, ex], dim=-1))
+        g = torch.sigmoid(g)
+
+        fused = g * pna + (1 - g) * ex
+
+        # ===================== GLOBAL MIX =====================
+        alpha = torch.sigmoid(self.alpha)
+
+        out = alpha * fused + (1 - alpha) * pna
+
+        return out
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class SafeExSTraQtPNA(nn.Module):
+
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.eps = 1e-6
+
+        # ===================== PNA =====================
+        self.pna = DegreeScalerAggregation(
+            aggregators=["mean", "max", "std"],
+            scalers=["identity", "amplification"],
+            deg=deg,
+        )
+
+        pna_out = 3 * 2 * n_hidden
+
+        self.pna_proj = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+        )
+
         # ===================== EX =====================
         self.ex_proj = nn.Sequential(
             nn.Linear(6, n_hidden),
