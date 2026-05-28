@@ -1,5 +1,137 @@
 import torch
 import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg):
+        super().__init__()
+        self.n_hidden = n_hidden
+        
+        # 1. Lõi PNA Tĩnh
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+        
+        # 2. Nhánh ExSTraQt - Tăng cường LayerNorm để xử lý lệch Scale Cross-Group (Sửa C)
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.exstraqt_project = nn.Sequential(
+            nn.Linear(6, n_hidden),
+            nn.LayerNorm(n_hidden), 
+            nn.SiLU()
+        )
+        
+        # 3. Cổng đa chiều tinh giản chống Attention Collapse
+        self.gate_proj = nn.Linear(n_hidden * 2, n_hidden)
+        self.gate_norm = nn.LayerNorm(n_hidden)
+        self.gate_activation = nn.Sigmoid()
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=0.4)
+        )
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.exstraqt_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.gate_proj.weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.pna_project[1].reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        self.exstraqt_project[1].reset_parameters()
+        self.gate_norm.reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts):
+        num_edges = x.size(0)
+        num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === NHÁNH 1: TĨNH (PNA) ===
+        pna_raw = self.pna_core(x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+
+        # === NHÁNH 2: ĐỘNG (EXSTRAQT KHỬ BIAS BIÊN & SCALE TOÀN DIỆN) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        # Sửa (B): Thay Hard Clamp bằng Soft Regularization để bảo toàn tín hiệu nhỏ ở Early Accounts
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # Sửa (A): Giảm hiệu ứng "Winner-takes-all" của Softmax, bình ổn phân phối cho Early/Sparse Users
+        global_std = torch.std(log_amounts) + 1e-6
+        raw_weights = scatter_softmax(log_amounts / global_std, index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-6)
+
+        # Trích xuất các chỉ số hành vi trên không gian toán học phẳng
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)
+        tf_std = torch.sqrt(time_var + 1e-6)
+
+        # Sửa (C): Đưa các đặc trưng mật độ và vận tốc về không gian Log-scale đồng nhất chéo nhóm
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-6)) ** 1.5 + 1e-5
+        flow_skew = skew_num / skew_den 
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-6))
+
+        # Đóng gói 6 đặc trưng
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # Sửa (C) bổ sung: Tầng LayerNorm (self.exstraqt_ln) tại đây sẽ chịu trách nhiệm cào bằng 
+        # toàn bộ độ lệch biên độ còn sót lại giữa Dense và Sparse Graphs trước khi chiếu vào mạng n_hidden
+        exstraqt_feats = self.exstraqt_project(self.exstraqt_ln(exstraqt_raw)) 
+
+        # === NHÁNH 3: FUSION GATED MULTI-DIMENSIONAL ===
+        combined_context = torch.cat([pna_feats, exstraqt_feats], dim=-1)
+        
+        # Tính toán Alpha với Gate tuyến tính hóa mượt mà
+        gate_logit = self.gate_proj(combined_context)
+        gate_logit = self.gate_norm(gate_logit) 
+        alpha = self.gate_activation(gate_logit)
+
+        fused_feats = (1.0 - alpha) * pna_feats + alpha * exstraqt_feats
+        
+        # Kết nối tắt bảo hiểm dòng chảy Gradient
+        output = self.post_transition(fused_feats) + pna_feats
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 from torch_scatter import scatter, scatter_softmax
 
