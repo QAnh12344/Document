@@ -4,6 +4,409 @@ from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
 class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4, max_edges_per_group=10):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.max_edges_per_group = max_edges_per_group
+        
+        # 1. Nhánh tính toán Trọng số Cạnh từ Thời gian (Biến cảm sinh - Induction Variable)
+        self.exstraqt_ln = nn.LayerNorm(6)
+        self.edge_weight_project = nn.Sequential(
+            nn.Linear(6, 1), 
+            nn.Sigmoid()     
+        )
+        
+        # Trọng số OWA học được (hoặc cố định) cho các thứ hạng sau khi sắp xếp
+        # Giả định gộp tối đa một cụm có `max_edges_per_group` cạnh
+        self.owa_weights = nn.Parameter(torch.Tensor(max_edges_per_group, 1))
+        
+        # 2. Lõi PNA Tĩnh
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.edge_weight_project[0].weight, nonlinearity='sigmoid')
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        # Khởi tạo trọng số OWA giảm dần (Ví dụ: Ưu tiên các cạnh có điểm cảm sinh cao)
+        nn.init.constant_(self.owa_weights, 1.0 / self.max_edges_per_group) 
+        
+        self.exstraqt_ln.reset_parameters()
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === BƯỚC 1: TÍNH BIẾN CẢM SINH (INDUCTION VARIABLE) ===
+        # (Giữ nguyên phần trích xuất đặc trưng exstraqt_raw của bạn...)
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0) 
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # Đây chính là Biến cảm sinh U cho từng group
+        group_attention = self.edge_weight_project(self.exstraqt_ln(exstraqt_raw)) 
+        edge_attention = group_attention[index].squeeze(-1) # Kích thước: [num_edges]
+
+        # === BƯỚC 2: CƠ CHẾ SẮP XẾP VÀ GÁN TRỌNG SỐ THEO THỨ TỰ (IOWA CORE) ===
+        
+        # Tạo một khóa sắp xếp kết hợp: index_nhóm * (một số lớn) + (1.0 - edge_attention)
+        # Mục đích để khi dùng torch.argsort, các cạnh cùng nhóm đứng cạnh nhau, 
+        # và trong cùng nhóm, cạnh có attention CAO NHẤT sẽ đứng ĐẦU TIÊN.
+        sort_key = index.to(torch.float64) * 1e7 + (1.0 - edge_attention).to(torch.float64)
+        perm = torch.argsort(sort_key)
+        
+        # Sắp xếp lại đặc trưng x và index theo thứ tự IOWA
+        sorted_x = x[perm]
+        sorted_index = index[perm]
+        
+        # Tính toán "Thứ hạng" (Rank) của từng cạnh trong nhóm của nó
+        # Ví dụ cạnh đầu tiên của nhóm có rank 0, cạnh tiếp theo rank 1...
+        ones = torch.ones_like(sorted_index)
+        # Tạo mảng cộng dồn vị trí
+        rank_in_group = torch.cumsum(ones, dim=0) - 1
+        # Trừ đi vị trí bắt đầu của nhóm đó để đưa rank về bắt đầu từ 0
+        group_start_idx = scatter(ones, sorted_index, dim=0, reduce='cumsum') - ones
+        rank_in_group = rank_in_group - group_start_idx[sorted_index]
+        
+        # Giới hạn rank trong phạm vi max_edges_per_group để tránh lỗi chỉ mục
+        rank_in_group = torch.clamp(rank_in_group, max=self.max_edges_per_group - 1)
+        
+        # Lấy trọng số OWA tương ứng với thứ hạng của cạnh đó
+        rank_weights = torch.softmax(self.owa_weights, dim=0)[rank_in_group] # Kích thước: [num_edges, 1]
+        
+        # Nhân đặc trưng đã sắp xếp với cả: Điểm tin cậy (Cảm sinh) VÀ Trọng số vị trí (OWA)
+        # Đây chính là công thức hoàn chỉnh của IOWA
+        filtered_x = sorted_x * edge_attention[perm].unsqueeze(-1) * rank_weights
+
+        # === BƯỚC 3: GỘP BẰNG PNA ===
+        pna_raw = self.pna_core(filtered_x, sorted_index) 
+        pna_feats = self.pna_project(pna_raw) 
+        
+        output = self.post_transition(pna_feats) + pna_feats
+        return output
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaPrecisionRecallAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4, residual_beta=0.2):
+        """
+        Args:
+            n_hidden (int): Kích thước không gian ẩn.
+            deg (Tensor): Ma trận bậc của đồ thị (phục vụ lõi PNA).
+            dropout_p (float): Tỷ lệ dropout.
+            residual_beta (float): Tỷ lệ giữ lại đặc trưng thô để cứu RECALL (nên trong khoảng 0.1 - 0.3).
+        """
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.residual_beta = residual_beta
+        
+        # 1. Nhánh tính toán bộ lọc Gumbel từ đặc trưng động (ExSTraQt)
+        self.exstraqt_ln = nn.LayerNorm(6)
+        # Đầu ra 2 chiều: Chiều 0 là Lọc bỏ (Drop), Chiều 1 là Giữ lại (Keep)
+        self.edge_gate_project = nn.Sequential(
+            nn.Linear(6, 2)
+        )
+        
+        # 2. Lõi PNA Tĩnh thuần túy
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.edge_gate_project[0].weight, nonlinearity='linear')
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.exstraqt_ln.reset_parameters()
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None, tau_gumbel=0.5):
+        num_edges = x.size(0)
+        
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+            
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === BƯỚC 1: TRÍCH XUẤT ĐẶC TRƯNG ĐỘNG (Giữ nguyên gốc 100%) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0) 
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # === BƯỚC 2: BỘ LỌC GUMBEL-SOFTMAX (TỐI ƯU PRECISION) ===
+        group_logits = self.edge_gate_project(self.exstraqt_ln(exstraqt_raw)) 
+        edge_logits = group_logits[index] 
+        
+        # Sinh mặt nạ nhị phân cứng ở Forward pass, giữ gradient ở Backward pass
+        gate_sampled = F.gumbel_softmax(edge_logits, tau=tau_gumbel, hard=True, dim=-1)
+        precision_gate = gate_sampled[:, 1].unsqueeze(-1) # [num_edges, 1]
+        
+        # Cạnh nào được giữ sẽ giữ nguyên, cạnh nào bị loại sẽ đưa đặc trưng về 0
+        filtered_x = x * precision_gate
+
+        # === BƯỚC 3: PHÉP TRỘN ĐẶC TRƯNG CỨU RECALL VÀ GỘP PNA ===
+        # Thay vì chỉ gộp filtered_x (gây mất recall), ta cộng thêm một phần x thô ban đầu.
+        # Điều này đảm bảo các tín hiệu ẩn của kẻ gian lận tinh vi không bị xóa hoàn toàn.
+        mixed_x = filtered_x + self.residual_beta * x
+
+        pna_raw = self.pna_core(mixed_x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+        
+        output = self.post_transition(pna_feats) + pna_feats
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaPrecisionRecallAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4, residual_beta=0.2):
+        """
+        Args:
+            n_hidden (int): Kích thước không gian ẩn.
+            deg (Tensor): Ma trận bậc của đồ thị (phục vụ lõi PNA).
+            dropout_p (float): Tỷ lệ dropout.
+            residual_beta (float): Tỷ lệ giữ lại đặc trưng thô để cứu RECALL (nên trong khoảng 0.1 - 0.3).
+        """
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.residual_beta = residual_beta
+        
+        # 1. Nhánh tính toán bộ lọc Gumbel từ đặc trưng động (ExSTraQt)
+        self.exstraqt_ln = nn.LayerNorm(6)
+        # Đầu ra 2 chiều: Chiều 0 là Lọc bỏ (Drop), Chiều 1 là Giữ lại (Keep)
+        self.edge_gate_project = nn.Sequential(
+            nn.Linear(6, 2)
+        )
+        
+        # 2. Lõi PNA Tĩnh thuần túy
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        
+        pna_out_features = len(scalers) * len(aggregators) * n_hidden
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(p=dropout_p)
+        )
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        nn.init.kaiming_normal_(self.edge_gate_project[0].weight, nonlinearity='linear')
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.exstraqt_ln.reset_parameters()
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None, tau_gumbel=0.5):
+        num_edges = x.size(0)
+        
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+            
+        device = x.device
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=device)
+
+        # === BƯỚC 1: TRÍCH XUẤT ĐẶC TRƯNG ĐỘNG (Giữ nguyên gốc 100%) ===
+        edge_counts = torch.bincount(index, minlength=num_groups).to(torch.float32)
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / (edge_counts[index] + 1e-5)
+
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        skew_num = scatter((log_amounts - mean_log_amount[index]) ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)
+        skew_den = (scatter((log_amounts - mean_log_amount[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / (edge_counts + 1e-5)) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0) 
+
+        avg_inter_arrival = torch.log1p(duration_safe / (edge_counts + 1e-5))
+
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        
+        # === BƯỚC 2: BỘ LỌC GUMBEL-SOFTMAX (TỐI ƯU PRECISION) ===
+        group_logits = self.edge_gate_project(self.exstraqt_ln(exstraqt_raw)) 
+        edge_logits = group_logits[index] 
+        
+        # Sinh mặt nạ nhị phân cứng ở Forward pass, giữ gradient ở Backward pass
+        gate_sampled = F.gumbel_softmax(edge_logits, tau=tau_gumbel, hard=True, dim=-1)
+        precision_gate = gate_sampled[:, 1].unsqueeze(-1) # [num_edges, 1]
+        
+        # Cạnh nào được giữ sẽ giữ nguyên, cạnh nào bị loại sẽ đưa đặc trưng về 0
+        filtered_x = x * precision_gate
+
+        # === BƯỚC 3: PHÉP TRỘN ĐẶC TRƯNG CỨU RECALL VÀ GỘP PNA ===
+        # Thay vì chỉ gộp filtered_x (gây mất recall), ta cộng thêm một phần x thô ban đầu.
+        # Điều này đảm bảo các tín hiệu ẩn của kẻ gian lận tinh vi không bị xóa hoàn toàn.
+        mixed_x = filtered_x + self.residual_beta * x
+
+        pna_raw = self.pna_core(mixed_x, index) 
+        pna_feats = self.pna_project(pna_raw) 
+        
+        output = self.post_transition(pna_feats) + pna_feats
+        
+        return outputimport torch
+import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
     def __init__(self, n_hidden, deg, dropout_p=0.4):
         super().__init__()
         self.n_hidden = n_hidden
