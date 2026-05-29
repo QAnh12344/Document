@@ -2,6 +2,648 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
+import time
+import logging
+from torch_scatter import scatter
+from torch_geometric.utils import degree, to_dense_batch
+from torch_geometric.nn import GINEConv, BatchNorm, Linear, PNAConv, to_hetero
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_geometric.data import HeteroData
+
+# Giả lập các dependencies bên ngoài để code chạy độc lập
+class Identity(nn.Module):
+    def __init__(self, *args, **kwargs): super().__init__()
+    def forward(self, input): return input
+    def reset_parameters(self): pass
+
+GenAgg = lambda f, jit: Identity()
+MLPAutoencoder = None
+
+# =====================================================================
+# 1. PHÂN HỆ MỚI: SUBGRAPH-AWARE SPECTRAL GRAPH NEURAL CALIBRATOR (SSGNC)
+# =====================================================================
+class SSGNCLayer(nn.Module):
+    """
+    Khối lọc phổ SSGNC xử lý đa tầng bất đồng nhất tần số cấu trúc (Frequency Heterogeneity)
+    Tích hợp: Dynamic Routing định tuyến đồ thị con + Tích chập phổ đa thức Chebyshev.
+    """
+    def __init__(self, in_channels, out_channels, K=3, T=3, M=3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.K = K  # Số lượng latent subgraphs (prototypes)
+        self.T = T  # Số vòng lặp định tuyến động (Routing iterations)
+        self.M = M  # Bậc của đa thức Chebyshev (Polynomial order)
+        
+        # Các nguyên mẫu đồ thị con học được (Trainable Prototype Vectors)
+        self.prototypes = nn.Parameter(torch.randn(K, in_channels))
+        
+        # Tham số học phổ cho từng đồ thị con và từng bậc đa thức Chebyshev
+        self.cheb_coeffs = nn.Parameter(torch.randn(K, M + 1, in_channels, out_channels))
+        self.momentum_beta = 0.9
+
+    def forward(self, x, edge_index):
+        num_nodes, d_in = x.shape
+        device = x.device
+        
+        # --- MECHANISM 1: DYNAMIC ROUTING (ĐỊNH TUYẾN ĐỘNG) ---
+        # Tính toán xác suất định tuyến khởi tạo s_ik dựa trên khoảng cách cosine/dot-product
+        logits = torch.matmul(x, self.prototypes.t()) # [N, K]
+        s = F.softmax(logits, dim=-1)
+        
+        current_prototypes = self.prototypes.clone()
+        for t in range(self.T):
+            # Cập nhật tọa độ tâm cụm nguyên mẫu dựa trên trọng số s_ik
+            # c_k = sum_i(s_ik * h_i) / (sum_i(s_ik) + epsilon)
+            sum_s = torch.sum(s, dim=0, keepdim=True).t() # [K, 1]
+            c_t = torch.matmul(s.t(), x) / (sum_s + 1e-6) # [K, d_in]
+            
+            # Tính lại xác suất định tuyến mịn hơn
+            logits = torch.matmul(x, c_t.t())
+            s = F.softmax(logits, dim=-1)
+            
+            # Cập nhật động lượng cho Ma trận Prototype gốc theo công thức (13)
+            current_prototypes = self.momentum_beta * current_prototypes + (1 - self.momentum_beta) * c_t
+
+        # --- MECHANISM 2: CHEBYSHEV SPECTRAL GRAPH CONVOLUTION ---
+        # 1. Tính toán ma trận Laplacian chuẩn hóa đối xứng ẩn: L_tilde = I - D^{-1/2} A D^{-1/2}
+        row, col = edge_index
+        deg_inv_sqrt = degree(row, num_nodes=num_nodes, dtype=torch.float32).pow(-0.5)
+        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+        
+        # Chuẩn hóa trọng số cạnh
+        edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        
+        # Khởi tạo chuỗi đa thức Chebyshev tinh chỉnh trên không gian đồ thị phẳng
+        cheb_xt = []
+        # T_0(L) X = X
+        cheb_xt.append(x)
+        
+        # T_1(L) X = L_tilde * X = X - A_norm * X
+        # Phép nhân ma trận thưa A_norm * X bằng scatter
+        ax_1 = scatter(x[col] * edge_weight.unsqueeze(-1), row, dim=0, dim_size=num_nodes, reduce='sum')
+        tx_1 = x - ax_1
+        cheb_xt.append(tx_1)
+        
+        # Lặp đệ quy tính toán bậc m: T_m(L) X = 2 * L_tilde * T_{m-1}(L) X - T_{m-2}(L) X
+        for m in range(2, self.M + 1):
+            tx_prev = cheb_xt[-1]
+            ax_m = scatter(tx_prev[col] * edge_weight.unsqueeze(-1), row, dim=0, dim_size=num_nodes, reduce='sum')
+            lx_prev = tx_prev - ax_m # L_tilde * T_{m-1}
+            tx_m = 2.0 * lx_prev - cheb_xt[-2]
+            cheb_xt.append(tx_m)
+            
+        # Stack chuỗi đa thức lại thành cấu trúc Tensor: [M+1, N, d_in]
+        cheb_stack = torch.stack(cheb_xt, dim=0) 
+        
+        # --- MECHANISM 3: SUBGRAPH-AWARE SPECTRAL FILTERING ---
+        # Áp dụng bộ lọc riêng biệt cho từng subgraph k cụ thể
+        z_subgraphs = []
+        for k in range(self.K):
+            # Tính toán tổng chập đa thức bậc M cho subgraph k theo công thức (17)
+            # Z_k = sum_{m=0}^M T_m(L) * X * Theta_{k,m}
+            z_k = torch.zeros(num_nodes, self.out_channels, device=device)
+            for m in range(self.M + 1):
+                z_k += torch.matmul(cheb_stack[m], self.cheb_coeffs[k, m])
+            z_subgraphs.append(z_k)
+            
+        # Kết hợp các đặc trưng đồ thị con qua trọng số định tuyến s_ik (Công thức 18)
+        # H^{l+1} = sigma( sum_k( diag(s_k) * Z_k ) )
+        h_out = torch.zeros(num_nodes, self.out_channels, device=device)
+        for k in range(self.K):
+            h_out += s[:, k].unsqueeze(-1) * z_subgraphs[k]
+            
+        return h_out, s
+
+class SSGNCCalibrator(nn.Module):
+    """ Mô hình SSGNC đa tầng kiến trúc kết hợp phân mảnh đặc trưng """
+    def __init__(self, in_channels, hidden_channels, num_layers=2):
+        super().__init__()
+        self.num_layers = num_layers
+        self.in_mlp = nn.Sequential(nn.Linear(in_channels, hidden_channels), nn.ReLU())
+        
+        self.convs = nn.ModuleList([
+            SSGNCLayer(hidden_channels, hidden_channels, K=3, T=3, M=3) for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(p=0.1)
+        self.out_mlp = nn.Linear(hidden_channels * num_layers, hidden_channels)
+
+    def forward(self, x, edge_index):
+        h = self.in_mlp(x)
+        layer_outputs = []
+        for i in range(self.num_layers):
+            h, _ = self.convs[i](h, edge_index)
+            h = self.dropout(F.relu(h))
+            layer_outputs.append(h)
+        # Concat phân tầng hệ thống phân cấp mạng sâu (Hierarchical Concatenation)
+        return self.out_mlp(torch.cat(layer_outputs, dim=-1))
+
+
+# =====================================================================
+# CÁC LỚP SẴN CÓ CỦA BẠN (GIỮ NGUYÊN HOÀN TOÀN CẤU TRÚC LOGIC)
+# =====================================================================
+class DiscreteEncoder(nn.Module):
+    def __init__(self, hidden_channels, max_num_features=10, max_num_values=500):
+        super().__init__()
+        self.embeddings = nn.ModuleList([nn.Embedding(max_num_values, hidden_channels) for i in range(max_num_features)])
+    def forward(self, x):
+        if x.dim() == 1: x = x.unsqueeze(1)
+        out = 0
+        for i in range(x.size(1)): out = out + self.embeddings[i](x[:, i])
+        return out
+    
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+    
+class TransformerAgg(nn.Module):
+    def __init__(self, d_model = 66):
+        super().__init__()
+        self.pos_enc = PositionalEncoding(d_model=d_model, dropout=0.05, max_len=128)
+        self.trans_enc = nn.TransformerEncoderLayer(d_model=d_model, nhead=2, dim_feedforward=d_model*4, dropout=0.0, batch_first=True)
+    def forward(self, x, index, timestamps_):
+        x = torch.cat([timestamps_.view(-1, 1), x], dim=1)
+        sort_ids = torch.argsort(index)
+        dense_edge_feats, mask = to_dense_batch(x[sort_ids, :], index[sort_ids])
+        sorted_dense_edge_feats, sorted_mask = self.sort_wrt_time(dense_edge_feats, mask)
+        sorted_dense_edge_feats = self.pos_enc(sorted_dense_edge_feats.permute(1,0,2)).permute(1,0,2)
+        sorted_dense_edge_feats = self.trans_enc(sorted_dense_edge_feats, src_key_padding_mask = ~sorted_mask)
+        sorted_dense_edge_feats[~sorted_mask.unsqueeze(-1).expand(-1, -1, sorted_dense_edge_feats.shape[-1])] = 0
+        return sorted_dense_edge_feats.mean(dim=1).squeeze()
+    def sort_wrt_time(self, matt, mask):
+        first_feature = matt[:, :, 0] 
+        sort_indices = torch.argsort(first_feature, dim=1)
+        sorted_matt = torch.gather(matt, 1, sort_indices.unsqueeze(-1).expand(-1, -1, matt.shape[-1]))
+        sorted_mask = torch.gather(mask, 1, sort_indices)
+        return sorted_matt[:, :, 1:], sorted_mask
+
+class GRUAgg(nn.Module):
+    def __init__(self, d_model = 66):
+        super().__init__()
+        self.gru = nn.GRU(d_model, hidden_size=d_model, num_layers=2, batch_first=True)
+    def forward(self, x, index, timestamps_):
+        x = torch.cat([timestamps_.view(-1, 1), x], dim=1)
+        sort_ids = torch.argsort(index)
+        dense_edge_feats, mask = to_dense_batch(x[sort_ids, :], index[sort_ids])
+        sorted_dense_edge_feats, sorted_mask = self.sort_wrt_time(dense_edge_feats, mask)
+        sorted_dense_edge_feats = self.gru(sorted_dense_edge_feats)[0]
+        return sorted_dense_edge_feats.mean(dim=1).squeeze()
+    def sort_wrt_time(self, matt, mask):
+        first_feature = matt[:, :, 0] 
+        sort_indices = torch.argsort(first_feature, dim=1)
+        sorted_matt = torch.gather(matt, 1, sort_indices.unsqueeze(-1).expand(-1, -1, matt.shape[-1]))
+        sorted_mask = torch.gather(mask, 1, sort_indices)
+        return sorted_matt[:, :, 1:], sorted_mask
+
+class PnaAgg(nn.Module):
+    def __init__(self , n_hidden, deg):
+        super().__init__()
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        self.agg = DegreeScalerAggregation(aggregators, scalers, deg)
+        self.lin = nn.Linear(len(scalers)*len(aggregators)*n_hidden, n_hidden)
+    def forward(self, x, index):
+        return self.lin(self.agg(x, index))
+
+class IdentityAgg(nn.Module):
+    def forward(self, x, index): return x
+
+class GinAgg(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.nn = nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.ReLU(), nn.Linear(n_hidden, n_hidden))
+    def forward(self, x, index):
+        return self.nn(scatter(x, index, dim=0, reduce='sum'))
+
+class MLP(nn.Module):
+    def __init__(self, nin, nout, nlayer=2, with_final_activation=True, with_norm=True, bias=True, activation_fn="relu", LN='False'):
+        super().__init__()
+        n_hid = nout
+        self.layers = nn.ModuleList([nn.Linear(nin if i==0 else n_hid, n_hid if i<nlayer-1 else nout, bias=bias) for i in range(nlayer)])
+        self.norms = nn.ModuleList([nn.BatchNorm1d(n_hid if i<nlayer-1 else nout) if not LN else nn.LayerNorm(n_hid) if with_norm else Identity() for i in range(nlayer)])
+        self.nlayer = nlayer
+        self.with_final_activation = with_final_activation
+        self.act = getattr(F, activation_fn)
+    def forward(self, x):
+        for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
+            x = layer(x)
+            if i < self.nlayer-1 or self.with_final_activation:
+                if x.size(0) > 1:  # Phòng chống lỗi BatchNorm1D khi số node/cạnh bằng 1
+                    x = norm(x)
+                x = self.act(x)  
+        return x
+    
+class AdammAgg(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.edge_transform = MLP(n_hidden, n_hidden, nlayer=1, with_final_activation=False)
+    def forward(self, x, index):
+        return self.edge_transform(scatter(x, index, dim=0, reduce='sum'))
+
+class SumAgg(nn.Module):
+    def forward(self, x, index): return scatter(x, index, dim=0, reduce='sum')
+
+class MultiEdgeAggModule(nn.Module):
+    def __init__(self, n_hidden=None, agg_type=None, index=None):
+        super().__init__()
+        self.agg_type = agg_type
+        if agg_type == 'genagg': self.agg = GenAgg(f=MLPAutoencoder, jit=False)
+        elif agg_type == 'gin': self.agg = GinAgg(n_hidden=n_hidden)
+        elif agg_type == 'pna':
+            uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+            d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+            deg = torch.bincount(d, minlength=1)
+            self.agg = PnaAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'sum': self.agg = SumAgg()
+        elif agg_type == 'transformer': self.agg = TransformerAgg(d_model=n_hidden)
+        elif agg_type == 'gru': self.agg = GRUAgg(d_model=n_hidden)
+        elif agg_type == 'adamm': self.agg = AdammAgg(n_hidden)
+        else: self.agg = IdentityAgg()
+        
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times):
+        _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
+        new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
+        if (self.agg_type == 'transformer') or (self.agg_type == 'gru'):
+            new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times)
+        else:
+            new_edge_attr = self.agg(x=edge_attr, index=inverse_indices)
+        return new_edge_index, new_edge_attr, inverse_indices
+
+class LinkPredHead(torch.nn.Module):
+    def __init__(self, n_hidden, n_classes, final_dropout) -> None:
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.mlp = nn.Sequential(Linear(self.n_hidden*3, self.n_hidden), nn.ReLU(), nn.Dropout(final_dropout), Linear(self.n_hidden, 25), nn.ReLU(), Linear(25, n_classes))
+    def forward(self, x, pos_edge_index, pos_edge_attr, neg_edge_index, neg_edge_attr):
+        x_pos = x[pos_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x_neg = x[neg_edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x_pos = torch.cat((x_pos, pos_edge_attr.view(-1, pos_edge_attr.shape[1])), 1)
+        x_neg = torch.cat((x_neg, neg_edge_attr.view(-1, neg_edge_attr.shape[1])), 1)
+        return (torch.sigmoid(self.mlp(x_pos)), torch.sigmoid(self.mlp(x_neg)))
+
+class GnnHelper(torch.nn.Module):
+    def __init__(self, num_gnn_layers, n_hidden=100, edge_updates=False, final_dropout=0.5, index_ = None, deg = None, args=None):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.num_gnn_layers = num_gnn_layers
+        self.edge_updates = edge_updates
+        self.flatten_edges = args.flatten_edges
+        self.edge_agg_type = args.edge_agg_type
+        self.node_agg = 'sum' if args.node_agg_type == 'sum' else GenAgg(f=MLPAutoencoder, jit=False)
+     
+        self.edge_aggrs, self.convs, self.emlps, self.batch_norms = nn.ModuleList(), nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
+        for _ in range(self.num_gnn_layers):
+            if args.model == 'gin':
+                conv = GINEConv(nn.Sequential(nn.Linear(self.n_hidden, self.n_hidden), nn.ReLU(), nn.Linear(self.n_hidden, self.n_hidden)), edge_dim=self.n_hidden, aggr=self.node_agg)
+            elif args.model == 'pna':
+                conv = PNAConv(in_channels=n_hidden, out_channels=n_hidden, aggregators=['mean', 'min', 'max', 'std'], scalers=['identity', 'amplification', 'attenuation'], deg=deg, edge_dim=n_hidden, towers=5, pre_layers=1, post_layers=1, divide_input=False)
+                
+            if self.edge_updates: self.emlps.append(nn.Sequential(nn.Linear(3 * self.n_hidden, self.n_hidden), nn.ReLU(), nn.Linear(self.n_hidden, self.n_hidden)))
+            if self.flatten_edges: self.edge_aggrs.append(MultiEdgeAggModule(n_hidden, agg_type=args.edge_agg_type, index=index_))
+            self.convs.append(conv)
+            self.batch_norms.append(BatchNorm(n_hidden))
+        if self.edge_agg_type == 'adamm':
+            self.edge_aggrs = None
+            self.edge_agg = MultiEdgeAggModule(n_hidden, agg_type=args.edge_agg_type, index=index_)
+
+    def forward(self, x, edge_index, edge_attr, simp_edge_batch=None):
+        times = None
+        if self.edge_agg_type == 'adamm':
+            edge_index, edge_attr, _ = self.edge_agg(edge_index, edge_attr, simp_edge_batch, times)
+            src, dst = edge_index
+            for i in range(self.num_gnn_layers):
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates: edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2   
+        else:
+            src, dst = edge_index
+            for i in range(self.num_gnn_layers):
+                if self.flatten_edges:
+                    n_edge_index, n_edge_attr, inverse_indices = self.edge_aggrs[i](edge_index, edge_attr, simp_edge_batch, times)
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
+                    if self.edge_updates: 
+                        remapped_edge_attr = torch.index_select(n_edge_attr, 0, inverse_indices)
+                        edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], remapped_edge_attr, edge_attr], dim=-1)) / 2
+                else:
+                    x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                    if self.edge_updates: edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
+        return x, edge_attr
+
+
+class MultiMPNN(torch.nn.Module):
+    def __init__(self, num_features, num_gnn_layers, n_classes=2, n_hidden=100, 
+                 edge_updates=False, edge_dim=None, final_dropout=0.5, 
+                 index_ = None, deg=None, args=None):
+        super().__init__()
+        self.args = args
+        self.n_hidden = n_hidden
+        self.final_dropout = final_dropout
+        
+        # Nhúng SSGNC Calibrator vào đầu Pipeline xử lý đặc trưng nút gốc
+        self.ssgnc_calibrator = SSGNCCalibrator(in_channels=num_features, hidden_channels=n_hidden)
+        
+        self.node_emb = nn.Linear(n_hidden, n_hidden) # Chuyển từ không gian nhúng của SSGNC
+        self.edge_emb = nn.Linear(edge_dim, n_hidden)
+
+        if args.reverse_mp or args.reverse_mp_lp:
+            self.edge_emb_rev = nn.Linear(edge_dim, n_hidden)
+        if args.edge_agg_type =='adamm':
+            self.edge_direction_encoder = DiscreteEncoder(n_hidden, max_num_values=4)
+    
+        self.gnn = GnnHelper(num_gnn_layers=num_gnn_layers, n_hidden=n_hidden, edge_updates=edge_updates, final_dropout=final_dropout,
+                             index_=index_, deg=deg, args=args)
+        
+        if args.reverse_mp or args.reverse_mp_lp:
+            self.gnn  = to_hetero(self.gnn, metadata= (['node'], [('node', 'to', 'node'), ('node', 'rev_to', 'node')]), aggr='mean')
+
+        if args.task == 'edge_class':
+            self.mlp = nn.Sequential(Linear(n_hidden*3, 50), nn.ReLU(), nn.Dropout(self.final_dropout),Linear(50, 25), nn.ReLU(), nn.Dropout(self.final_dropout), Linear(25, n_classes))
+        elif args.task == 'node_class':
+            self.mlp = nn.Sequential(Linear(n_hidden, 50), nn.ReLU(), nn.Dropout(self.final_dropout),Linear(50, 25), nn.ReLU(), nn.Dropout(self.final_dropout), Linear(25, n_classes))
+        elif args.task == 'lp':
+            if args.ports_batch: self.edge_emb_new = nn.Linear(edge_dim-2, n_hidden)
+            self.edge_readout = LinkPredHead(n_hidden=n_hidden, n_classes=1, final_dropout=final_dropout)
+    
+    def forward(self, data):
+        if isinstance(data, HeteroData):
+            # 1. Trích xuất cấu trúc phẳng đồng thể tạm thời để đẩy qua màng lọc phổ SSGNC
+            flat_edge_index = data['node', 'to', 'node'].edge_index
+            calibrated_x = self.ssgnc_calibrator(data['node'].x, flat_edge_index)
+            
+            # 2. Đưa sang pipeline kiến trúc mạng Hetero định tuyến xuôi ngược của bạn
+            x_dict = {"node": self.node_emb(calibrated_x)}
+            edge_attr_dict = {
+                    ("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr), 
+                    ("node", 'rev_to', 'node'): self.edge_emb_rev(data['node', 'rev_to', 'node'].edge_attr),    
+                }
+            simp_edge_batch_dict = data.simp_edge_batch_dict if self.args.flatten_edges else None
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict)
+            x = x_dict['node']
+            edge_attr = edge_attr_dict['node', 'to', 'node']
+
+            if self.args.task == 'edge_class':
+                x = x[data['node', 'to', 'node'].edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+                out = self.mlp(x)
+            elif self.args.task == 'node_class':
+                out = self.mlp(x)
+        else:
+            calibrated_x = self.ssgnc_calibrator(data.x, data.edge_index)
+            x = self.node_emb(calibrated_x)
+            edge_attr = self.edge_emb(data.edge_attr) 
+            simp_edge_batch = data.simp_edge_batch if self.args.flatten_edges else None
+            if self.args.edge_agg_type =='adamm': edge_attr = edge_attr + self.edge_direction_encoder(data.edge_direction)
+            x, edge_attr = self.gnn(x, data.edge_index, edge_attr, simp_edge_batch)
+
+            if self.args.task == 'edge_class':
+                x = x[data.edge_index.T].reshape(-1, 2*self.n_hidden).relu()
+                x = torch.cat((x, edge_attr.view(-1, edge_attr.shape[1])), 1)
+                out = self.mlp(x)
+            elif self.args.task == 'node_class':
+                out = self.mlp(x)
+        return out
+
+
+# =====================================================================
+# PHẦN TOÁN HỌC DTCRC THEO CÔNG THỨC (8) VÀ (9) CỦA PHƯƠNG PHÁP LUẬN
+# =====================================================================
+def find_crc_threshold(risks, alpha, n_samples):
+    """ Tìm kiếm nhị phân chính xác theo công thức biên toán học: alpha - (1 - alpha) / n """
+    low, high = 0.0, 1.0
+    best_lambda = high
+    bound = alpha - (1.0 - alpha) / max(1, n_samples)
+    if bound <= 0: return 0.5 # Ngưỡng an toàn phòng thủ nếu số mẫu calib quá bé
+    
+    for _ in range(30): 
+        mid = (low + high) / 2.0
+        # Tính toán hàm chỉ thị lỗi thực nghiệm empirical risk
+        if np.mean(risks > mid) <= bound:
+            best_lambda = mid
+            high = mid 
+        else:
+            low = mid 
+    return best_lambda
+
+
+# =====================================================================
+# PIPELINE ĐIỀU KHIỂN ĐẦU CUỐI: TÍCH HỢP HÀM LOSS SET-SIZE DUAL-THRESHOLD
+# =====================================================================
+def run_dtcrc_pipeline_with_your_model(train_data, val_data, test_data, args, alpha=0.10):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    num_features = train_data['node'].x.size(1)
+    edge_dim = train_data['node', 'to', 'node'].edge_attr.size(1)
+    
+    deg = None
+    if args.model == 'pna':
+        row, col = train_data['node', 'to', 'node'].edge_index
+        deg = degree(row, num_nodes=train_data['node'].num_nodes, dtype=torch.long)
+        
+    model = MultiMPNN(
+        num_features=num_features, num_gnn_layers=2, n_classes=2, 
+        n_hidden=32, edge_dim=edge_dim, args=args, deg=deg
+    ).to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+    task_target = args.task
+    if task_target == 'node_class':
+        y_train = train_data['node'].y
+    else:
+        y_train = train_data['node', 'to', 'node'].y
+        
+    num_normal = (y_train == 0).sum().item()
+    num_anomaly = (y_train == 1).sum().item()
+    weights = torch.tensor([1.0, float(num_normal / (num_anomaly + 1e-6))], device=device)
+    
+    # Hàm mất mát phân loại cơ sở
+    ce_criterion = nn.CrossEntropyLoss(weight=weights)
+
+    train_data = train_data.to(device)
+    val_data = val_data.to(device)
+    test_data = test_data.to(device)
+
+    # Chia đôi độc lập tập Val: 50% GNN-Val (theo dõi Loss), 50% Calib (Tính toán Ngưỡng toán học)
+    total_val_elements = val_data['node'].num_nodes if task_target == 'node_class' else val_data['node', 'to', 'node'].edge_index.size(1)
+    y_val_all = val_data['node'].y.cpu().numpy() if task_target == 'node_class' else val_data['node', 'to', 'node'].y.cpu().numpy()
+    
+    val_indices = np.arange(total_val_elements)
+    np.random.seed(42)
+    np.random.shuffle(val_indices)
+    
+    split_pt = int(0.5 * total_val_elements)
+    gnn_val_idx = val_indices[:split_pt]
+    calib_idx = val_indices[split_pt:]
+
+    print("=== Phân tích cấu trúc Tập Dữ Liệu Cấu Hình ===")
+    print(f"Tổng mẫu tập Val: {total_val_elements} -> Quá trình GNN-Val: {len(gnn_val_idx)} | Tập Toán Học Calib: {len(calib_idx)}\n")
+
+    # --- GIAI ĐOẠN 1: HUẤN LUYỆN MÔ HÌNH VỚI LOSS KẾT HỢP (CE + SET-SIZE) ---
+    best_val_loss = float('inf')
+    best_model_state = None
+    beta_loss = 0.8  # Trọng số hàm loss tích hợp giữa CE mục tiêu và Set-size
+    
+    print("=== GIAI ĐOẠN 1: KHỞI ĐỘNG TỐI ƯU HÓA TRỌNG SỐ MẠNG (SSGNC + BACKBONE) ===")
+    for epoch in range(1, 41):
+        model.train()
+        optimizer.zero_grad()
+        
+        logits_train = model(train_data)
+        loss_ce = ce_criterion(logits_train, y_train)
+        
+        # Tính toán hình phạt kích thước tập dự đoán Set-Size Loss kích thích Singleton
+        probs_train = F.softmax(logits_train, dim=-1)
+        loss_set_size = torch.mean(torch.sum(probs_train * (1.0 - probs_train), dim=-1))
+        
+        # Tổng hợp hàm loss kết hợp như đặc tả phương pháp luận
+        total_loss = beta_loss * loss_ce + (1.0 - beta_loss) * loss_set_size
+        
+        total_loss.backward()
+        optimizer.step()
+        
+        # Đánh giá kiểm soát hội tụ trên phân vùng GNN-Val
+        model.eval()
+        with torch.no_grad():
+            logits_val = model(val_data)
+            if task_target == 'node_class':
+                val_loss = ce_criterion(logits_val[gnn_val_idx], val_data['node'].y[gnn_val_idx])
+            else:
+                val_loss = ce_criterion(logits_val[gnn_val_idx], val_data['node', 'to', 'node'].y[gnn_val_idx])
+                
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict().copy()
+                
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch:02d} | Kết Hợp Loss: {total_loss.item():.4f} | Cục Bộ CE: {loss_ce.item():.4f} | Phần Tách Val Loss: {val_loss.item():.4f}")
+
+    model.load_state_dict(best_model_state)
+
+    # --- GIAI ĐOẠN 2: TÌM NGƯỠNG ĐỒNG THỜI DUAL-THRESHOLD CRC TRÊN TẬP CALIB ---
+    model.eval()
+    with torch.no_grad():
+        logits_val = model(val_data)
+        probs_val = F.softmax(logits_val, dim=-1)[:, 1].cpu().numpy()
+
+    normal_calib_idx = [i for i in calib_idx if y_val_all[i] == 0]
+    ano_calib_idx = [i for i in calib_idx if y_val_all[i] == 1]
+    
+    # Tìm kiếm nhị phân kiểm soát rủi ro FPR và FNR toán học chính xác theo Công thức (8) và (9)
+    lambda_normal = find_crc_threshold(probs_val[normal_calib_idx], alpha, len(normal_calib_idx))
+    lambda_ano = find_crc_threshold(1.0 - probs_val[ano_calib_idx], alpha, len(ano_calib_idx))
+
+    print(f"\n=== NGƯỠNG TOÁN HỌC CONFORMAL THU ĐƯỢC ===")
+    print(f"lambda_normal (FPR bound threshold): {lambda_normal:.4f}")
+    print(f"lambda_ano    (FNR bound threshold): {lambda_ano:.4f}")
+
+    # --- GIAI ĐOẠN 3: ĐÁNH GIÁ CHẤT LƯỢNG SET-PREDICTION TRÊN ĐỒ THỊ TEST ĐỘC LẬP ---
+    with torch.no_grad():
+        logits_test = model(test_data)
+        probs_test = F.softmax(logits_test, dim=-1)[:, 1].cpu().numpy()
+        
+    y_test = test_data['node'].y.cpu().numpy() if task_target == 'node_class' else test_data['node', 'to', 'node'].y.cpu().numpy()
+        
+    fpr_errors, fnr_errors = 0, 0
+    total_normal, total_ano = 0, 0
+    singletons = 0
+    
+    # Tiến hành phép giao Logic đồng thời (Intersection of Conformal Prediction Sets)
+    for p, y_true in zip(probs_test, y_test):
+        set_normal = {1} if p >= lambda_normal else {0, 1}
+        set_ano = {0} if p < (1.0 - lambda_ano) else {0, 1}
+        
+        # C_test = C_normal intersect C_ano
+        p_set = set_normal.intersection(set_ano)
+        if len(p_set) == 0: p_set = {0, 1} # Cơ chế Phòng vệ Fallback bảo toàn xác suất bound
+        
+        if len(p_set) == 1: singletons += 1
+        
+        if y_true == 0:
+            total_normal += 1
+            if 0 not in p_set: fpr_errors += 1
+        else:
+            total_ano += 1
+            if 1 not in p_set: fnr_errors += 1
+
+    print(f"\n================ HIỆU SUẤT TRÊN ĐỒ THỊ TEST ĐỘC LẬP ================")
+    print(f"Hạn mức rủi ro kiểm soát thiết lập mục tiêu (Alpha): {alpha * 100}%")
+    print(f"Tỷ lệ Dương tính giả thực tế trên đồ thị (FPR)     : {(fpr_errors/max(1, total_normal))*100:.2f}% (Cam kết toán học: <= {alpha*100}%)")
+    print(f"Tỷ lệ Âm tính giả thực tế trên đồ thị (FNR)      : {(fnr_errors/max(1, total_ano))*100:.2f}% (Cam kết toán học: <= {alpha*100}%)")
+    print(f"Tỷ lệ quyết định đơn nhãn tối ưu (Singleton Size=1) : {(singletons/len(y_test))*100:.2f}%")
+
+
+# =====================================================================
+# KHỞI TẠO LUỒNG CHẠY KIỂM THỬ KHÉP KÍN
+# =====================================================================
+if __name__ == "__main__":
+    class ArgsMock:
+        def __init__(self):
+            self.model = 'gin'
+            self.task = 'node_class'
+            self.node_agg_type = 'sum'
+            self.edge_agg_type = 'sum'
+            self.flatten_edges = False
+            self.edge_updates = False
+            self.reverse_mp = True
+            self.reverse_mp_lp = False
+            self.ports_batch = False
+
+    args = ArgsMock()
+
+    def generate_independent_hetero_graph(num_nodes, num_edges):
+        data = HeteroData()
+        data['node'].x = torch.randn(num_nodes, 16)
+        data['node'].y = torch.randint(0, 2, (num_nodes,))
+        
+        data['node', 'to', 'node'].edge_index = torch.randint(0, num_nodes, (2, num_edges))
+        data['node', 'to', 'node'].edge_attr = torch.randn(num_edges, 8)
+        data['node', 'to', 'node'].y = data['node'].y # Đồng bộ nhãn cho bài toán tương thích rộng
+        
+        data['node', 'rev_to', 'node'].edge_index = data['node', 'to', 'node'].edge_index.flipud()
+        data['node', 'rev_to', 'node'].edge_attr = torch.randn(num_edges, 8)
+        
+        data.edge_index_dict = {
+            ('node', 'to', 'node'): data['node', 'to', 'node'].edge_index,
+            ('node', 'rev_to', 'node'): data['node', 'rev_to', 'node'].edge_index
+        }
+        return data
+
+    print("--- Đang tạo tự động 3 tập đồ thị HeteroData độc lập ---")
+    train_graph = generate_independent_hetero_graph(num_nodes=200, num_edges=500)
+    val_graph   = generate_independent_hetero_graph(num_nodes=100, num_edges=250)
+    test_graph  = generate_independent_hetero_graph(num_nodes=100, num_edges=250)
+
+    # Kích hoạt chạy toàn bộ luồng pipeline từ đầu đến cuối
+    run_dtcrc_pipeline_with_your_model(train_graph, val_graph, test_graph, args, alpha=0.10)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import get_laplacian
 
