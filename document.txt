@@ -2,6 +2,299 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+# =====================================================================
+# 1. CẤU PHẦN SSGNC (Subgraph-aware Spectral Graph Neural Calibrator)
+# =====================================================================
+
+class SSGNC_Layer(nn.Module):
+    def __init__(self, in_channels, out_channels, K_subgraphs=3, M_chebyshev=2, T_routing=3):
+        super(SSGNC_Layer, self).__init__()
+        self.K = K_subgraphs
+        self.M = M_chebyshev
+        self.T = T_routing
+        self.out_channels = out_channels
+        
+        # Nguyên mẫu đồ thị con (Prototypes)
+        self.prototypes = nn.Parameter(torch.randn(self.K, in_channels))
+        # Tham số cho bộ lọc phổ Chebyshev: K đồ thị con, mỗi đồ thị có (M+1) ma trận trọng số
+        self.theta = nn.Parameter(torch.randn(self.K, self.M + 1, in_channels, out_channels))
+        self.beta_momentum = 0.9
+
+    def forward(self, x, laplacian_matrices):
+        # laplacian_matrices: Danh sách các ma trận cơ sở Chebyshev T_m(L_tilde) X -> Hình dáng: (M+1, N, d)
+        num_nodes = x.size(0)
+        
+        # --- a. Cơ chế Định tuyến Động (Dynamic Routing) ---
+        with torch.no_grad():
+            c = self.prototypes.clone()
+            for t in range(self.T):
+                # Tính xác suất định tuyến s_ik (Công thức 10 & 12)
+                scores = torch.matmul(x, c.t()) # (N, K)
+                s = F.softmax(scores, dim=-1)
+                
+                # Cập nhật nguyên mẫu c^(t) (Công thức 11)
+                if t < self.T - 1:
+                    c_next = torch.matmul(s.t(), x) / (s.sum(dim=0).unsqueeze(-1) + 1e-6)
+                    c = c_next
+            
+            # Cập nhật momentum cho prototypes gốc
+            self.prototypes.data = self.beta_momentum * self.prototypes.data + (1 - self.beta_momentum) * c
+
+        # Tính lại s cuối cùng để lan truyền đạo hàm (nếu cần)
+        scores = torch.matmul(x, self.prototypes.t())
+        s = F.softmax(scores, dim=-1) # (N, K)
+
+        # --- b. Tích chập phổ Chebyshev cho từng đồ thị con (Công thức 17) ---
+        # laplacian_matrices shape: (M+1, N, in_channels)
+        Z = torch.zeros(self.K, num_nodes, self.out_channels, device=x.device)
+        for k in range(self.K):
+            for m in range(self.M + 1):
+                # T_m(L_tilde) * X
+                cheb_m = laplacian_matrices[m] # (N, in_channels)
+                # T_m(L_tilde) * X * theta
+                Z[k] += torch.matmul(cheb_m, self.theta[k, m]) # (N, out_channels)
+
+        # --- c. Lọc phổ nhận biết đồ thị con (Công thức 18) ---
+        h_out = torch.zeros(num_nodes, self.out_channels, device=x.device)
+        for k in range(self.K):
+            # s[:, k] đóng vai trò ma trận đường chéo diag(s_:,k)
+            h_out += s[:, k].unsqueeze(-1) * Z[k]
+            
+        return F.relu(h_out)
+
+class Full_SSGNC_Model(nn.Module):
+    def __init__(self, gnn_logits_dim, hidden_dim, num_classes=2, L_layers=2):
+        super(Full_SSGNC_Model, self).__init__()
+        self.mlp_in = nn.Linear(gnn_logits_dim, hidden_dim)
+        
+        self.layers = nn.ModuleList([
+            SSGNC_Layer(hidden_dim, hidden_dim) for _ in range(L_layers)
+        ])
+        
+        self.dropout = nn.Dropout(p=0.5)
+        # Kết hợp phân cấp đặc trưng qua Concat (Công thức 21)
+        self.mlp_out = nn.Linear(hidden_dim * L_layers, num_classes)
+
+    def forward(self, x_logits, laplacian_matrices):
+        h = self.mlp_in(x_logits)
+        layer_outputs = []
+        
+        for layer in self.layers:
+            h = layer(h, laplacian_matrices)
+            h = self.dropout(h)
+            layer_outputs.append(h)
+            
+        h_concat = torch.cat(layer_outputs, dim=-1)
+        out_logits = self.mlp_out(h_concat)
+        return F.softmax(out_logits, dim=-1) # Trả ra xác suất mịn đã hiệu chuẩn
+
+# =====================================================================
+# 2. HÀM MẤT MÁT HỖN HỢP (Loss Function)
+# =====================================================================
+def compute_set_size_loss(calibrated_probs):
+    # Ước lượng kích thước tập dự đoán (tổng xác suất các nhãn)
+    # Ép mô hình tự tin để kích thước tập tiến về gần 1 (nhãn đơn)
+    return torch.mean(torch.sum(calibrated_probs, dim=-1))
+
+def compute_total_loss(calibrated_probs, targets, beta=0.8):
+    ce_loss = F.cross_entropy(torch.log(calibrated_probs + 1e-10), targets)
+    size_loss = compute_set_size_loss(calibrated_probs)
+    return beta * ce_loss + (1 - beta) * size_loss
+
+# =====================================================================
+# 3. THUẬT TOÁN TÌM KIẾM NHỊ PHÂN CHO DTCRC (Dual-Threshold CRC)
+# =====================================================================
+def binary_search_threshold_fpr(calib_probs, calib_labels, alpha, n_normal):
+    # Lọc các nút bình thường thật (y = 0)
+    normal_idx = (calib_labels == 0)
+    p_ano_normal_nodes = calib_probs[normal_idx, 1] # Xác suất đoán là bất thường (nhãn 1) của các nút bình thường
+    
+    low, high = 0.0, 1.0
+    best_lambda = 1.0
+    bound = alpha - (1.0 - alpha) / n_normal
+    
+    # Tìm kiếm nhị phân với độ chính xác cao
+    for _ in range(20):
+        mid = (low + high) / 2
+        # Tính toán rủi ro thực nghiệm FPR: Tỷ lệ nút bình thường bị đoán sai thành bất thường (p_ano >= mid)
+        fpr_risk = torch.mean((p_ano_normal_nodes >= mid).float()).item()
+        
+        if fpr_risk <= bound:
+            best_lambda = mid
+            high = mid # Cố gắng tìm ngưỡng nhỏ hơn để tập bao phủ rộng hơn
+        else:
+            low = mid
+            
+    return best_lambda
+
+def binary_search_threshold_fnr(calib_probs, calib_labels, alpha, n_ano):
+    # Lọc các nút bất thường thật (y = 1)
+    ano_idx = (calib_labels == 1)
+    p_ano_ano_nodes = calib_probs[ano_idx, 1] # Xác suất đoán là bất thường (nhãn 1) của các nút bất thường
+    
+    low, high = 0.0, 1.0
+    best_lambda = 1.0
+    bound = alpha - (1.0 - alpha) / n_ano
+    
+    for _ in range(20):
+        mid = (low + high) / 2
+        # Tính toán rủi ro thực nghiệm FNR: Tỷ lệ nút bất thường bị bỏ sót (p_ano < 1 - mid)
+        fnr_risk = torch.mean((p_ano_ano_nodes < (1.0 - mid)).float()).item()
+        
+        if fnr_risk <= bound:
+            best_lambda = mid
+            high = mid
+        else:
+            low = mid
+            
+    return best_lambda
+
+# =====================================================================
+# 4. HÀM GIAO TẬP HỢP VÀ ĐÁNH GIÁ (Inference & Evaluation)
+# =====================================================================
+def construct_prediction_sets(test_probs, lambda_norm, lambda_ano):
+    # test_probs: (N_test, 2)
+    p_ano = test_probs[:, 1]
+    pred_sets = []
+    
+    for p in p_ano:
+        # C_lambda_normal (Công thức 5)
+        c_norm = {1} if p >= lambda_norm else {0, 1}
+        # C_lambda_ano (Công thức 6)
+        c_ano = {0} if p < (1.0 - lambda_ano) else {0, 1}
+        
+        # Giao hai tập hợp (Intersection)
+        c_final = c_norm.intersection(c_ano)
+        pred_sets.append(c_final)
+        
+    return pred_sets
+
+def evaluate_conformal_metrics(pred_sets, true_labels):
+    correct_coverage = 0
+    total_size = 0
+    singleton_count = 0
+    false_positives = 0
+    false_negatives = 0
+    
+    n_test = len(true_labels)
+    n_norm = np.sum(true_labels == 0)
+    n_ano = np.sum(true_labels == 1)
+    
+    for i in range(n_test):
+        s = pred_sets[i]
+        y = true_labels[i]
+        
+        # 1. Coverage: Nhãn thật có nằm trong tập dự đoán không
+        if y in s:
+            correct_coverage += 1
+            
+        # 2. Size & Singleton
+        total_size += len(s)
+        if len(s) == 1:
+            singleton_count += 1
+            
+        # 3. Tính toán FPR thực tế trên tập Test
+        if y == 0 and (0 not in s):
+            false_positives += 1
+            
+        # 4. Tính toán FNR thực tế trên tập Test
+        if y == 1 and (1 not in s):
+            false_negatives += 1
+            
+    print(f"--- KẾT QUẢ ĐÁNH GIÁ CONFORMAL RISK CONTROL ---")
+    print(f"Độ phủ thực tế (Coverage): {correct_coverage / n_test:.3f}")
+    print(f"Kích thước tập trung bình (Inefficiency): {total_size / n_test:.3f}")
+    print(f"Tỷ lệ nhãn đơn tự tin (Single): {singleton_count / n_test:.3f}")
+    print(f"FPR thực tế trên tập Test: {false_positives / n_norm:.3f}")
+    print(f"FNR thực tế trên tập Test: {false_negatives / n_ano:.3f}")
+
+# =====================================================================
+# 5. ĐƯỜNG CHẠY CHÍNH (Main Execution Pipeline)
+# =====================================================================
+if __name__ == "__main__":
+    # GIẢ ĐỊNH DỮ LIỆU ĐẦU VÀO TỪ GIAI ĐOẠN 1 (Bạn thay bằng dữ liệu thật của bạn)
+    num_nodes = 1000
+    gnn_logits_feat = 2 # Đầu ra từ mô hình GNN nền
+    
+    # Giả lập ma trận Logits cố định trích xuất từ Best Checkpoint
+    fixed_gnn_logits = torch.randn(num_nodes, gnn_logits_feat)
+    labels = torch.randint(0, 2, (num_nodes,))
+    
+    # Chỉ mục phân chia dữ liệu (Tập val đóng vai trò tập hiệu chuẩn - Calibration)
+    train_idx = torch.arange(0, 600)
+    val_idx = torch.arange(600, 800)  # Sẽ dùng làm Calibration Set
+    test_idx = torch.arange(800, 1000)
+    
+    # Giả lập Ma trận đa thức Chebyshev T_m(L_tilde) X (Bậc M=2)
+    # Trong thực tế, bạn tính cái này từ ma trận kề A theo công thức (14, 15, 16)
+    hidden_dim = 16
+    laplacian_bases = [torch.randn(num_nodes, hidden_dim) for _ in range(3)] # M+1 = 3 bases
+
+    # --- BƯỚC 1: Khởi tạo và Huấn luyện mô hình SSGNC Calibrator ---
+    calibrator = Full_SSGNC_Model(gnn_logits_dim=gnn_logits_feat, hidden_dim=hidden_dim)
+    optimizer = torch.optim.Adam(calibrator.parameters(), lr=0.01)
+    
+    print("Bắt đầu huấn luyện bộ hiệu chuẩn SSGNC...")
+    calibrator.train()
+    for epoch in range(50): # Chạy demo 50 epochs
+        optimizer.zero_grad()
+        # Forward qua bộ hiệu chuẩn phổ đồ thị
+        calibrated_probs = calibrator(fixed_gnn_logits, laplacian_bases)
+        
+        # Tính loss hỗn hợp trên tập train
+        loss = compute_total_loss(calibrated_probs[train_idx], labels[train_idx], beta=0.8)
+        loss.backward()
+        optimizer.step()
+        
+    # --- BƯỚC 2: Trích xuất xác suất mịn và Tìm ngưỡng trên tập Hiệu chuẩn (Tập VAL) ---
+    calibrator.eval()
+    with torch.no_grad():
+        final_calibrated_probs = calibrator(fixed_gnn_logits, laplacian_bases)
+        
+    val_probs = final_calibrated_probs[val_idx]
+    val_labels = labels[val_idx]
+    
+    alpha = 0.1 # Chấp nhận rủi ro tối đa 10%
+    n_normal_val = torch.sum(val_labels == 0).item()
+    n_ano_val = torch.sum(val_labels == 1).item()
+    
+    # Chạy tìm kiếm nhị phân chốt 2 ngưỡng toán học
+    lambda_norm_hat = binary_search_threshold_fpr(val_probs, val_labels, alpha, n_normal_val)
+    lambda_ano_hat = binary_search_threshold_fnr(val_probs, val_labels, alpha, n_ano_val)
+    
+    print(f"\n-> Đã chốt ngưỡng toán học tối ưu từ tập hiệu chuẩn (Val):")
+    print(f"   Ngưỡng kiểm soát FPR (λ_normal): {lambda_norm_hat:.4f}")
+    print(f"   Ngưỡng kiểm soát FNR (λ_ano): {lambda_ano_hat:.4f}")
+
+    # --- BƯỚC 3: Áp dụng lên tập TEST và Đánh giá kết quả ---
+    test_probs = final_calibrated_probs[test_idx]
+    test_labels = labels[test_idx].numpy()
+    
+    # Tạo tập dự đoán đồng nhất qua phép giao
+    prediction_sets_test = construct_prediction_sets(test_probs, lambda_norm_hat, lambda_ano_hat)
+    
+    # In báo cáo các chỉ số toán học
+    evaluate_conformal_metrics(prediction_sets_test, test_labels)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import math
 import time
 import logging
