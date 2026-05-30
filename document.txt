@@ -2,6 +2,310 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from tqdm import tqdm
+
+# =====================================================================
+# 1. HÀM TRÍCH XUẤT LOGITS TỪ GNN BACKBONE (GIỮ NGUYÊN HOÀN TOÀN LOGIC CỦA BẠN)
+# =====================================================================
+def extract_real_logits_from_checkpoint_hetero(checkpoint_path, val_loader, test_loader, inds, model, device):
+    print(f"\n--- ĐANG TRÍCH XUẤT LOGITS TỪ CHECKPOINT: {checkpoint_path} ---")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.to(device)
+    model.eval()
+    
+    def collect_logits_from_loader(loader):
+        all_logits = []
+        for batch in tqdm(loader, desc="Extracting Logits"):
+            assign_ports_with_cpp(batch)
+            local_inds = inds.detach().cpu()
+            batch_edge_inds = local_inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+            batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+            
+            mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+            batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+            batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+            
+            with torch.no_grad():
+                batch.to(device)
+                out = model(batch)
+                logits_filtered = out[mask]
+                all_logits.append(logits_filtered.detach().cpu())
+                
+        return torch.cat(all_logits, dim=0)
+
+    logits_val = collect_logits_from_loader(val_loader)
+    logits_test = collect_logits_from_loader(test_loader)
+    return logits_val, logits_test
+
+# =====================================================================
+# 2. TOÁN TỬ CHEBYSHEV PHÂN RÃ THEO ĐỒ THỊ GỐC (Eq. 14, 15, 16)
+# =====================================================================
+def compute_chebyshev_bases_direct(edge_index_origin, x_features, num_nodes, M_chebyshev=2):
+    num_edges = x_features.size(0)
+    device = x_features.device
+    
+    src_nodes = edge_index_origin[0].to(device)
+    dst_nodes = edge_index_origin[1].to(device)
+
+    # Tính toán bậc chuẩn hóa phục vụ toán tử Laplacian
+    node_deg = torch.zeros(num_nodes, device=device)
+    ones = torch.ones(num_edges, device=device)
+    node_deg.scatter_add_(0, src_nodes, ones)
+    node_deg.scatter_add_(0, dst_nodes, ones)
+    
+    edge_deg = node_deg[src_nodes] + node_deg[dst_nodes] - 2
+    edge_deg_inv_sqrt = torch.pow(edge_deg + 1e-5, -0.5)
+
+    def graph_laplacian_two_step(curr_x):
+        x_norm = curr_x * edge_deg_inv_sqrt.unsqueeze(-1)
+        node_features = torch.zeros(num_nodes, curr_x.size(1), device=device)
+        node_features.index_add_(0, src_nodes, x_norm)
+        node_features.index_add_(0, dst_nodes, x_norm)
+        
+        out_edge = node_features[src_nodes] + node_features[dst_nodes]
+        out_edge = out_edge * edge_deg_inv_sqrt.unsqueeze(-1)
+        return -out_edge
+
+    # Khởi tạo đa thức đệ quy Chebyshev theo đúng Eq. 14, 15, 16
+    cheb_bases = [x_features] # T0(L)X = X
+    if M_chebyshev > 0:
+        cheb_bases.append(graph_laplacian_two_step(x_features)) # T1(L)X = LX
+        
+    for m in range(2, M_chebyshev + 1):
+        # Tm(L)X = 2 * L * Tm-1(L)X - Tm-2(L)X
+        cheb_m = 2 * graph_laplacian_two_step(cheb_bases[-1]) - cheb_bases[-2]
+        cheb_bases.append(cheb_m)
+        
+    return torch.stack(cheb_bases)
+
+# =====================================================================
+# 3. SUBGRAPH-AWARE SPECTRAL GRAPH NEURAL CALIBRATOR (SSGNC)
+# =====================================================================
+class SSGNC_Layer_Direct(nn.Module):
+    def __init__(self, in_channels, out_channels, K_subgraphs=3, M_chebyshev=2, num_iterations=3):
+        super().__init__()
+        self.K = K_subgraphs
+        self.M = M_chebyshev
+        self.T = num_iterations
+        self.out_channels = out_channels
+        
+        # Trainable prototypes C (Mục IV-B-1)
+        self.prototypes = nn.Parameter(torch.randn(self.K, in_channels))
+        # Hệ số bộ lọc chuyên biệt cho từng subgraph và bậc đa thức theta (Eq. 17)
+        self.theta = nn.Parameter(torch.randn(self.K, self.M + 1, in_channels, out_channels))
+
+    def forward(self, h_features, edge_index_origin, num_nodes):
+        num_edges = h_features.size(0)
+        device = h_features.device
+        eps = 1e-8
+        
+        # --- THUẬT TOÁN DYNAMIC ROUTING MÔ PHỎNG CHUẨN THỨC THEO Eq. 10, 11, 12, 13 ---
+        # Bước 1: Khởi tạo routing probabilities ban đầu (Eq. 10)
+        logits = torch.matmul(h_features, self.prototypes.t()) # (num_edges, K)
+        s = F.softmax(logits, dim=-1)
+        
+        # Bước 2: Vòng lặp cập nhật định tuyến động qua T bước ẩn
+        current_prototypes = self.prototypes.clone()
+        for t in range(self.T):
+            # Cập nhật prototype cục bộ dựa trên trọng số gán (Eq. 11)
+            # s.t(): (K, num_edges) x h_features: (num_edges, in_channels) -> (K, in_channels)
+            sum_s = torch.sum(s, dim=0, keepdim=True).t() # (K, 1)
+            c_t = torch.matmul(s.t(), h_features) / (sum_s + eps)
+            
+            # Cập nhật lại xác suất gán s dựa trên mẫu thử mới (Eq. 12)
+            logits = torch.matmul(h_features, c_t.t())
+            s = F.softmax(logits, dim=-1)
+            
+        # Cập nhật lại ma trận Prototypes gốc với hệ số quán tính (Eq. 13)
+        with torch.no_grad():
+            self.prototypes.copy_(0.9 * self.prototypes + 0.1 * c_t)
+
+        # --- BỘ LỌC ĐA THỨC CHEBYSHEV PHÂN TÁCH SUBGRAPH (Eq. 14 - 17) ---
+        laplacian_matrices = compute_chebyshev_bases_direct(edge_index_origin, h_features, num_nodes, self.M)
+
+        # Tính toán ma trận tích chập Z_k chuyên biệt cho từng Subgraph (Eq. 17)
+        Z = torch.zeros(self.K, num_edges, self.out_channels, device=device)
+        for k in range(self.K):
+            for m in range(self.M + 1):
+                Z[k] += torch.matmul(laplacian_matrices[m], self.theta[k, m])
+
+        # --- TÍCH HỢP TÍNH NĂNG ĐẦU RA THEO XÁC SUẤT ĐỊNH TUYẾN (Eq. 18) ---
+        h_out = torch.zeros(num_edges, self.out_channels, device=device)
+        for k in range(self.K):
+            # Cộng dồn tích chập Z_k nhân với vector xác suất tương ứng của nhánh định tuyến k
+            h_out += s[:, k].unsqueeze(-1) * Z[k]
+            
+        return F.relu(h_out)
+
+class Full_SSGNC_Model_Direct(nn.Module):
+    def __init__(self, gnn_logits_dim, hidden_dim, num_classes=2, L_layers=2):
+        super().__init__()
+        # MLPin xử lý đầu vào biến đổi logits thô (Eq. 19)
+        self.mlp_in = nn.Linear(gnn_logits_dim, hidden_dim)
+        
+        # Khởi tạo chuỗi cấu trúc đa tầng mạng SSGNC
+        self.layers = nn.ModuleList([SSGNC_Layer_Direct(hidden_dim, hidden_dim) for _ in range(L_layers)])
+        
+        # MLPout nhận vào tầng nối đặc trưng Concat của tất cả các layer ẩn (Eq. 21)
+        self.mlp_out = nn.Linear(hidden_dim * L_layers, num_classes)
+
+    def forward(self, x_logits, edge_index_origin, num_nodes):
+        # H(0) = MLPin(X) -> Eq. 19
+        h = self.mlp_in(x_logits)
+        
+        layer_outputs = []
+        # Duyệt qua từng lớp kiến trúc sâu của bộ lọc Spectral Calibrator -> Eq. 20
+        for layer in self.layers:
+            h = layer(h, edge_index_origin, num_nodes)
+            h = F.dropout(h, p=0.5, training=self.training)
+            layer_outputs.append(h) # Lưu lại đặc trưng trung gian để gộp cụm
+            
+        # Y = MLPout(Concat(H(1), ..., H(L))) -> Khớp chính xác hoàn toàn Eq. 21
+        h_concat = torch.cat(layer_outputs, dim=-1)
+        return F.softmax(self.mlp_out(h_concat), dim=-1)
+
+# =====================================================================
+# 4. HÀM TỐI ƯU MẤT MÁT & HIỆU CHUẨN CONFORMAL RISK CONTROL (Mục IV-A)
+# =====================================================================
+def compute_sets_size_loss(calibrated_probs):
+    entropy = -torch.sum(calibrated_probs * torch.log(calibrated_probs + 1e-9), dim=-1)
+    return torch.mean(entropy)
+
+# Tìm ngưỡng lambda_norm tối ưu dựa trên nhị phân hóa FPR đạt bound chặt (Eq. 4 & Eq. 8)
+def binary_search_threshold_fpr(calib_probs, calib_labels, alpha, n_normal):
+    p_ano_normal = calib_probs[calib_labels == 0, 1]
+    low, high, best_lambda = 0.0, 1.0, 1.0
+    bound = alpha - (1.0 - alpha) / n_normal
+    for _ in range(20):
+        mid = (low + high) / 2
+        if torch.mean((p_ano_normal >= mid).float()).item() <= bound:
+            best_lambda, high = mid, mid
+        else:
+            low = mid
+    return best_lambda
+
+# Tìm ngưỡng lambda_ano tối ưu dựa trên nhị phân hóa FNR đạt bound chặt (Eq. 4 & Eq. 9)
+def binary_search_threshold_fnr(calib_probs, calib_labels, alpha, n_ano):
+    p_ano_ano = calib_probs[calib_labels == 1, 1]
+    low, high, best_lambda = 0.0, 1.0, 1.0
+    bound = alpha - (1.0 - alpha) / n_ano
+    for _ in range(20):
+        mid = (low + high) / 2
+        if torch.mean((p_ano_ano < (1.0 - mid)).float()).item() <= bound:
+            best_lambda, high = mid, mid
+        else:
+            low = mid
+    return best_lambda
+
+# Hàm giao tập tập hợp kết quả giao diện C(xtest) phục vụ Bảng I
+def evaluate_conformal(test_probs, true_labels, lambda_norm, lambda_ano, alpha):
+    p_ano = test_probs[:, 1].cpu().numpy()
+    correct_coverage, total_size, singleton_count = 0, 0, 0
+    false_positives, false_negatives = 0, 0
+    n_test = len(true_labels)
+    n_norm = np.sum(true_labels == 0)
+    n_ano = np.sum(true_labels == 1)
+    
+    for i in range(n_test):
+        # Giao cấu trúc tập tổ hợp (Eq. 5 & Eq. 6) để tìm C(xtest) cuối cùng
+        c_norm = {1} if p_ano[i] >= lambda_norm else {0, 1}
+        c_ano = {0} if p_ano[i] < (1.0 - lambda_ano) else {0, 1}
+        s = c_norm.intersection(c_ano) 
+        y = true_labels[i]
+        
+        if y in s: correct_coverage += 1
+        total_size += len(s)
+        if len(s) == 1: singleton_count += 1
+        if y == 0 and (0 not in s): false_positives += 1
+        if y == 1 and (1 not in s): false_negatives += 1
+            
+    print(f"\n================ ĐÁNH GIÁ CONFORMAL (BẢNG I ĐỐI CHỨNG) ================")
+    print(f"Độ phủ thực tế (Cov)         : {correct_coverage / n_test:.3f} (Mục tiêu ~ {1-alpha})")
+    print(f"Kích thước tập (Ine)         : {total_size / n_test:.3f}")
+    print(f"Tỷ lệ tự tin nhãn đơn (Single): {singleton_count / n_test:.3f}")
+    print(f"FPR trên tập Test            : {false_positives / n_norm:.3f} (Mục tiêu <= {alpha})")
+    print(f"FNR trên tập Test            : {false_negatives / n_ano:.3f} (Mục tiêu <= {alpha})")
+
+# =====================================================================
+# 5. PIPELINE CHẠY CHÍNH TÍCH HỢP TRÊN KAGGLE
+# =====================================================================
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"-> Khởi động thành công cấu trúc thực nghiệm trên: {device}")
+    
+    # 5.1 Đọc cấu trúc đồ thị AML gốc từ Kaggle
+    val_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/val_data_5.pt', map_location=device)
+    te_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/te_data_5.pt', map_location=device)
+    
+    edge_index_val = val_data['node', 'to', 'node'].edge_index
+    y_val = val_data['node', 'to', 'node'].y
+    edge_index_te = te_data['node', 'to', 'node'].edge_index
+    y_te = te_data['node', 'to', 'node'].y
+    
+    # Đảm bảo số lượng node tổng quát không bị tràn biên chỉ mục
+    num_total_nodes = max(
+        val_data['node'].x.size(0),
+        te_data['node'].x.size(0),
+        int(edge_index_val.max().item()) + 1,
+        int(edge_index_te.max().item()) + 1
+    )
+
+    # 5.2 Nạp Logits thực tế từ GNN Backbone
+    checkpoint_file = '/kaggle/working/best.tar'
+    # raw_logits_val, raw_logits_test = extract_real_logits_from_checkpoint_hetero(...)
+    raw_logits_val = torch.randn(edge_index_val.size(1), 2).to(device) # Khai báo giả lập chạy luồng
+    raw_logits_test = torch.randn(edge_index_te.size(1), 2).to(device)
+
+    # 5.3 Khởi tạo Calibrator SSGNC cải tiến trực tiếp
+    calibrator = Full_SSGNC_Model_Direct(gnn_logits_dim=2, hidden_dim=16, L_layers=2).to(device)
+    optimizer = torch.optim.Adam(calibrator.parameters(), lr=0.01)
+    
+    # 5.4 Tiến trình tối ưu hàm Loss hỗn hợp (Mục IV-A-3: Cross-Entropy + Set-Size Loss)
+    calibrator.train()
+    for epoch in range(40):
+        optimizer.zero_grad()
+        probs = calibrator(raw_logits_val, edge_index_val, num_total_nodes)
+        
+        ce_loss = F.cross_entropy(torch.log(probs + 1e-10), y_val)
+        size_loss = compute_sets_size_loss(probs)
+        
+        # L = beta * Loss_CE + (1 - beta) * Loss_Size (Chuẩn hóa tối ưu hóa Bảng I)
+        loss = 0.8 * ce_loss + 0.2 * size_loss 
+        loss.backward()
+        optimizer.step()
+
+    # 5.5 Thực thi Hiệu chuẩn Conformal thực tế
+    calibrator.eval()
+    with torch.no_grad():
+        calibrated_val_probs = calibrator(raw_logits_val, edge_index_val, num_total_nodes)
+        calibrated_test_probs = calibrator(raw_logits_test, edge_index_te, num_total_nodes)
+        
+    alpha = 0.10 # Ngưỡng dung sai rủi ro thiết lập cố định
+    lambda_norm = binary_search_threshold_fpr(calibrated_val_probs, y_val, alpha, torch.sum(y_val == 0).item())
+    lambda_ano = binary_search_threshold_fnr(calibrated_val_probs, y_val, alpha, torch.sum(y_val == 1).item())
+    
+    # 5.6 Kết xuất kết quả cuối cùng đối chứng chuẩn
+    evaluate_conformal(calibrated_test_probs, y_te.cpu().numpy(), lambda_norm, lambda_ano, alpha)
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import scipy.sparse as sp
 from tqdm import tqdm
 
