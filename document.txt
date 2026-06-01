@@ -2,6 +2,262 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+# =====================================================================
+# 1. TOÁN TỬ CHEBYSHEV PHÂN RÃ THEO ĐỒ THỊ GỐC (Eq. 14, 15, 16)
+# =====================================================================
+def compute_chebyshev_bases_direct(edge_index_origin, x_features, num_nodes, M_chebyshev=2):
+    num_edges = x_features.size(0)
+    device = x_features.device
+    
+    src_nodes = edge_index_origin[0].to(device)
+    dst_nodes = edge_index_origin[1].to(device)
+
+    # Tính toán bậc nút đối xứng (Node Degree) chuẩn xác bằng index_add_
+    node_deg = torch.zeros(num_nodes, device=device)
+    ones = torch.ones(num_edges, device=device)
+    node_deg.index_add_(0, src_nodes, ones)
+    node_deg.index_add_(0, dst_nodes, ones)
+    
+    # Ánh xạ bậc từ Nút về Cạnh để tính toán toán tử Laplacian chuẩn hóa
+    edge_deg = node_deg[src_nodes] + node_deg[dst_nodes] - 2
+    edge_deg_inv_sqrt = torch.pow(edge_deg + 1e-5, -0.5)
+
+    def graph_laplacian_two_step(curr_x):
+        x_norm = curr_x * edge_deg_inv_sqrt.unsqueeze(-1)
+        node_features = torch.zeros((num_nodes, curr_x.size(1)), device=device)
+        node_features.index_add_(0, src_nodes, x_norm)
+        node_features.index_add_(0, dst_nodes, x_norm)
+        
+        out_edge = node_features[src_nodes] + node_features[dst_nodes]
+        out_edge = out_edge * edge_deg_inv_sqrt.unsqueeze(-1)
+        return -out_edge
+
+    cheb_bases = [x_features]  # T0(L)X = X
+    if M_chebyshev > 0:
+        cheb_bases.append(graph_laplacian_two_step(x_features))  # T1(L)X = LX
+        
+    for m in range(2, M_chebyshev + 1):
+        # Tm(L)X = 2 * L * Tm-1(L)X - Tm-2(L)X
+        cheb_m = 2 * graph_laplacian_two_step(cheb_bases[-1]) - cheb_bases[-2]
+        cheb_bases.append(cheb_m)
+        
+    return torch.stack(cheb_bases)
+
+# =====================================================================
+# 2. SUBGRAPH-AWARE SPECTRAL GRAPH NEURAL CALIBRATOR (SSGNC)
+# =====================================================================
+class SSGNC_Layer_Direct(nn.Module):
+    def __init__(self, in_channels, out_channels, K_subgraphs=3, M_chebyshev=2, num_iterations=3):
+        super().__init__()
+        self.K = K_subgraphs
+        self.M = M_chebyshev
+        self.T = num_iterations
+        self.out_channels = out_channels
+        
+        self.prototypes = nn.Parameter(torch.randn(self.K, in_channels))
+        self.theta = nn.Parameter(torch.randn(self.K, self.M + 1, in_channels, out_channels))
+
+    def forward(self, h_features, edge_index_origin, num_nodes):
+        num_edges = h_features.size(0)
+        device = h_features.device
+        eps = 1e-8
+        
+        # --- THUẬT TOÁN DYNAMIC ROUTING ĐỒNG BỘ GRADIENT ---
+        logits = torch.matmul(h_features, self.prototypes.t())
+        s = F.softmax(logits, dim=-1)
+        
+        for t in range(self.T):
+            sum_s = torch.sum(s, dim=0, keepdim=True).t()
+            c_t = torch.matmul(s.t(), h_features) / (sum_s + eps)
+            logits = torch.matmul(h_features, c_t.t())
+            s = F.softmax(logits, dim=-1)
+            
+        with torch.no_grad():
+            self.prototypes.copy_(0.9 * self.prototypes + 0.1 * c_t)
+
+        # --- BỘ LỌC ĐA THỨC CHEBYSHEV PHÂN TÁCH SUBGRAPH ---
+        laplacian_matrices = compute_chebyshev_bases_direct(edge_index_origin, h_features, num_nodes, self.M)
+
+        Z = torch.zeros(self.K, num_edges, self.out_channels, device=device)
+        for k in range(self.K):
+            for m in range(self.M + 1):
+                Z[k] += torch.matmul(laplacian_matrices[m], self.theta[k, m])
+
+        # --- TÍCH HỢP TÍNH NĂNG THEO XÁC SUẤT ĐỊNH TUYẾN ---
+        h_out = torch.zeros(num_edges, self.out_channels, device=device)
+        for k in range(self.K):
+            h_out += s[:, k].unsqueeze(-1) * Z[k]
+            
+        return F.relu(h_out)
+
+class Full_SSGNC_Model_Direct(nn.Module):
+    def __init__(self, gnn_logits_dim, hidden_dim, num_classes=2, L_layers=2):
+        super().__init__()
+        self.mlp_in = nn.Linear(gnn_logits_dim, hidden_dim)
+        self.layers = nn.ModuleList([SSGNC_Layer_Direct(hidden_dim, hidden_dim) for _ in range(L_layers)])
+        self.mlp_out = nn.Linear(hidden_dim * L_layers, num_classes)
+
+    def forward(self, x_logits, edge_index_origin, num_nodes):
+        h = self.mlp_in(x_logits)
+        layer_outputs = []
+        
+        for layer in self.layers:
+            h = layer(h, edge_index_origin, num_nodes)
+            h = F.dropout(h, p=0.5, training=self.training)
+            layer_outputs.append(h)
+            
+        h_concat = torch.cat(layer_outputs, dim=-1)
+        return F.softmax(self.mlp_out(h_concat), dim=-1)
+
+# =====================================================================
+# 3. HÀM TỐI ƯU MẤT MÁT & HIỆU CHUẨN CONFORMAL RISK CONTROL
+# =====================================================================
+def compute_sets_size_loss(calibrated_probs):
+    entropy = -torch.sum(calibrated_probs * torch.log(calibrated_probs + 1e-9), dim=-1)
+    return torch.mean(entropy)
+
+def binary_search_threshold_fpr(calib_probs, calib_labels, alpha, n_normal):
+    p_ano_normal = calib_probs[calib_labels == 0, 1]
+    low, high, best_lambda = 0.0, 1.0, 1.0
+    bound = alpha - (1.0 - alpha) / n_normal
+    for _ in range(20):
+        mid = (low + high) / 2
+        if torch.mean((p_ano_normal >= mid).float()).item() <= bound:
+            best_lambda, high = mid, mid
+        else:
+            low = mid
+    return best_lambda
+
+def binary_search_threshold_fnr(calib_probs, calib_labels, alpha, n_ano):
+    p_ano_ano = calib_probs[calib_labels == 1, 1]
+    low, high, best_lambda = 0.0, 1.0, 1.0
+    bound = alpha - (1.0 - alpha) / n_ano
+    for _ in range(20):
+        mid = (low + high) / 2
+        if torch.mean((p_ano_ano < (1.0 - mid)).float()).item() <= bound:
+            best_lambda, high = mid, mid
+        else:
+            low = mid
+    return best_lambda
+
+def evaluate_conformal(test_probs, true_labels, lambda_norm, lambda_ano, alpha):
+    p_ano = test_probs[:, 1].cpu().numpy()
+    correct_coverage, total_size, singleton_count = 0, 0, 0
+    false_positives, false_negatives = 0, 0
+    n_test = len(true_labels)
+    n_norm = np.sum(true_labels == 0)
+    n_ano = np.sum(true_labels == 1)
+    
+    for i in range(n_test):
+        c_norm = {1} if p_ano[i] >= lambda_norm else {0, 1}
+        c_ano = {0} if p_ano[i] < (1.0 - lambda_ano) else {0, 1}
+        s = c_norm.intersection(c_ano) 
+        y = true_labels[i]
+        
+        if y in s: correct_coverage += 1
+        total_size += len(s)
+        if len(s) == 1: singleton_count += 1
+        if y == 0 and (0 not in s): false_positives += 1
+        if y == 1 and (1 not in s): false_negatives += 1
+            
+    print(f"\n================ ĐÁNH GIÁ CONFORMAL (BẢNG I ĐỐI CHỨNG) ================")
+    print(f"Độ phủ thực tế (Cov)         : {correct_coverage / n_test:.4f} (Mục tiêu ~ {1-alpha:.2f})")
+    print(f"Kích thước tập (Ine)         : {total_size / n_test:.4f}")
+    print(f"Tỷ lệ tự tin nhãn đơn (Single): {singleton_count / n_test:.4f}")
+    print(f"FPR trên tập Test            : {false_positives / n_norm:.4f} (Mục tiêu <= {alpha:.2f})")
+    print(f"FNR trên tập Test            : {false_negatives / n_ano:.4f} (Mục tiêu <= {alpha:.2f})")
+
+# =====================================================================
+# 4. LUỒNG PIPELINE THỰC THI CHÍNH TÍCH HỢP DATASET KAGGLE
+# =====================================================================
+def execute_ssgnc_calibration(logits_val, edge_index_val, y_val, logits_test, edge_index_te, y_te, num_total_nodes, alpha=0.10):
+    device = logits_val.device
+    
+    # Khởi tạo Calibrator SSGNC dựa trên số chiều logit đầu vào
+    calibrator = Full_SSGNC_Model_Direct(gnn_logits_dim=logits_val.size(1), hidden_dim=16, L_layers=2).to(device)
+    optimizer = torch.optim.Adam(calibrator.parameters(), lr=0.01)
+    
+    # Tiến trình tối ưu hàm Loss hỗn hợp NLL + Set Size
+    calibrator.train()
+    for epoch in range(40):
+        optimizer.zero_grad()
+        probs = calibrator(logits_val, edge_index_val, num_total_nodes)
+        
+        ce_loss = F.nll_loss(torch.log(probs + 1e-10), y_val)
+        size_loss = compute_sets_size_loss(probs)
+        
+        loss = 0.8 * ce_loss + 0.2 * size_loss 
+        loss.backward()
+        optimizer.step()
+
+    # Thực thi Hiệu chuẩn Conformal toán phân vị
+    calibrator.eval()
+    with torch.no_grad():
+        calibrated_val_probs = calibrator(logits_val, edge_index_val, num_total_nodes)
+        calibrated_test_probs = calibrator(logits_test, edge_index_te, num_total_nodes)
+        
+    lambda_norm = binary_search_threshold_fpr(calibrated_val_probs, y_val, alpha, torch.sum(y_val == 0).item())
+    lambda_ano = binary_search_threshold_fnr(calibrated_val_probs, y_val, alpha, torch.sum(y_val == 1).item())
+    
+    # Kết xuất kết quả cuối cùng đối chứng
+    evaluate_conformal(calibrated_test_probs, y_te.cpu().numpy(), lambda_norm, lambda_ano, alpha)
+
+
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"-> Đang tải cấu trúc đồ thị AML từ Kaggle trên thiết bị: {device}")
+    
+    # Đọc trực tiếp dataset thực tế từ đường dẫn Kaggle của bạn
+    val_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/val_data_5.pt', map_location=device)
+    te_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/te_data_5.pt', map_location=device)
+    
+    edge_index_val = val_data['node', 'to', 'node'].edge_index
+    y_val = val_data['node', 'to', 'node'].y
+    edge_index_te = te_data['node', 'to', 'node'].edge_index
+    y_te = te_data['node', 'to', 'node'].y
+    
+    num_total_nodes = max(
+        val_data['node'].x.size(0),
+        te_data['node'].x.size(0),
+        int(edge_index_val.max().item()) + 1,
+        int(edge_index_te.max().item()) + 1
+    )
+
+    # =====================================================================
+    # ⚠️ THAY THẾ HAI BIẾN ĐẦU VÀO NÀY BẰNG TENSOR LOGITS THỰC TẾ CỦA BẠN ⚠️
+    # =====================================================================
+    raw_logits_val = YOUR_VAL_LOGITS     # Tensor kích thước [num_edges_val, num_classes]
+    raw_logits_test = YOUR_TEST_LOGITS   # Tensor kích thước [num_edges_test, num_classes]
+    # =====================================================================
+
+    # Kích hoạt toàn bộ luồng hiệu chuẩn phổ đồ thị và in bảng kết quả
+    execute_ssgnc_calibration(
+        logits_val=raw_logits_val.to(device), 
+        edge_index_val=edge_index_val, 
+        y_val=y_val, 
+        logits_test=raw_logits_test.to(device), 
+        edge_index_te=edge_index_te, 
+        y_te=y_te, 
+        num_total_nodes=num_total_nodes, 
+        alpha=0.10
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from tqdm import tqdm
 
 # =====================================================================
