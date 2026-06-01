@@ -5,6 +5,271 @@ import numpy as np
 from tqdm import tqdm
 
 # =====================================================================
+# 1. HÀM LOSS ĐỐI XỨNG CHO CẠNH (BALANCED ASL)
+# =====================================================================
+class BalancedASL(nn.Module):
+    def __init__(self, gamma_neg=2, gamma_pos=0.5, target_idx=1, eps=1e-8):
+        super(BalancedASL, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.target_idx = target_idx
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=-1)
+        p = probs[:, self.target_idx]
+        targets = targets.float()
+        loss_pos = targets * torch.log(p + self.eps) * torch.pow(1 - p, self.gamma_pos)
+        loss_neg = (1 - targets) * torch.log(1 - p + self.eps) * torch.pow(p, self.gamma_neg)
+        return -torch.mean(loss_pos + loss_neg)
+
+# =====================================================================
+# 2. MẠNG PHỔ SSGNC CHO KHÔNG GIAN CẠNH
+# =====================================================================
+class SSGNC_Edge_Network(nn.Module):
+    def __init__(self, in_dim=2, hidden_dim=16, out_dim=2, L_layers=2, K_subgraphs=3, M_order=2):
+        super(SSGNC_Edge_Network, self).__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.L_layers = L_layers
+        self.K_subgraphs = K_subgraphs
+        self.M_order = M_order
+        
+        self.edge_mlp_in = nn.Linear(in_dim, hidden_dim)
+        self.prototypes = nn.Parameter(torch.randn(K_subgraphs, hidden_dim))
+        self.cheb_weights = nn.Parameter(torch.randn(K_subgraphs, M_order + 1, hidden_dim, hidden_dim))
+        self.edge_mlp_out = nn.Linear(hidden_dim * L_layers, out_dim)
+        self.dropout = nn.Dropout(p=0.2)
+        self.temperature = nn.Parameter(torch.ones(1) * 1.0)
+
+    def compute_laplacian(self, edge_index, num_nodes):
+        row, col = edge_index
+        deg = torch.zeros(num_nodes, device=edge_index.device)
+        deg.index_add_(0, row, torch.ones_like(row, dtype=torch.float))
+        deg_inv_sqrt = torch.pow(deg, -0.5)
+        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+        val = -deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        indices = edge_index
+        id_indices = torch.arange(num_nodes, device=edge_index.device).repeat(2, 1)
+        indices = torch.cat([indices, id_indices], dim=1)
+        val = torch.cat([val, torch.ones(num_nodes, device=edge_index.device)])
+        return torch.sparse_coo_tensor(indices, val, (num_nodes, num_nodes)).coalesce()
+
+    def forward(self, edge_feats, edge_index, num_nodes):
+        e_h = F.relu(self.edge_mlp_in(edge_feats))
+        sim = torch.matmul(e_h, self.prototypes.t()) 
+        routing_edges_k = F.softmax(sim, dim=-1)
+        
+        L_sparse = self.compute_laplacian(edge_index, num_nodes)
+        layer_outputs = []
+        e_h_current = e_h
+        
+        for l in range(self.L_layers):
+            # Cạnh sang Nút
+            n_h = torch.zeros((num_nodes, self.hidden_dim), device=edge_index.device)
+            n_h.index_add_(0, edge_index[1], e_h_current)
+            
+            # Khử quy nạp Chebyshev đa thức phổ
+            T_m = [n_h]
+            T_1 = torch.sparse.mm(L_sparse, n_h)
+            T_m.append(T_1)
+            for m in range(2, self.M_order + 1):
+                T_next = 2 * torch.sparse.mm(L_sparse, T_m[-1]) - T_m[-2]
+                T_m.append(T_next)
+                
+            n_h_filtered_set = []
+            for k in range(self.K_subgraphs):
+                z_k = torch.zeros_like(n_h)
+                for m in range(self.M_order + 1):
+                    z_k += torch.matmul(T_m[m], self.cheb_weights[k, m])
+                n_h_filtered_set.append(z_k)
+                
+            # Nút trả ngược về Cạnh
+            e_h_next = torch.zeros_like(e_h_current)
+            for k in range(self.K_subgraphs):
+                nodes_src_feats = n_h_filtered_set[k][edge_index[0]]
+                nodes_dst_feats = n_h_filtered_set[k][edge_index[1]]
+                e_h_next += routing_edges_k[:, k].unsqueeze(-1) * (nodes_src_feats + nodes_dst_feats)
+                
+            e_h_next = F.relu(e_h_next)
+            e_h_next = self.dropout(e_h_next)
+            layer_outputs.append(e_h_next)
+            e_h_current = e_h_next
+            
+        edge_logits = self.edge_mlp_out(torch.cat(layer_outputs, dim=-1))
+        return edge_logits / torch.clamp(self.temperature, min=0.5, max=4.0)
+
+# =====================================================================
+# 3. TOÁN HỌC QUÉT NGƯỠNG ĐỘNG TOÀN DIỆN (DYNAMIC CONFORMAL CALIBRATION)
+# =====================================================================
+def run_dynamic_meta_calibration(calib_probs, labels, alpha, max_penalty=3.5):
+    """
+    Tính toán động các ngưỡng toán học thực tế bằng kỹ thuật phân vị (Quantiles),
+    đáp ứng chính xác yêu cầu không fix cứng số liệu.
+    """
+    p_anomaly = calib_probs[:, 1].cpu().numpy()
+    labels_np = labels.cpu().numpy()
+    
+    # Phân tách xác suất theo nhãn thực tế
+    probs_normal = p_anomaly[labels_np == 0]
+    probs_anomaly = p_anomaly[labels_np == 1]
+    
+    # 1. Định nghĩa hàm rủi ro thực tế (Empirical Loss) cho Normal (FPR Control)
+    # Hàm rủi ro tăng dần khi p tiến sát về 1
+    losses_normal = np.minimum(-np.log(1.0 - probs_normal + 1e-8), max_penalty)
+    n_normal = len(losses_normal)
+    # Tính toán giá trị phân vị chính xác dựa trên n+1 theo lý thuyết CRC
+    q_level_normal = np.clip((n_normal + 1) * (1.0 - alpha) / n_normal, 0.0, 1.0)
+    lambda_norm_opt = np.quantile(losses_normal, q_level_normal) if n_normal > 0 else 0.5
+    
+    # 2. Định nghĩa hàm rủi ro cho Anomaly (FNR Control)
+    # Hàm rủi ro tăng dần khi p tiến sát về 0
+    losses_anomaly = np.minimum(-np.log(probs_anomaly + 1e-8), max_penalty)
+    n_ano = len(losses_anomaly)
+    q_level_ano = np.clip((n_ano + 1) * (1.0 - alpha) / n_ano, 0.0, 1.0)
+    lambda_ano_opt = np.quantile(losses_anomaly, q_level_ano) if n_ano > 0 else 0.5
+    
+    return lambda_norm_opt, lambda_ano_opt
+
+def evaluate_predictions(probs, targets, lambda_norm, lambda_ano, is_calibrated=True):
+    """ Tính toán các metric dựa trên biên quyết định động được hiệu chuẩn """
+    p_ano = probs[:, 1].cpu().numpy()
+    targets_np = targets.cpu().numpy()
+    
+    if is_calibrated:
+        # Chuyển đổi ngược từ không gian toán tử phạt (Loss Space) về không gian xác suất
+        threshold_norm = 1.0 - np.exp(-lambda_norm)
+        threshold_ano = np.exp(-lambda_ano)
+        
+        # Biên quyết định động tối ưu hóa theo phân phối thực tế
+        preds = np.where(p_ano >= (threshold_norm + threshold_ano) / 2.0, 1, 0)
+    else:
+        # Ngưỡng chuẩn mực của mô hình Base khi chưa hiệu chuẩn
+        preds = np.where(p_ano >= 0.5, 1, 0)
+        
+    tp = np.sum((preds == 1) & (targets_np == 1))
+    fp = np.sum((preds == 1) & (targets_np == 0))
+    fn = np.sum((preds == 0) & (targets_np == 1))
+    tn = np.sum((preds == 0) & (targets_np == 0))
+    
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+    
+    fpr = fp / (fp + tn + 1e-8)
+    fnr = fn / (fn + tp + 1e-8)
+    
+    return f1, fpr, fnr
+
+# =====================================================================
+# 4. HÀM CHỦ CHỐT TÍNH TOÁN VÀ ĐỐI CHỨNG (MAIN EXECUTION MODULE)
+# =====================================================================
+def execute_ssgnc_pipeline_benchmark(logits_val, edge_index_val, y_val, logits_test, edge_index_test, y_test, num_nodes, alpha=0.1):
+    """
+    HÀM SỬ DỤNG TRỰC TIẾP: Nhận vào các Tensor thực tế của bạn, không giả lập dữ liệu.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    num_total_edges = logits_val.size(0)
+    
+    # Phân chia tập Validation sạch chống rò rỉ dữ liệu (Anti-Leakage)
+    np.random.seed(42)
+    shuffled_indices = np.random.permutation(num_total_edges)
+    split_idx = int(num_total_edges * 0.5)
+    
+    train_idx = shuffled_indices[:split_idx]
+    meta_idx = shuffled_indices[split_idx:]
+    
+    # Tách biệt ma trận đặc trưng cạnh (Logits)
+    logits_train = logits_val[train_idx].clone().detach().to(device).float()
+    logits_meta = logits_val[meta_idx].clone().detach().to(device).float()
+    
+    y_train = y_val[train_idx].to(device).long()
+    y_meta = y_val[meta_idx]
+    
+    # Cô lập đồ thị con (Cạnh)
+    edge_index_train = edge_index_val[:, train_idx].to(device)
+    edge_index_meta = edge_index_val[:, meta_idx].to(device)
+    
+    # Khởi tạo mô hình mạng phổ thích ứng theo chiều thực tế của logits_val
+    calibrator = SSGNC_Edge_Network(in_dim=logits_val.size(1), hidden_dim=16, out_dim=2).to(device)
+    optimizer = torch.optim.AdamW(calibrator.parameters(), lr=0.005, weight_decay=1e-3)
+    criterion = BalancedASL(gamma_neg=2, gamma_pos=0.5)
+    
+    # Tiến hành pha huấn luyện làm mịn dải phổ trên tập Train-Calib
+    calibrator.train()
+    for epoch in range(30):  
+        optimizer.zero_grad()
+        outputs = calibrator(logits_train, edge_index_train, num_nodes=num_nodes)
+        loss = criterion(outputs, y_train)
+        loss.backward()
+        optimizer.step()
+        
+    # Chuyển trạng thái suy diễn kiểm soát toán học
+    calibrator.eval()
+    with torch.no_grad():
+        # Trích xuất phân phối xác suất trên tập Meta để tìm ngưỡng động
+        probs_meta = F.softmax(calibrator(logits_meta, edge_index_meta, num_nodes=num_nodes), dim=-1)
+        
+        # Trích xuất phân phối xác suất trên tập Test thực tế của bạn
+        logits_test_dev = logits_test.to(device).float()
+        edge_index_test_dev = edge_index_test.to(device)
+        probs_test = F.softmax(calibrator(logits_test_dev, edge_index_test_dev, num_nodes=num_nodes), dim=-1)
+        
+        # Lấy xác suất gốc trực tiếp từ ma trận logits_test ban đầu của bạn để tính toán Base Model
+        probs_base_test = F.softmax(logits_test.float(), dim=-1)
+        
+    # Tính toán động ra các giá trị ngưỡng tối ưu thực tế, hoàn toàn dựa trên hành vi phân phối
+    lambda_norm, lambda_ano = run_dynamic_meta_calibration(probs_meta, y_meta, alpha=alpha)
+    
+    # Đánh giá so sánh trực tiếp số liệu thực tế trên Test Set
+    base_f1, base_fpr, base_fnr = evaluate_predictions(probs_base_test, y_test, None, None, is_calibrated=False)
+    our_f1, our_fpr, our_fnr = evaluate_predictions(probs_test, y_test, lambda_norm, lambda_ano, is_calibrated=True)
+    
+    print("\n" + "📊 " + "="*65)
+    print(" BẢNG SO SÁNH HIỆU NĂNG THỰC NGHIỆM ĐỐI CHỨNG THỰC TẾ (ĐỘNG 100%)")
+    print("="*67)
+    print(f"| Chỉ số đánh giá | Base Model (GNN gốc) | Ours (SSGNC-DTCRC) | Mục tiêu |")
+    print(f"|-----------------|----------------------|--------------------|----------|")
+    print(f"| F1-Score        |       {base_f1:.4f}         |       {our_f1:.4f}        |   Max    |")
+    print(f"| FPR (Báo động giả)|       {base_fpr:.4f}         |       {our_fpr:.4f}        |  ≤ {alpha:.1f}   |")
+    print(f"| FNR (Bỏ sót)    |       {base_fnr:.4f}         |       {our_fnr:.4f}        |  ≤ {alpha:.1f}   |")
+    print("="*67)
+
+# =====================================================================
+# HƯỚNG DẪN KÍCH HOẠT VÀO DỰ ÁN CỦA BẠN:
+# =====================================================================
+# Chỉ cần import hoặc dán hàm này vào cuối file chạy chính của bạn và gọi:
+# 
+# execute_ssgnc_pipeline_benchmark(
+#     logits_val=TEN_MANG_LOGITS_VAL_CỦA_BẠN,     # Cạnh Kích thước [965473, 2]
+#     edge_index_val=MA_TRẬN_CẠNH_VAL_CỦA_BẠN,
+#     y_val=NHÃN_CẠNH_VAL_CỦA_BẠN,
+#     logits_test=TEN_MANG_LOGITS_TEST_CỦA_BẠN,   # Cạnh Kích thước tập Test thực tế
+#     edge_index_test=MA_TRẬN_CẠNH_TEST_CỦA_BẠN,
+#     y_test=NHÃN_CẠNH_TEST_CỦA_BẠN,
+#     num_nodes=SỐ_LƯỢNG_NÚT_TOÀN_CỤC,
+#     alpha=0.1
+# )
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+
+# =====================================================================
 # 1. HÀM TRÍCH XUẤT LOGITS TỪ GNN BACKBONE (GIỮ NGUYÊN HOÀN TOÀN LOGIC CỦA BẠN)
 # =====================================================================
 def extract_real_logits_from_checkpoint_hetero(checkpoint_path, val_loader, test_loader, inds, model, device):
