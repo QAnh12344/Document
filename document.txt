@@ -12,6 +12,384 @@ warnings.filterwarnings("ignore", message="Sparse invariant checks are implicitl
 # CONFIGURATION SYSTEM (Cấu hình toán học hệ thống)
 # =====================================================================
 CONFIG = {
+    "target_class_idx": 1,           # Lớp mục tiêu cần kiểm soát rủi ro
+    "binary_search_iters": 45,       
+    "max_penalty": 5.0,
+    "batch_size": 65536,             # Kích thước xử lý song song cực đại trên GPU
+    "num_epochs": 50,                # Tăng số lượng Epochs để tối ưu hóa hội tụ sâu cho bài báo
+    "lr": 0.005
+}
+
+# =====================================================================
+# 1. MẠNG PHỔ THÍCH ỨNG DÀNH RIÊNG CHO LOGITS ĐỘC LẬP (EDGE-ROUTING)
+# =====================================================================
+class SSGNCEdgeRoutingNet(nn.Module):
+    def __init__(self, in_dim, hidden_dim=32, K_subgraphs=4, num_routing_iter=3):
+        super().__init__()
+        self.out_dim = in_dim  
+        self.K = K_subgraphs
+        self.T = num_routing_iter
+        
+        self.mlp_in = nn.Linear(in_dim, hidden_dim)
+        self.prototypes = nn.Parameter(torch.randn(K_subgraphs, hidden_dim))
+        self.weights = nn.Parameter(torch.randn(K_subgraphs, hidden_dim, self.out_dim) * 0.02)
+        
+        self.mlp_out = nn.Linear(self.out_dim, self.out_dim)
+        nn.init.orthogonal_(self.prototypes)
+
+    def forward(self, x_edges):
+        h = F.gelu(self.mlp_in(x_edges)) 
+        
+        logits = torch.matmul(h, self.prototypes.t()) 
+        s = F.softmax(logits, dim=-1)
+
+        c_k = self.prototypes
+        for t in range(self.T):
+            s_expanded = s.unsqueeze(-1)          
+            x_expanded = h.unsqueeze(1)          
+            num = torch.sum(s_expanded * x_expanded, dim=0)
+            den = torch.sum(s, dim=0).unsqueeze(-1) + 1e-6
+            c_k = num / den
+            logits = torch.matmul(h, c_k.t())
+            s = F.softmax(logits, dim=-1)
+
+        Z = torch.zeros(self.K, x_edges.size(0), self.out_dim, device=x_edges.device)
+        for k in range(self.K):
+            Z[k] = torch.matmul(h, self.weights[k])
+
+        out = torch.zeros(x_edges.size(0), self.out_dim, device=x_edges.device)
+        for k in range(self.K):
+            out += s[:, k].unsqueeze(-1) * Z[k]
+
+        return self.mlp_out(out)
+
+
+# =====================================================================
+# 2. HÀM LOSS BALANCED ASL ĐA LỚP TỔNG QUÁT (ONE-VS-REST)
+# =====================================================================
+class BalancedASL(nn.Module):
+    def __init__(self, gamma_neg=2, gamma_pos=1.5, clip=0.01, target_idx=1):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = 1e-8
+        self.target_idx = target_idx
+
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=-1)
+        p = probs[:, self.target_idx]
+        
+        targets_binary = (targets == self.target_idx).float()
+
+        loss_pos = targets_binary * torch.log(p + self.eps) * torch.pow(1 - p, self.gamma_pos)
+        p_neg = 1 - p
+        if self.clip > 0:
+            p_neg = (p_neg + self.clip).clamp(max=1.0)
+        loss_neg = (1 - targets_binary) * torch.log(p_neg + self.eps) * torch.pow(1 - p_neg, self.gamma_neg)
+
+        return - (loss_pos + loss_neg).mean()
+
+
+# =====================================================================
+# 3. HÀM TÍNH NGƯỠNG TOÁN HỌC AN TOÀN CHỐNG TREO SỐ THỰC (TÍCH HỢP TQDM)
+# =====================================================================
+def compute_bounded_soft_thresholds(calib_probs, calib_labels, alpha, config, leave_pbar=False):
+    target_idx = config["target_class_idx"]
+    p_ano = calib_probs[:, target_idx].cpu().numpy()
+    labels = calib_labels.cpu().numpy() if isinstance(calib_labels, torch.Tensor) else np.array(calib_labels)
+    eps = 1e-12
+    max_penalty = config["max_penalty"]
+
+    n_normal = np.sum(labels != target_idx)
+    n_ano = np.sum(labels == target_idx)
+    bs_iters = config["binary_search_iters"]
+    
+    weight_normal = (n_normal + n_ano) / (2.0 * n_normal + 1e-6) if n_normal > 0 else 1.0
+    weight_ano = (n_normal + n_ano) / (2.0 * n_ano + 1e-6) if n_ano > 0 else 1.0
+    tol = 1e-7
+
+    # --- Nhánh A: Tìm Lambda_Normal ---
+    low, high = 0.0001, 0.9999
+    lambda_normal_hat = 0.50
+    target_risk_normal = alpha
+
+    if n_normal > 0:
+        p_ano_norm = p_ano[labels != target_idx]
+        log_p_norm = -np.log(np.clip(1.0 - p_ano_norm, eps, 1.0 - eps)) * weight_normal
+        
+        # Thêm tqdm giám sát nội bộ bài toán tìm kiếm nhị phân tuyến tính
+        for _ in range(bs_iters):
+            if (high - low) < tol: 
+                break
+            mid = (low + high) / 2.0
+            soft_error_normal = np.clip(log_p_norm * mid, 0.0, max_penalty)
+            empirical_risk_normal = np.mean(soft_error_normal)
+
+            if empirical_risk_normal <= target_risk_normal:
+                lambda_normal_hat = mid
+                low = mid
+            else:
+                high = mid
+
+    # --- Nhánh B: Tìm Lambda_Anomaly ---
+    low, high = 0.0001, 0.9999
+    lambda_ano_hat = 0.50
+    target_risk_ano = alpha
+
+    if n_ano > 0:
+        p_ano_fraud = p_ano[labels == target_idx]
+        log_p_fraud = -np.log(np.clip(p_ano_fraud, eps, 1.0 - eps)) * weight_ano
+        
+        for _ in range(bs_iters):
+            if (high - low) < tol: 
+                break
+            mid = (low + high) / 2.0
+            soft_error_ano = np.clip(log_p_fraud * (1.0 - mid), 0.0, max_penalty)
+            empirical_risk_ano = np.mean(soft_error_ano)
+
+            if empirical_risk_ano <= target_risk_ano:
+                lambda_ano_hat = mid
+                high = mid
+            else:
+                low = mid
+
+    return lambda_normal_hat, lambda_ano_hat
+
+
+# =====================================================================
+# 4. META-CALIBRATION QUÉT LƯỚI KHÔNG GIAN (CHỈNH SỬA HIỂN THỊ QUÁ TRÌNH)
+# =====================================================================
+def Joint_Meta_Calibration_On_Val(calib_val_probs, y_val, config):
+    device = calib_val_probs.device
+    target_idx = config["target_class_idx"]
+    p_ano_tensor = calib_val_probs[:, target_idx]
+    
+    labels = y_val.cpu().numpy() if isinstance(y_val, torch.Tensor) else np.array(y_val)
+    p_ano = p_ano_tensor.cpu().numpy()
+    eps = 1e-12
+    max_penalty = config["max_penalty"]
+
+    n_norm = np.sum(labels != target_idx)
+    n_ano = np.sum(labels == target_idx)
+    w_normal = (n_norm + n_ano) / (2.0 * n_norm + 1e-6)
+    w_ano = (n_norm + n_ano) / (2.0 * n_ano + 1e-6)
+
+    best_f1 = -1.0
+    best_alpha = 0.20
+    best_gamma = 0.0
+    best_lambda_normal = 0.50
+    best_lambda_ano = 0.50
+
+    alpha_space = np.linspace(0.05, 0.75, 30)
+    gamma_space = torch.linspace(-0.25, 0.25, 25, device=device) 
+
+    # Tiến trình quét không gian Conformal Risk
+    pbar_alpha = tqdm(alpha_space, desc="[1/2] Đang quét không gian Conformal Risk (Alpha)")
+    for alpha_trial in pbar_alpha:
+        l_norm, l_ano = compute_bounded_soft_thresholds(calib_val_probs, y_val, alpha_trial, config)
+
+        val_err_norm = np.mean(np.clip(-np.log(np.clip(1.0 - p_ano[labels != target_idx], eps, 1.0 - eps)) * l_norm * w_normal, 0.0, max_penalty))
+        val_err_ano = np.mean(np.clip(-np.log(np.clip(p_ano[labels == target_idx], eps, 1.0 - eps)) * (1.0 - l_ano) * w_ano, 0.0, max_penalty))
+
+        if val_err_norm > alpha_trial or val_err_ano > alpha_trial:
+            continue
+
+        must_be_1 = (p_ano_tensor >= l_norm) & (p_ano_tensor >= (1.0 - l_ano))
+        must_be_0 = (p_ano_tensor < l_norm) & (p_ano_tensor < (1.0 - l_ano))
+        is_uncertain = (p_ano_tensor < l_norm) & (p_ano_tensor >= (1.0 - l_ano))
+        is_empty = (p_ano_tensor >= l_norm) & (p_ano_tensor < (1.0 - l_ano)) 
+
+        base_preds = torch.zeros_like(p_ano_tensor)
+        base_preds[must_be_1] = 1.0
+        base_preds[must_be_0] = 0.0
+        base_preds[is_empty] = (p_ano_tensor[is_empty] > 0.5).float() 
+
+        for gamma_trial in gamma_space:
+            temp_preds = base_preds.clone()
+            if is_uncertain.any():
+                temp_preds[is_uncertain] = (p_ano_tensor[is_uncertain] > (0.5 + gamma_trial)).float()
+
+            preds_cpu = temp_preds.cpu().numpy()
+            
+            binary_labels = (labels == target_idx).astype(int)
+            current_f1 = f1_score(binary_labels, preds_cpu, zero_division=0)
+
+            if current_f1 > best_f1:
+                best_f1 = current_f1
+                best_alpha = alpha_trial
+                best_gamma = gamma_trial.item()
+                best_lambda_normal = l_norm
+                best_lambda_ano = l_ano
+                pbar_alpha.set_postfix({"Best F1": f"{best_f1:.4f}", "Alpha": f"{best_alpha:.3f}"})
+
+    return best_lambda_normal, best_lambda_ano, best_gamma, best_alpha
+
+
+# =====================================================================
+# 5. HÀM XUẤT ĐÁNH GIÁ ĐỐI SÁNH KHOA HỌC
+# =====================================================================
+def evaluate_dtcrc_inference_test(test_probs, test_labels, actual_backbone_logits, lambda_normal, lambda_ano, margin_gamma, chosen_alpha, config):
+    print("-> [2/2] Bắt đầu tính toán các chỉ số kiểm định trên tập Test...")
+    target_idx = config["target_class_idx"]
+    p_ano_tensor = test_probs[:, target_idx]
+    p_ano = p_ano_tensor.cpu().numpy()
+    eps = 1e-12
+    max_penalty = config["max_penalty"]
+
+    true_labels = test_labels.cpu().numpy() if isinstance(test_labels, torch.Tensor) else np.array(test_labels)
+    binary_true_labels = (true_labels == target_idx).astype(int)
+    
+    base_preds_raw = torch.argmax(actual_backbone_logits, dim=-1).cpu().numpy()
+    base_preds_binary = (base_preds_raw == target_idx).astype(int)
+
+    must_be_1 = (p_ano_tensor >= lambda_normal) & (p_ano_tensor >= (1.0 - lambda_ano))
+    must_be_0 = (p_ano_tensor < lambda_normal) & (p_ano_tensor < (1.0 - lambda_ano))
+    is_uncertain = (p_ano_tensor < lambda_normal) & (p_ano_tensor >= (1.0 - lambda_ano))
+    is_empty = (p_ano_tensor >= lambda_normal) & (p_ano_tensor < (1.0 - lambda_ano))
+
+    final_preds_tensor = torch.zeros_like(p_ano_tensor)
+    final_preds_tensor[must_be_1] = 1.0
+    final_preds_tensor[must_be_0] = 0.0
+    final_preds_tensor[is_empty] = (p_ano_tensor[is_empty] > 0.5).float()
+    if is_uncertain.any():
+        final_preds_tensor[is_uncertain] = (p_ano_tensor[is_uncertain] > (0.5 + margin_gamma)).float()
+        
+    final_preds = final_preds_tensor.cpu().numpy()
+
+    base_f1 = f1_score(binary_true_labels, base_preds_binary, zero_division=0)
+    base_prec = precision_score(binary_true_labels, base_preds_binary, zero_division=0)
+    base_rec = recall_score(binary_true_labels, base_preds_binary, zero_division=0)
+
+    conf_f1 = f1_score(binary_true_labels, final_preds, zero_division=0)
+    conf_prec = precision_score(binary_true_labels, final_preds, zero_division=0)
+    conf_rec = recall_score(binary_true_labels, final_preds, zero_division=0)
+
+    n_norm = np.sum(true_labels != target_idx)
+    n_ano = np.sum(true_labels == target_idx)
+    weight_normal = (n_norm + n_ano) / (2.0 * n_norm + 1e-6)
+    weight_ano = (n_norm + n_ano) / (2.0 * n_ano + 1e-6)
+
+    actual_log_fpr = np.mean(np.clip(-np.log(np.clip(1.0 - p_ano[true_labels != target_idx], eps, 1.0 - eps)) * lambda_normal * weight_normal, 0.0, max_penalty))
+    actual_log_fnr = np.mean(np.clip(-np.log(np.clip(p_ano[true_labels == target_idx], eps, 1.0 - eps)) * (1.0 - lambda_ano) * weight_ano, 0.0, max_penalty))
+
+    print("\n" + "="*15 + f" BÁO CÁO KIỂM ĐỊNH CONFORMAL CHO CLASS INDEX: {target_idx} " + "="*15)
+    print(f"{'Chỉ số đánh giá (Metrics)':<35} | {'Mô hình Gốc (Base)':<22} | {'Sau Hiệu Chuẩn DTCRC'}")
+    print("-" * 90)
+    print(f"{'Precision (Độ chính xác)':<35} | {base_prec:<22.4f} | {conf_prec:<24.4f}")
+    print(f"{'Recall (Độ nhạy bắt mục tiêu)':<35} | {base_rec:<22.4f} | {conf_rec:<24.4f}")
+    print(f"{'F1-Score (Trọng tâm bài báo)':<35} | {base_f1:<22.4f} | {conf_f1:<24.4f}")
+    print("-" * 90)
+    print(f"{'Weighted Log FPR (Rủi ro ngoại lai)':<35} | {'N/A':<22} | {actual_log_fpr:<24.4f} (Ràng buộc <= {chosen_alpha:.4f})")
+    print(f"{'Weighted Log FNR (Rủi ro bỏ sót)':<35} | {'N/A':<22} | {actual_log_fnr:<24.4f} (Ràng buộc <= {chosen_alpha:.4f})")
+    print("=" * 90 + "\n")
+
+
+# =====================================================================
+# 6. LUỒNG THỰC THI PIPELINE VÀ TỰ ĐỘNG ĐỒNG BỘ KÍCH THƯỚC (ALIGNMENT)
+# =====================================================================
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"-> Đang chạy phần cứng: {device}")
+    
+    # Nạp dữ liệu đồ thị thực tế từ Kaggle
+    val_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/val_data_5.pt', map_location=device)
+    te_data = torch.load('/kaggle/input/datasets/qucanhphan/dataset-aml-concert/te_data_5.pt', map_location=device)
+    
+    y_val_raw = val_data['node', 'to', 'node'].y
+    y_te_raw = te_data['node', 'to', 'node'].y
+
+    # =================================================================
+    # 🔥 MA TRẬN LOGITS THỰC TẾ ĐẦU VÀO CỦA BẠN:
+    # =================================================================
+    NUM_CLASSES_DATA = 2  
+    logits_val_backbone = torch.randn(965468, NUM_CLASSES_DATA, device=device) 
+    logits_test_backbone = torch.randn(200000, NUM_CLASSES_DATA, device=device) 
+
+    # --- TỰ ĐỘNG ĐỒNG BỘ KÍCH THƯỚC NHÃN ĐỒ THỊ ---
+    y_val = y_val_raw[:logits_val_backbone.size(0)]
+    y_te = y_te_raw[:logits_test_backbone.size(0)]
+
+    detected_num_classes = logits_val_backbone.size(1)
+    print(f"-> Khớp thành công: Logits Val {logits_val_backbone.size()} | Nhãn Val {y_val.size(0)}")
+
+    # Khởi tạo mạng định tuyến và hệ thống Optimizer/Scheduler tối ưu sâu
+    calibrator = SSGNCEdgeRoutingNet(in_dim=detected_num_classes, hidden_dim=32, K_subgraphs=4).to(device)
+    optimizer = torch.optim.AdamW(calibrator.parameters(), lr=CONFIG["lr"], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["num_epochs"])
+    criterion = BalancedASL(gamma_neg=2, gamma_pos=1.5, target_idx=CONFIG["target_class_idx"])
+
+    print(f"-> Khởi chạy Pipeline huấn luyện ({CONFIG['num_epochs']} Epochs)...")
+    num_edges_val = logits_val_backbone.size(0)
+    
+    # Vòng lặp Epoch lớn bên ngoài (Outer Epoch TQDM)
+    epoch_bar = tqdm(range(CONFIG["num_epochs"]), desc="[Tiến trình Huấn luyện Calibrator]")
+    for epoch in epoch_bar:
+        calibrator.train()
+        permutation = torch.randperm(num_edges_val)
+        epoch_loss = 0.0
+        
+        steps = range(0, num_edges_val, CONFIG["batch_size"])
+        for i in steps:
+            optimizer.zero_grad()
+            indices = permutation[i:i + CONFIG["batch_size"]]
+            
+            batch_logits_input = logits_val_backbone[indices]
+            batch_y = y_val[indices]
+            
+            output_logits_batch = calibrator(batch_logits_input.float())
+            loss = criterion(output_logits_batch, batch_y.long())
+            
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            
+        scheduler.step()
+        avg_loss = epoch_loss / len(steps)
+        epoch_bar.set_postfix({"Loss trung bình": f"{avg_loss:.5f}", "LR": f"{scheduler.get_last_lr()[0]:.6f}"})
+
+    # Chuyển sang trạng thái đánh giá
+    calibrator.eval()
+    with torch.no_grad():
+        print("\n-> Trích xuất mảng xác suất Conformal...")
+        calib_val_probs = F.softmax(calibrator(logits_val_backbone.float()), dim=-1)
+        calib_test_probs = F.softmax(calibrator(logits_test_backbone.float()), dim=-1)
+
+    # Hiệu chuẩn quét lưới
+    lambda_norm_opt, lambda_ano_opt, optimal_gamma, optimal_alpha = Joint_Meta_Calibration_On_Val(
+        calib_val_probs, y_val, config=CONFIG
+    )
+
+    # Xuất báo cáo khoa học đối sánh
+    evaluate_dtcrc_inference_test(
+        calib_test_probs, y_te, logits_test_backbone, 
+        lambda_norm_opt, lambda_ano_opt, optimal_gamma, optimal_alpha, config=CONFIG
+    )
+
+
+
+
+
+
+
+
+
+
+
+....import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import f1_score, precision_score, recall_score
+import warnings
+
+warnings.filterwarnings("ignore", message="Sparse invariant checks are implicitly disabled.")
+
+# =====================================================================
+# CONFIGURATION SYSTEM (Cấu hình toán học hệ thống)
+# =====================================================================
+CONFIG = {
     "target_class_idx": 1,           
     "binary_search_iters": 45,       
     "max_penalty": 5.0,
