@@ -1,6 +1,117 @@
 import torch
 import numpy as np
 
+def run_crc_sgad_fast(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05):
+    """
+    Hiện thực hóa CRC-SGAD chuẩn bài báo bằng toán tử VECTOR HOÁ.
+    Chạy siêu tốc, không dùng vòng lặp lồng nhau, xử lý vạn cạnh trong tích tắc.
+    """
+    # 1. Đưa về xác suất phẳng 1D lớp Bất thường (Class 1)
+    if logits_val.dim() == 2 and logits_val.shape[1] == 2:
+        probs_val = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+        probs_test = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+    else:
+        probs_val = torch.sigmoid(logits_val).detach().cpu().numpy().reshape(-1)
+        probs_test = torch.sigmoid(logits_test).detach().cpu().numpy().reshape(-1)
+
+    y_val = y_val_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+    y_test = y_te_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+
+    # 2. TÁCH BIỆT VÀ VECTOR HOÁ ĐỂ TÌM LAMBDA_0 VÀ LAMBDA_1 (KHÔNG VÒNG LẶP LỒNG)
+    # Tìm lam_0 kiểm soát FPR dựa trên các mẫu nhãn 0
+    probs_val_0 = probs_val[y_val == 0]
+    # Thua thiệt của lớp 0 là: 1 - I((1 - p) >= lam_0) = I(1 - p < lam_0) = I(p > 1 - lam_0)
+    # Sắp xếp để tìm phân vị (Quantile) trực tiếp
+    if len(probs_val_0) > 0:
+        # Cần tối thiểu hóa kích thước tập hợp, tức là làm lam_0 lớn nhất có thể thỏa mãn loss <= alpha_fpr
+        # Sắp xếp xác suất tăng dần, điểm cắt alpha_fpr nằm ở đuôi phía trên
+        probs_val_0_sorted = np.sort(probs_val_0)
+        idx_0 = int(np.floor(len(probs_val_0) * (1.0 - alpha_fpr)))
+        idx_0 = np.clip(idx_0, 0, len(probs_val_0) - 1)
+        best_lam0 = 1.0 - probs_val_0_sorted[idx_0]
+    else:
+        best_lam0 = 0.5
+
+    # Tìm lam_1 kiểm soát FNR dựa trên các mẫu nhãn 1
+    probs_val_1 = probs_val[y_val == 1]
+    # Thua thiệt của lớp 1 là: 1 - I(p >= lam_1) = I(p < lam_1)
+    if len(probs_val_1) > 0:
+        probs_val_1_sorted = np.sort(probs_val_1)
+        idx_1 = int(np.ceil(len(probs_val_1) * alpha_fnr))
+        idx_1 = np.clip(idx_1, 0, len(probs_val_1) - 1)
+        best_lam1 = probs_val_1_sorted[idx_1]
+    else:
+        best_lam1 = 0.5
+
+    print(f"--- HIỆU CHUẨN SIÊU TỐC (VECTORIZED CRC) ---")
+    print(f"-> lam_0 (Ngưỡng an toàn lớp Bình thường): {best_lam0:.4f}")
+    print(f"-> lam_1 (Ngưỡng an toàn lớp Bất thường): {best_lam1:.4f}")
+
+    # 3. ĐÁNH GIÁ TRÊN TẬP TEST BẰNG MA TRẬN SỐNG
+    # Xây dựng Prediction Sets dạng ma trận logic boolean để tăng tốc
+    # s_0 chứa 0 nếu (1 - p) >= lam_0 <=> p <= 1 - lam_0
+    include_0 = probs_test <= (1.0 - best_lam0)
+    # s_1 chứa 1 nếu p >= lam_1
+    include_1 = probs_test >= best_lam1
+    
+    # Tính toán rủi ro toán học thực tế trên tập Test
+    test_fpr_controlled = np.mean((y_test == 0) & (~include_0))
+    test_fnr_controlled = np.mean((y_test == 1) & (~include_1))
+    
+    # Tính kích thước tập hợp trung bình (Set Size)
+    # Mỗi hàng có kích thước = (đúng nếu chứa 0) + (đúng nếu chứa 1)
+    set_sizes = include_0.astype(int) + include_1.astype(int)
+    # Xử lý các tập hợp rỗng (nếu có) bằng cách ép chọn nhãn theo argmax 0.5
+    set_sizes = np.where(set_sizes == 0, 1, set_sizes)
+    avg_test_set_size = np.mean(set_sizes)
+
+    # 4. CHUYỂN ĐỔI VỀ NHÃN ĐƠN ĐỂ ĐO ĐẠC F1-SCORE
+    # Luật suy diễn nhãn đơn từ tập hợp của CRC-SGAD:
+    # Nếu chỉ chứa 1 -> đoán 1. Nếu chỉ chứa 0 -> đoán 0.
+    # Nếu chứa cả hai {0, 1} hoặc rỗng -> phân xử bằng ngưỡng 0.5 mặc định
+    final_preds = np.zeros_like(probs_test, dtype=int)
+    
+    # Trường hợp 1: Chỉ chứa nhãn 1 (include_1 là True và include_0 là False)
+    final_preds[include_1 & ~include_0] = 1
+    # Trường hợp 2: Chỉ chứa nhãn 0 (include_0 là True và include_1 là False)
+    final_preds[include_0 & ~include_1] = 0
+    # Trường hợp 3: Mơ hồ (chứa cả hai hoặc rỗng), dùng xác suất gốc so với 0.5
+    ambiguous_mask = (include_0 == include_1)
+    final_preds[ambiguous_mask] = (probs_test[ambiguous_mask] >= 0.5).astype(int)
+
+    # Tính F1-score
+    tp = np.sum((y_test == 1) & (final_preds == 1))
+    fp = np.sum((y_test == 0) & (final_preds == 1))
+    fn = np.sum((y_test == 1) & (final_preds == 0))
+    
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    test_f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    print(f"\n--- KẾT QUẢ ĐÁNH GIÁ (TỐC ĐỘ CAO) ---")
+    print(f" Ràng buộc đặt ra : FPR <= {alpha_fpr} | FNR <= {alpha_fnr}")
+    print(f" Thực tế tập Test: Test FPR = {test_fpr_controlled:.4f} | Test FNR = {test_fnr_controlled:.4f}")
+    print(f" Kích thước tập dự đoán trung bình: {avg_test_set_size:.4f}")
+    print(f" Điểm F1-Score cuối cùng thu được: {test_f1:.4f}")
+    print(f"=========================================================")
+    
+    return test_f1
+
+# Thử nghiệm ngay bằng cách gọi:
+# run_crc_sgad_fast(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05)
+
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
+
 def run_crc_sgad_framework(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05):
     """
     Hiện thực hóa thuật toán Dual-Threshold Conformal Risk Control từ bài báo CRC-SGAD.
