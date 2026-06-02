@@ -3,6 +3,223 @@ import numpy as np
 import scipy.sparse as sp
 from tqdm import tqdm
 
+def compute_chebyshev_basis_sparse(edge_index, x, max_order=3):
+    """
+    [SSGNC] Xấp xỉ bộ lọc Spectral bằng Đa thức Chebyshev (Eq. 14, 15, 16).
+    - Tự động xoay trục ma trận cạnh từ [num_edges, 2] sang [2, num_edges].
+    - Chạy trên ma trận thưa CSR để tối ưu hiệu năng.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    
+    x = x.reshape(-1, 1)
+    N = len(x)
+
+    # Tự động chuẩn hóa cấu trúc hình học của đồ thị
+    if isinstance(edge_index, torch.Tensor):
+        edge_index_np = edge_index.detach().cpu().numpy()
+    else:
+        edge_index_np = np.array(edge_index)
+
+    if edge_index_np.shape[1] == 2 and edge_index_np.shape[0] != 2:
+        edge_index_np = edge_index_np.T
+
+    row = edge_index_np[0]
+    col = edge_index_np[1]
+    
+    # Lọc bỏ các chỉ số lỗi vượt biên kích thước
+    valid_edges = (row < N) & (col < N)
+    row = row[valid_edges]
+    col = col[valid_edges]
+    data = np.ones_like(row)
+    
+    # Xây dựng ma trận kề thưa
+    A = sp.coo_matrix((data, (row, col)), shape=(N, N)).tocsr()
+    
+    # Tính Normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
+    d = np.array(A.sum(axis=1)).flatten()
+    d_inv_sqrt = np.power(d, -0.5, where=d>0)
+    d_inv_sqrt[d == 0] = 0.0
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    I = sp.eye(N)
+    L_normalized = (I - D_inv_sqrt @ A @ D_inv_sqrt).tocsr()
+    
+    # Lan truyền đa thức Chebyshev tuyến tính
+    T = []
+    T.append(x) # T_0
+    
+    if max_order >= 1:
+        T.append(L_normalized.dot(x)) # T_1
+        
+    for m in range(2, max_order + 1):
+        T_m = 2 * L_normalized.dot(T[-1]) - T[-2]
+        T.append(T_m)
+        
+    structural_context = np.concatenate(T, axis=1)
+    return np.mean(structural_context, axis=1)
+
+
+def compute_refined_probs(logits, margin_threshold=0.15):
+    """
+    TÍNH LẠI PROBS RAW THEO TƯ DUY 2 CỘT + LOẠI BỎ NÚT MẬP MỜ
+    - Tính tỷ lệ lấn lướt tương đối giữa cột 1 (Anomaly) và cột 0 (Normal).
+    - Nếu khoảng cách tự tin giữa 2 lớp nhỏ hơn margin_threshold, 
+      nút đó bị coi là mập mờ và ép thẳng về mốc trung hòa 0.5 để bộ lọc CRC loại bỏ.
+    """
+    if isinstance(logits, torch.Tensor):
+        logits = logits.detach().cpu().numpy()
+    
+    # Trích xuất 2 giá trị độc lập của từng dòng
+    p0 = logits[:, 0]  # Đại diện cho lớp 0
+    p1 = logits[:, 1]  # Đại diện cho lớp 1
+    
+    # Tính tỷ lệ tương đối đối trọng lẫn nhau (không mù quáng bỏ qua cột 0)
+    probs_relative = p1 / (p0 + p1 + 1e-8)
+    
+    # Tạo mặt nạ lọc các nút ba phải, không chắc chắn
+    ambiguous_mask = np.abs(p1 - p0) < margin_threshold
+    
+    # Ép các nút mập mờ này về mốc ranh giới 0.5
+    probs_refined = np.copy(probs_relative)
+    probs_refined[ambiguous_mask] = 0.5
+    
+    return probs_refined
+
+
+def run_dtcrc_refined_pipeline(logits_val, y_val, logits_test, y_test, 
+                               edge_index_val, edge_index_test, 
+                               alpha=0.10, margin_threshold=0.15, max_order=3):
+    """
+    PIPELINE ĐẦY ĐỦ (FULL FIXED PIPELINE)
+    - Nhận đầu vào logits 2 cột.
+    - Tính toán lại xác suất loại bỏ nhiễu mập mờ.
+    - Chạy bộ hiệu chuẩn chuẩn toán học Paper (Eq. 8, 9).
+    - Trả ra nhãn cứng và đánh giá chính xác.
+    """
+    print("\n=========================================================")
+    print("      KHỞI CHẠY PIPELINE HIỆU CHUẨN ĐẶC TRỊ 2 CỘT LOGITS ")
+    print("=========================================================")
+
+    # 1. Tính toán lại phân phối xác suất thô từ cấu trúc 2 cột
+    probs_val_raw = compute_refined_probs(logits_val, margin_threshold=margin_threshold)
+    probs_test_raw = compute_refined_probs(logits_test, margin_threshold=margin_threshold)
+
+    y_val = y_val.detach().cpu().numpy().astype(int).reshape(-1) if isinstance(y_val, torch.Tensor) else np.array(y_val)
+    y_test = y_test.detach().cpu().numpy().astype(int).reshape(-1) if isinstance(y_test, torch.Tensor) else np.array(y_test)
+
+    # 2. Hiệu chuẩn phổ cấu trúc đồ thị (SSGNC - Eq. 18)
+    structural_val = compute_chebyshev_basis_sparse(edge_index_val, probs_val_raw, max_order=max_order)
+    structural_test = compute_chebyshev_basis_sparse(edge_index_test, probs_test_raw, max_order=max_order)
+
+    # Làm mượt phân phối thích ứng
+    probs_val_smooth = 0.85 * probs_val_raw + 0.15 * structural_val
+    probs_test_smooth = 0.85 * probs_test_raw + 0.15 * structural_test
+
+    # 3. Học song song cặp ngưỡng độc lập (DTCRC - Eq. 8 & Eq. 9)
+    lambdas = np.linspace(0.001, 0.999, 1000)
+    
+    probs_val_norm = probs_val_smooth[y_val == 0]
+    probs_val_ano = probs_val_smooth[y_val == 1]
+    
+    n_norm = len(probs_val_norm)
+    n_ano = len(probs_val_ano)
+
+    # Đo lường rủi ro thực nghiệm thực tế (Eq. 5 & Eq. 6)
+    loss_fpr = np.mean(probs_val_norm[:, None] > (1.0 - lambdas[None, :]), axis=0) if n_norm > 0 else np.zeros_like(lambdas)
+    loss_fnr = np.mean(probs_val_ano[:, None] < lambdas[None, :], axis=0) if n_ano > 0 else np.zeros_like(lambdas)
+
+    # Trần rủi ro toán học bảo thủ của Paper
+    bound_norm = alpha - (1.0 - alpha) / n_norm
+    bound_ano = alpha - (1.0 - alpha) / n_ano
+
+    valid_norm_idx = np.where(loss_fpr <= bound_norm)[0]
+    valid_ano_idx = np.where(loss_fnr <= bound_ano)[0]
+
+    # Tìm ngưỡng lambda tối ưu, phòng vệ biên nếu tập nghiệm trống
+    lambda_norm = lambdas[valid_norm_idx[-1]] if len(valid_norm_idx) > 0 else lambdas[np.argmin(loss_fpr)]
+    lambda_ano = lambdas[valid_ano_idx[0]] if len(valid_ano_idx) > 0 else lambdas[np.argmin(loss_fnr)]
+
+    print(f"\n[KẾT QUẢ ĐO NGƯỠNG ĐỒNG THỜI]")
+    print(f"  * Ngưỡng lambda_norm chặn sạch FP : {lambda_norm:.4f}")
+    print(f"  * Ngưỡng lambda_ano chặn sót FN   : {lambda_ano:.4f}")
+
+    # 4. Thiết lập tập dự đoán giao thoa (Intersection) để sinh nhãn cứng
+    include_0 = probs_test_smooth <= (1.0 - lambda_norm)
+    include_1 = probs_test_smooth >= lambda_ano
+
+    # Mặc định gán nhãn -1: Đại diện cho các nút KHÔNG CHẮC CHẮN / BỊ LOẠI BỎ
+    final_preds = np.full_like(probs_test_smooth, fill_value=-1, dtype=int)
+    
+    # Chỉ ghi nhận nhãn khi toán học chứng minh độ tự tin tuyệt đối thuộc về 1 lớp đơn lẻ
+    final_preds[include_1 & ~include_0] = 1  # Chắc chắn là Tội phạm
+    final_preds[include_0 & ~include_1] = 0  # Chắc chắn là Sạch
+
+    # 5. Phân xử vùng tranh chấp (Chỉ áp dụng với những nút mập mờ còn sót lại)
+    ambiguous_mask = (final_preds == -1)
+    ambiguous_indices = np.where(ambiguous_mask)[0]
+    
+    if len(ambiguous_indices) > 0:
+        confidence_val = np.abs(probs_val_smooth - 0.5)
+        tau = np.percentile(confidence_val, (1.0 - alpha) * 100)
+        confidence_test = np.abs(probs_test_smooth - 0.5)
+        
+        for idx in ambiguous_indices:
+            # Nếu độ tự tin vượt bộ lọc phân vị tau thì mới bẻ gãy tranh chấp, 
+            # còn nếu vẫn nằm dưới tau -> Giữ nguyên nhãn -1 (Bỏ qua hoàn toàn)
+            if confidence_test[idx] > tau:
+                final_preds[idx] = 1 if probs_test_smooth[idx] >= 0.5 else 0
+
+    # 6. Thống kê và kết xuất báo cáo hiệu năng thực nghiệm
+    num_ignored = np.sum(final_preds == -1)
+    total_nodes = len(final_preds)
+    print(f"\n[THỐNG KÊ MÀNG LỌC TIN CẬY]")
+    print(f"  * Số nút chắc chắn giữ lại: {total_nodes - num_ignored}/{total_nodes}")
+    print(f"  * Số nút mập mờ bị LOẠI BỎ hoàn toàn (Nhãn -1): {num_ignored} ({(num_ignored/total_nodes)*100:.2f}%)")
+
+    # Đánh giá ma trận nhầm lẫn đối chiếu (Chỉ tính trên các nút mô hình CHẮC CHẮN)
+    base_preds = (probs_test_raw >= 0.5).astype(int)
+    
+    def calculate_metrics(preds, labels):
+        # Lọc mặt nạ để bỏ qua các phần tử có nhãn dự đoán bằng -1
+        valid = preds != -1
+        if np.sum(valid) == 0: return 0.0, 0.0, 0.0
+        p, l = preds[valid], labels[valid]
+        
+        tp = np.sum((l == 1) & (p == 1))
+        fp = np.sum((l == 0) & (p == 1))
+        fn = np.sum((l == 1) & (p == 0))
+        
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        return f1, prec, rec
+
+    base_f1, base_prec, base_rec = calculate_metrics(base_preds, y_test)
+    test_f1, test_prec, test_rec = calculate_metrics(final_preds, y_test)
+
+    print(f"=========================================================")
+    print(f" MÔ HÌNH GNN GỐC (q = 0.5)       -> F1: {base_f1:.4f} | Precision: {base_prec:.4f} | Recall: {base_rec:.4f}")
+    print(f" BỘ HIỆU CHUẨN SỬA ĐỔI (Fixed)    -> F1: {test_f1:.4f} | Precision: {test_prec:.4f} | Recall: {test_rec:.4f}")
+    print("=========================================================\n")
+    
+    return final_preds
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
+import scipy.sparse as sp
+from tqdm import tqdm
+
 def compute_chebyshev_basis_no_num_nodes(edge_index, x, max_order=3):
     """
     Tự động tính toán số lượng nút dựa trên len(x) để tránh lệch kích thước (Dimension Mismatch).
