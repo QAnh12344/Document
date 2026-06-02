@@ -1,5 +1,176 @@
 import torch
 import numpy as np
+from tqdm import tqdm
+
+def adaptive_graph_smoothing_tqdm(probs, edge_index, num_nodes):
+    """
+    Bước 1: Làm mượt cấu trúc dựa trên Bậc nút (Local Node Degree).
+    Khử nhiễu phân phối lệch pha và kiểm soát hiện tượng bùng nổ False Positive.
+    """
+    row, col = edge_index.detach().cpu().numpy()
+    num_edges = len(probs)
+    
+    node_degree = np.zeros(num_nodes)
+    node_anomaly_score = np.zeros(num_nodes)
+    
+    # Vòng lặp 1: Thống kê thông tin cấu trúc đồ thị cục bộ
+    for i in tqdm(range(num_edges), desc="[1/3] Đang tính bậc nút đồ thị"):
+        u, v = row[i], col[i]
+        node_degree[u] += 1
+        node_degree[v] += 1
+        node_anomaly_score[u] += probs[i]
+        node_anomaly_score[v] += probs[i]
+        
+    node_degree_safe = np.where(node_degree == 0, 1, node_degree)
+    node_average_anomaly = node_anomaly_score / node_degree_safe
+    
+    adaptive_probs = np.zeros(num_edges)
+    
+    # Vòng lặp 2: Tính toán xác suất thích ứng cho từng cạnh
+    for i in tqdm(range(num_edges), desc="[2/3] Làm mượt xác suất cấu trúc"):
+        u, v = row[i], col[i]
+        
+        # Trọng số hình học (Geometric Mean Degree Weight)
+        edge_weight = 1.0 / np.sqrt(node_degree_safe[u] * node_degree_safe[v])
+        alpha_dynamic = np.clip(edge_weight, 0.01, 0.5)
+        
+        neighbor_context = (node_average_anomaly[u] + node_average_anomaly[v]) / 2
+        adaptive_probs[i] = (1 - alpha_dynamic) * probs[i] + alpha_dynamic * neighbor_context
+        
+    return adaptive_probs
+
+
+def run_full_crc_sgad_pipeline(logits_val, y_val, logits_test, y_test, 
+                               edge_index_val, edge_index_test, num_nodes, 
+                               alpha_fpr=0.05, alpha_fnr=0.05):
+    """
+    FRAMEWORK CRC-SGAD HOÀN CHỈNH (HẬU XỬ LÝ ĐỒ THỊ THÍCH ỨNG)
+    =========================================================
+    Đầu vào:
+        - logits_val, logits_test: Tensor PyTorch đầu ra của mô hình GNN.
+        - y_val, y_test: Tensor PyTorch nhãn thực tế (0 hoặc 1).
+        - edge_index_val, edge_index_test: Tensor chỉ số cạnh đồ thị PyG (torch_geometric).
+        - num_nodes: Tổng số nút trên đồ thị (int).
+        - alpha_fpr: Giới hạn rủi ro báo động nhầm tối đa cho phép.
+        - alpha_fnr: Giới hạn rủi ro bỏ sót tội phạm tối đa cho phép.
+    """
+    print("\n=========================================================")
+    print("   KHỞI CHẠY FRAMEWORK CRC-SGAD CẤU TRÚC THÍCH ỨNG (HYBRID) ")
+    print("=========================================================")
+
+    # 1. Đồng bộ và tiền xử lý dữ liệu từ PyTorch sang NumPy phẳng
+    if logits_val.dim() == 2 and logits_val.shape[1] == 2:
+        probs_val_raw = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+        probs_test_raw = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+    else:
+        probs_val_raw = torch.sigmoid(logits_val).detach().cpu().numpy().reshape(-1)
+        probs_test_raw = torch.sigmoid(logits_test).detach().cpu().numpy().reshape(-1)
+
+    y_val = y_val.detach().cpu().numpy().astype(int).reshape(-1)
+    y_test = y_test.detach().cpu().numpy().astype(int).reshape(-1)
+
+    # 2. Thực hiện làm mượt đồ thị thích ứng để hiệu chuẩn phân phối
+    print("\n[BƯỚC 1] HIỆU CHUẨN XÁC SUẤT TRÊN TẬP VALIDATION...")
+    probs_val = adaptive_graph_smoothing_tqdm(probs_val_raw, edge_index_val, num_nodes)
+    
+    print("\n[BƯỚC 2] HIỆU CHUẨN XÁC SUẤT TRÊN TẬP TEST...")
+    probs_test = adaptive_graph_smoothing_tqdm(probs_test_raw, edge_index_test, num_nodes)
+
+    # 3. Quét tìm Ngưỡng kép an toàn trên tập Validation (Calibration)
+    print("\n[BƯỚC 3] ĐANG TOÁN HÓA VÀ HỌC NGƯỠNG KÉP (CONFORMAL TUNING)...")
+    lambdas = np.linspace(0.001, 0.999, 1000)
+    
+    probs_val_0 = probs_val[y_val == 0]
+    probs_val_1 = probs_val[y_val == 1]
+    
+    # Vector hóa song song ma trận tăng tốc độ tìm kiếm
+    loss_fpr_array = np.mean(probs_val_0[:, None] > (1.0 - lambdas[None, :]), axis=0) if len(probs_val_0) > 0 else np.zeros_like(lambdas)
+    loss_fnr_array = np.mean(probs_val_1[:, None] < lambdas[None, :], axis=0) if len(probs_val_1) > 0 else np.zeros_like(lambdas)
+
+    valid_lam0_indices = np.where(loss_fpr_array <= alpha_fpr)[0]
+    valid_lam1_indices = np.where(loss_fnr_array <= alpha_fnr)[0]
+    
+    # Trích xuất cặp ranh giới tối ưu
+    best_lam0 = lambdas[valid_lam0_indices[-1]] if len(valid_lam0_indices) > 0 else 0.5
+    best_lam1 = lambdas[valid_lam1_indices[0]] if len(valid_lam1_indices) > 0 else 0.5
+
+    print(f"  * Ngưỡng chặn FP học được (lam_0): {best_lam0:.4f}")
+    print(f"  * Ngưỡng chặn FN học được (lam_1): {best_lam1:.4f}")
+
+    # 4. Áp dụng sang tập Test để dựng không gian bao phủ (Prediction Sets)
+    include_0 = probs_test <= (1.0 - best_lam0)
+    include_1 = probs_test >= best_lam1
+
+    final_preds = np.zeros_like(probs_test, dtype=int)
+    final_preds[include_1 & ~include_0] = 1  # Chắc chắn Bất thường
+    final_preds[include_0 & ~include_1] = 0  # Chắc chắn Bình thường
+    
+    # 5. Phân xử vùng tranh chấp ngặt nghèo ({0, 1} hoặc tập rỗng)
+    ambiguous_mask = (include_0 == include_1)
+    ambiguous_indices = np.where(ambiguous_mask)[0]
+    
+    if len(ambiguous_indices) > 0:
+        confidence_val = np.abs(probs_val - 0.5)
+        confidence_test = np.abs(probs_test - 0.5)
+        
+        # Ngưỡng tự tin động = Trung vị độ lệch xác suất của tập Validation
+        dynamic_trust_threshold = np.median(confidence_val)
+        
+        # Dùng tqdm để hiển thị tiến trình phân xử vùng tranh chấp
+        for idx in tqdm(ambiguous_indices, desc="[3/3] Đang phân xử vùng tranh chấp"):
+            if confidence_test[idx] > dynamic_trust_threshold:
+                final_preds[idx] = 1 if probs_test[idx] >= 0.5 else 0
+            else:
+                # Nếu độ tự tin dưới trung vị, ưu tiên nhãn mô hình sau làm mượt
+                final_preds[idx] = 1 if probs_test[idx] >= 0.5 else 0
+
+    # 6. Định lượng và in kết quả so sánh ma trận nhầm lẫn
+    base_preds = (probs_test_raw >= 0.5).astype(int)
+    
+    def calculate_metrics(preds, labels):
+        tp = np.sum((labels == 1) & (preds == 1))
+        fp = np.sum((labels == 0) & (preds == 1))
+        fn = np.sum((labels == 1) & (preds == 0))
+        
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        return f1, prec, rec, fp, fn
+
+    base_f1, base_prec, base_rec, base_fp, base_fn = calculate_metrics(base_preds, y_test)
+    test_f1, test_prec, test_rec, test_fp, test_fn = calculate_metrics(final_preds, y_test)
+
+    print(f"\n=========================================================")
+    print(f"             BẢO CÁO KẾT QUẢ THỰC NGHIỆM                  ")
+    print(f"=========================================================")
+    print(f" MÔ HÌNH GỐC (Ngưỡng cắt cứng q = 0.5):")
+    print(f"   -> F1-Score: {base_f1:.4f} | Precision: {base_prec:.4f} | Recall: {base_rec:.4f}")
+    print(f"   -> Lỗi chi tiết: [Báo động nhầm FP: {base_fp}] | [Bỏ sót FN: {base_fn}]")
+    print(f"---------------------------------------------------------")
+    print(f" HẬU XỬ LÝ CRC-SGAD THÍCH ỨNG ĐỒ THỊ:")
+    print(f"   -> F1-Score: {test_f1:.4f} | Precision: {test_prec:.4f} | Recall: {test_rec:.4f}")
+    print(f"   -> Lỗi chi tiết: [Báo động nhầm FP: {test_fp}] | [Bỏ sót FN: {test_fn}]")
+    print(f"=========================================================\n")
+    
+    return test_f1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
 
 def run_crc_sgad_optimized(logits_val, y_val, logits_test, y_test, alpha_fpr=0.15, alpha_fnr=0.02):
     """
