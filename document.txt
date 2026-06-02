@@ -3,6 +3,190 @@ import numpy as np
 import scipy.sparse as sp
 from tqdm import tqdm
 
+def compute_chebyshev_basis_no_num_nodes(edge_index, x, max_order=3):
+    """
+    Tự động tính toán số lượng nút dựa trên len(x) để tránh lệch kích thước (Dimension Mismatch).
+    Sử dụng Ma trận thưa để tối ưu hóa hiệu năng, chạy cực nhẹ.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    
+    # Ép phẳng và đưa về dạng ma trận cột (N, 1) chuẩn toán học
+    x = x.reshape(-1, 1)
+    N = len(x) # Tự động xác định số lượng thực thể (num_nodes)
+
+    # 1. Trích xuất danh sách cạnh và lọc bỏ các chỉ số vượt quá phạm vi của x
+    row, col = edge_index.detach().cpu().numpy()
+    
+    # Kỹ thuật phòng vệ: Loại bỏ các cạnh trỏ đến nút nằm ngoài kích thước của x (nếu có)
+    valid_edges = (row < N) & (col < N)
+    row = row[valid_edges]
+    col = col[valid_edges]
+    
+    data = np.ones_like(row)
+    
+    # 2. Xây dựng ma trận kề thưa với kích thước tự động (N, N)
+    A = sp.coo_matrix((data, (row, col)), shape=(N, N))
+    A = A.tocsr()
+    
+    # Tính bậc nút (Degree)
+    d = np.array(A.sum(axis=1)).flatten()
+    d_inv_sqrt = np.power(d, -0.5, where=d>0)
+    d_inv_sqrt[d == 0] = 0.0
+    
+    # Tạo ma trận đường chéo thưa D^{-1/2}
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    
+    # Tính toán Normalized Laplacian: L = I - D^{-1/2} A D^{-1/2} (Eq. 14, 15, 16)
+    I = sp.eye(N)
+    L_normalized = I - D_inv_sqrt @ A @ D_inv_sqrt
+    L_normalized = L_normalized.tocsr() # CSR giúp tăng tốc phép nhân ma trận cột
+    
+    # 3. Lan truyền đa thức Chebyshev
+    T = []
+    # T_0(L) X = X (Eq. 14 của Paper)
+    T.append(x)
+    
+    if max_order >= 1:
+        # T_1(L) X = L X (Eq. 15 của Paper)
+        T.append(L_normalized.dot(x))
+        
+    # Chạy các bậc cao hơn với tqdm theo dõi tiến độ
+    for m in tqdm(range(2, max_order + 1), desc="   [SSGNC] Lan truyền Chebyshev Spectral"):
+        # T_m = 2 * L * T[-1] - T[-2] (Eq. 16 của Paper)
+        T_m = 2 * L_normalized.dot(T[-1]) - T[-2]
+        T.append(T_m)
+        
+    # Kết hợp các tầng đặc trưng cấu trúc (Hierarchical Aggregation - Eq. 21)
+    structural_context = np.concatenate(T, axis=1)
+    return np.mean(structural_context, axis=1)
+
+
+def run_dtcrc_ssgnc_no_nodes(logits_val, y_val, logits_test, y_test, 
+                             edge_index_val, edge_index_test, 
+                             alpha_fpr=0.05, alpha_fnr=0.05, max_order=3):
+    """
+    FRAMEWORK DTCRC + SSGNC HOÀN CHỈNH (KHÔNG CẦN TRUYỀN NUM_NODES)
+    """
+    print("\n=========================================================")
+    print("   KHỞI CHẠY FRAMEWORK DTCRC + SPECTRAL CALIBRATOR       ")
+    print("=========================================================")
+
+    # 1. Đồng bộ hóa xác suất đầu ra của GNN
+    if logits_val.dim() == 2 and logits_val.shape[1] == 2:
+        probs_val_raw = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+        probs_test_raw = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+    else:
+        probs_val_raw = torch.sigmoid(logits_val).detach().cpu().numpy().reshape(-1)
+        probs_test_raw = torch.sigmoid(logits_test).detach().cpu().numpy().reshape(-1)
+
+    y_val = y_val.detach().cpu().numpy().astype(int).reshape(-1)
+    y_test = y_test.detach().cpu().numpy().astype(int).reshape(-1)
+
+    # 2. Hiệu chuẩn phổ đồ thị (SSGNC) - Tự động nhận diện kích thước qua phân phối xác suất
+    print("\n[BƯỚC 1] HIỆU CHUẨN TRÊN TẬP VALIDATION:")
+    structural_val = compute_chebyshev_basis_no_num_nodes(edge_index_val, probs_val_raw, max_order=max_order)
+    
+    print("\n[BƯỚC 2] HIỆU CHUẨN TRÊN TẬP TEST:")
+    structural_test = compute_chebyshev_basis_no_num_nodes(edge_index_test, probs_test_raw, max_order=max_order)
+
+    # Hàm làm mượt thích ứng kết hợp ngữ cảnh lân cận đa tần (Eq. 18)
+    probs_val_smooth = 0.6 * probs_val_raw + 0.4 * structural_val
+    probs_test_smooth = 0.6 * probs_test_raw + 0.4 * structural_test
+
+    # 3. Tìm kiếm nhị phân cặp ngưỡng kép DTCRC trên tập Validation (Eq. 8, Eq. 9)
+    print("\n[BƯỚC 3] ĐANG QUÉT TÌM NGƯỠNG KÉP DTCRC...")
+    lambdas = np.linspace(0.001, 0.999, 1000)
+    
+    probs_val_norm = probs_val_smooth[y_val == 0]
+    probs_val_ano = probs_val_smooth[y_val == 1]
+    
+    n_norm = len(probs_val_norm)
+    n_ano = len(probs_val_ano)
+
+    # Tính toán tổn thất rủi ro song song hóa vector theo đúng định nghĩa hàm chỉ thị (Eq. 5 & Eq. 6)
+    loss_fpr = np.mean(probs_val_norm[:, None] > (1.0 - lambdas[None, :]), axis=0) if n_norm > 0 else np.zeros_like(lambdas)
+    loss_fnr = np.mean(probs_val_ano[:, None] < lambdas[None, :], axis=0) if n_ano > 0 else np.zeros_like(lambdas)
+
+    # Tính toán lằn ranh ngưỡng kiểm chuẩn thống cai trị lỗi (Eq. 8 & Eq. 9)
+    valid_norm_idx = np.where(loss_fpr <= alpha_fpr - (1.0 - alpha_fpr)/n_norm)[0] if n_norm > 0 else []
+    valid_ano_idx = np.where(loss_fnr <= alpha_fnr - (1.0 - alpha_fnr)/n_ano)[0] if n_ano > 0 else []
+
+    lambda_norm = lambdas[valid_norm_idx[-1]] if len(valid_norm_idx) > 0 else 0.5
+    lambda_ano = lambdas[valid_ano_idx[0]] if len(valid_ano_idx) > 0 else 0.5
+
+    print(f"  * Ngưỡng lambda_norm học được : {lambda_norm:.4f}")
+    print(f"  * Ngưỡng lambda_ano học được  : {lambda_ano:.4f}")
+
+    # 4. Áp dụng xây dựng tập dự đoán giao thoa (Intersection) để kiểm soát lỗi đồng thời
+    include_0 = probs_test_smooth <= (1.0 - lambda_norm)
+    include_1 = probs_test_smooth >= lambda_ano
+
+    final_preds = np.zeros_like(probs_test_smooth, dtype=int)
+    final_preds[include_1 & ~include_0] = 1  # Chắc chắn Bất thường
+    final_preds[include_0 & ~include_1] = 0  # Chắc chắn Bình thường
+
+    # 5. Phân xử vùng tranh chấp ngặt nghèo (Tập rỗng hoặc đôi nhãn)
+    ambiguous_mask = (include_0 == include_1)
+    ambiguous_indices = np.where(ambiguous_mask)[0]
+    
+    if len(ambiguous_indices) > 0:
+        confidence_val = np.abs(probs_val_smooth - 0.5)
+        # Thiết lập màng lọc phân vị tự tin động (Quantile Criterion theo Sec IV-B-3)
+        tau = np.percentile(confidence_val, (1.0 - alpha_fnr) * 100)
+        
+        confidence_test = np.abs(probs_test_smooth - 0.5)
+        
+        for idx in tqdm(ambiguous_indices, desc="\n[BƯỚC 4] Phân xử vùng tranh chấp"):
+            if confidence_test[idx] > tau:
+                final_preds[idx] = 1 if probs_test_smooth[idx] >= 0.5 else 0
+            else:
+                # Kỹ thuật giải cứu Recall đặc trị khi GNN bị lỗi FN cao
+                final_preds[idx] = 1 if probs_test_raw[idx] >= 0.35 else 0
+
+    # 6. Đánh giá và xuất báo cáo ma trận nhầm lẫn
+    base_preds = (probs_test_raw >= 0.5).astype(int)
+    
+    def calculate_metrics(preds, labels):
+        tp = np.sum((labels == 1) & (preds == 1))
+        fp = np.sum((labels == 0) & (preds == 1))
+        fn = np.sum((labels == 1) & (preds == 0))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        return f1, prec, rec, fp, fn
+
+    base_f1, base_prec, base_rec, base_fp, base_fn = calculate_metrics(base_preds, y_test)
+    test_f1, test_prec, test_rec, test_fp, test_fn = calculate_metrics(final_preds, y_test)
+
+    print(f"\n=========================================================")
+    print(f"             BÁO CÁO KẾT QUẢ THỰC NGHIỆM ĐỐI CHIẾU        ")
+    print(f"=========================================================")
+    print(f" MÔ HÌNH GNN GỐC (Ngưỡng cắt cứng q = 0.5):")
+    print(f"   -> F1: {base_f1:.4f} | Precision: {base_prec:.4f} | Recall: {base_rec:.4f} | [FN: {base_fn}]")
+    print(f"---------------------------------------------------------")
+    print(f" CONFIG DTCRC + SSGNC (Chuẩn Công Thức Paper):")
+    print(f"   -> F1: {test_f1:.4f} | Precision: {test_prec:.4f} | Recall: {test_rec:.4f} | [FN: {test_fn}]")
+    print(f"=========================================================\n")
+    
+    return test_f1
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
+import scipy.sparse as sp
+from tqdm import tqdm
+
 def compute_chebyshev_basis_sparse(edge_index, num_nodes, x, max_order=3):
     """
     Xấp xỉ bộ lọc Spectral bằng Đa thức Chebyshev (Eq. 14, 15, 16).
