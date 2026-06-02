@@ -1,3 +1,90 @@
+import torch
+import torch.nn.functional as F
+
+# ==========================================
+# 1. CHUẨN BỊ DỮ LIỆU ĐẦU VÀO (PYTORCH TENSOR)
+# ==========================================
+# Code tự động nhận diện thiết bị (Cuda/CPU) từ tensor của bạn
+device = logits_val.device
+
+# Chuyển đổi Logits của cạnh thành Xác suất (Sigmoid)
+probs_val = torch.sigmoid(logits_val)
+probs_test = torch.sigmoid(logits_test)
+
+# Đảm bảo nhãn ở dạng Long hoặc Float Tensor phù hợp để so sánh
+y_val = y_val_filtered.to(device).long()
+y_test = y_te_filtered.to(device).long()
+
+# Cấu hình các mức FPR tối đa bạn muốn kiểm soát (ví dụ: FPR <= 1%, 5%, 10%,...)
+alpha_levels = [0.01, 0.05, 0.10, 0.15, 0.20]
+
+# ==========================================
+# 2. CÁC HÀM ĐÁNH GIÁ VÀ TÍNH RỦI RO (FPR, F1)
+# ==========================================
+def compute_fpr_and_f1(probs, labels, q):
+    """
+    Tính toán FPR, Precision, Recall và F1-score dựa trên ngưỡng xác suất q.
+    Cạnh có xác suất >= q sẽ được dự đoán là Bất thường (Lớp 1).
+    """
+    # Dự đoán nhị phân dựa trên ngưỡng q (trả về kiểu int/long thay vì bool)
+    preds = (probs >= q).long()
+    
+    # Tính các thành phần của Confusion Matrix trên tập cạnh
+    tp = torch.sum((labels == 1) & (preds == 1)).item()
+    fp = torch.sum((labels == 0) & (preds == 1)).item()
+    fn = torch.sum((labels == 1) & (preds == 0)).item()
+    tn = torch.sum((labels == 0) & (preds == 0)).item()
+    
+    # 1. Tính False Positive Rate (FPR)
+    total_normal = fp + tn
+    fpr = fp / total_normal if total_normal > 0 else 0.0
+    
+    # 2. Tính Precision, Recall và F1-score để xem mức độ cải thiện
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return fpr, f1, precision, recall
+
+# ==========================================
+# 3. QUÈT TÌM NGƯỠNG ĐỘNG (CRC) VÀ KIỂM TRA
+# ==========================================
+print(f"{'Alpha (Max FPR)':<16}{'Threshold (q)':<15}{'Test FPR':<12}{'Test F1':<12}{'Test Precision':<16}{'Test Recall':<12}")
+print("-" * 85)
+
+# Tạo lưới quét mịn gồm 2000 bước từ 0.0 đến 1.0 trên cùng device
+q_grid = torch.linspace(0.0, 1.0, 2000, device=device)
+
+for alpha in alpha_levels:
+    q_hat = 1.0  # Mặc định ban đầu ở mức an toàn cao nhất (ngưỡng chặt nhất)
+    
+    # Bước CRC: Tìm ngưỡng q nhỏ nhất trên tập Validation sao cho FPR <= alpha
+    for q in q_grid:
+        q_val = q.item()
+        val_fpr, _, _, _ = compute_fpr_and_f1(probs_val, y_val, q_val)
+        
+        if val_fpr <= alpha:
+            q_hat = q_val
+            break
+            
+    # Áp dụng ngưỡng q_hat tối ưu vừa tìm được lên tập Test để đo đạc hiệu năng thực tế
+    test_fpr, test_f1, test_prec, test_rec = compute_fpr_and_f1(probs_test, y_test, q_hat)
+    
+    # In kết quả theo hàng cho bảng thí nghiệm của bài báo
+    print(f"{alpha:<16.2f}{q_hat:<15.4f}{test_fpr:<12.4f}{test_f1:<12.4f}{test_prec:<16.4f}{test_rec:<12.4f}")
+
+print("-" * 85)
+print("Thí nghiệm hoàn tất thành công trên PyTorch Tensors!")
+
+
+
+
+
+
+
+
+
+
 import numpy as np
 from scipy.special import expit
 
