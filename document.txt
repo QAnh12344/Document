@@ -1,4 +1,86 @@
 import torch
+import numpy as np
+
+# ==========================================
+# 1. CHUYỂN ĐỔI TENSOR SANG NUMPY NGAY TỪ ĐẦU
+# ==========================================
+# Đảm bảo lấy đúng giá trị xác suất và đưa về mảng NumPy chuẩn
+probs_val = torch.sigmoid(logits_val).detach().cpu().numpy()
+probs_test = torch.sigmoid(logits_test).detach().cpu().numpy()
+
+y_val = y_val_filtered.detach().cpu().numpy().astype(int)
+y_test = y_te_filtered.detach().cpu().numpy().astype(int)
+
+# Cấu hình các mức FPR tối đa bạn muốn kiểm soát
+alpha_levels = [0.01, 0.05, 0.10, 0.15, 0.20]
+
+# ==========================================
+# 2. HÀM ĐÁNH GIÁ VÀ TÍNH RỦI RO (FPR, F1) BẰNG NUMPY
+# ==========================================
+def compute_fpr_and_f1_numpy(probs, labels, q):
+    """
+    Tính toán các chỉ số bằng NumPy để đảm bảo tính chính xác tuyệt đối.
+    """
+    # Cạnh có xác suất >= q thì dự đoán là Bất thường (1), ngược lại là Bình thường (0)
+    preds = (probs >= q).astype(int)
+    
+    # Tính các chỉ số True Positive, False Positive, False Negative, True Negative
+    tp = np.sum((labels == 1) & (preds == 1))
+    fp = np.sum((labels == 0) & (preds == 1))
+    fn = np.sum((labels == 1) & (preds == 0))
+    tn = np.sum((labels == 0) & (preds == 0))
+    
+    # 1. Tính False Positive Rate (FPR)
+    total_normal = fp + tn
+    fpr = fp / total_normal if total_normal > 0 else 0.0
+    
+    # 2. Tính Precision, Recall và F1-score
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return fpr, f1, precision, recall
+
+# ==========================================
+# 3. QUÉT TÌM NGƯỠNG ĐỘNG (CRC) VÀ IN KẾT QUẢ
+# ==========================================
+print(f"{'Alpha (Max FPR)':<16}{'Threshold (q)':<15}{'Test FPR':<12}{'Test F1':<12}{'Test Precision':<16}{'Test Recall':<12}")
+print("-" * 85)
+
+# Lưới quét gồm 2000 bước từ 0.0 đến 1.0 bằng NumPy
+q_grid = np.linspace(0.0, 1.0, 2000)
+
+for alpha in alpha_levels:
+    q_hat = 1.0  # Mặc định ban đầu ở mức an toàn cao nhất
+    
+    # Tìm ngưỡng q nhỏ nhất trên tập Validation sao cho FPR <= alpha
+    for q in q_grid:
+        val_fpr, _, _, _ = compute_fpr_and_f1_numpy(probs_val, y_val, q)
+        if val_fpr <= alpha:
+            q_hat = q
+            break
+            
+    # Áp dụng ngưỡng q_hat tìm được lên tập Test
+    test_fpr, test_f1, test_prec, test_rec = compute_fpr_and_f1_numpy(probs_test, y_test, q_hat)
+    
+    print(f"{alpha:<16.2f}{q_hat:<15.4f}{test_fpr:<12.4f}{test_f1:<12.4f}{test_prec:<16.4f}{test_rec:<12.4f}")
+
+print("-" * 85)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
 import torch.nn.functional as F
 
 # ==========================================
