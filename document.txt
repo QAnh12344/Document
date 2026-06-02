@@ -1,6 +1,82 @@
 import torch
 import numpy as np
 
+def graph_aware_edge_smoothing(probs, edge_index, num_nodes, alpha_smooth=0.2):
+    """
+    Thuật toán nâng cấp tầm Paper: Làm mượt xác suất cạnh dựa trên cấu trúc đồ thị.
+    alpha_smooth: Trọng số tin tưởng vào cấu trúc lân cận (0.0 là giữ nguyên, 1.0 là theo lân cận hoàn toàn).
+    """
+    row, col = edge_index.detach().cpu().numpy()
+    num_edges = len(probs)
+    
+    # 1. Tính toán mức độ "bất thường trung bình" đi ra từ mỗi nút
+    node_anomaly_score = np.zeros(num_nodes)
+    node_degree = np.zeros(num_nodes)
+    
+    for i in range(num_edges):
+        u, v = row[i], col[i]
+        p = probs[i]
+        node_anomaly_score[u] += p
+        node_anomaly_score[v] += p
+        node_degree[u] += 1
+        node_degree[v] += 1
+        
+    # Tránh chia cho 0
+    node_degree[node_degree == 0] = 1
+    node_average_anomaly = node_anomaly_score / node_degree
+    
+    # 2. Cập nhật lại xác suất mới cho từng cạnh (Nhận biết cấu trúc đồ thị cục bộ)
+    smoothed_probs = np.zeros(num_edges)
+    for i in range(num_edges):
+        u, v = row[i], col[i]
+        # Xác suất mới = (1 - alpha) * Xác suất gốc + alpha * Trung bình của 2 đầu nút lân cận
+        neighbor_context = (node_average_anomaly[u] + node_average_anomaly[v]) / 2
+        smoothed_probs[i] = (1 - alpha_smooth) * probs[i] + alpha_smooth * neighbor_context
+        
+    return smoothed_probs
+
+# =========================================================================
+# QUY TRÌNH CHẠY THÍ NGHIỆM CHO PAPER (GIẢ ĐỊNH BẠN CÓ ĐỦ EDGE_INDEX VÀ NUM_NODES)
+# =========================================================================
+
+# Bước 1: Trích xuất xác suất thô từ GNN giống như bạn đã làm
+probs_val_raw = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+probs_test_raw = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+
+y_val = y_val_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+y_test = y_te_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+
+# Bước 2: Đi qua bộ lọc nhận biết đồ thị (Graph-Aware Smoothing) - ĐÓNG GÓP MỚI
+# Giả sử bạn có biến num_nodes, edge_index_val, edge_index_test từ dataset
+probs_val_smooth = graph_aware_edge_smoothing(probs_val_raw, edge_index_val, num_nodes, alpha_smooth=0.15)
+probs_test_smooth = graph_aware_edge_smoothing(probs_test_raw, edge_index_test, num_nodes, alpha_smooth=0.15)
+
+# Bước 3: Dò tìm ngưỡng q tối ưu trên xác suất ĐÃ ĐƯỢC LÀM MƯỢT BẰNG ĐỒ THỊ
+best_f1_val = 0.0
+best_q = 0.5
+q_grid = np.linspace(0.01, 0.99, 2000)
+
+for q in q_grid:
+    # Dùng hàm get_f1_score cũ của bạn nhưng truyền vào probs_val_smooth
+    current_f1, _, _ = get_f1_score(probs_val_smooth, y_val, q) 
+    if current_f1 > best_f1_val:
+        best_f1_val = current_f1
+        best_q = q
+
+# Bước 4: Đánh giá kết quả cuối cùng trên tập Test
+test_f1_smooth, test_prec_smooth, test_rec_smooth = get_f1_score(probs_test_smooth, y_test, best_q)
+
+print(f"--- Kết quả ĐỒ THỊ NÂNG CẤP (Tầm Paper) ---")
+print(f"F1 tập Test sau khi làm mượt cấu trúc đồ thị và chỉnh ngưỡng: {test_f1_smooth:.4f}")
+
+
+
+..
+
+
+import torch
+import numpy as np
+
 # 1. Chuyển đổi và làm phẳng dữ liệu từ logits (N, 2)
 probs_val = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
 probs_test = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
