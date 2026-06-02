@@ -1,3 +1,77 @@
+import numpy as np
+from scipy.special import expit
+
+# ==========================================
+# 1. CHUẨN BỊ DỮ LIỆU
+# ==========================================
+probs_val = expit(logits_val)   # Xác suất cạnh bất thường tập Val
+probs_test = expit(logits_test) # Xác suất cạnh bất thường tập Test
+
+y_val = np.array(y_val_filtered)
+y_test = np.array(y_te_filtered)
+
+# Cấu hình các mức FPR tối đa bạn muốn giới hạn (ví dụ: muốn FPR <= 5%, 10%,...)
+alpha_levels = [0.01, 0.05, 0.10, 0.15, 0.20]
+
+# ==========================================
+# 2. HÀM TÍNH RỦI RO ĐƯỢC THIẾT KẾ ĐỂ KIỂM SOÁT FPR
+# ==========================================
+def compute_fpr_loss(probs, labels, q):
+    """
+    Tính toán Tỷ lệ báo động nhầm (False Positive Rate).
+    Một cạnh được coi là Bất thường (Lớp 1) nếu xác suất của nó >= q.
+    (Lưu ý: Cách định nghĩa ngưỡng q ở đây thay đổi để phù hợp với việc siết chặt FPR).
+    """
+    # Mô hình dự đoán là Bất thường (1) nếu xác suất vượt ngưỡng q
+    pred_anomaly = (probs >= q).astype(int)
+    
+    # False Positive: Thực tế là BÌNH THƯỜNG (0) nhưng đoán nhầm là BẤT THƯỜNG (1)
+    false_positives = (labels == 0) & (pred_anomaly == 1)
+    
+    # Tổng số cạnh bình thường thực tế
+    total_normal_edges = np.sum(labels == 0)
+    if total_normal_edges == 0:
+        return 0.0
+        
+    # Trả về FPR thực tế với ngưỡng q này
+    return np.sum(false_positives) / total_normal_edges
+
+# ==========================================
+# 3. QUÉT TÌM NGƯỠNG VÀ ĐÁNH GIÁ
+# ==========================================
+print(f"{'Alpha (Max FPR)':<18}{'Threshold (q) Found':<22}{'Empirical FPR (Test)':<25}")
+print("-" * 65)
+
+# Lưới quét từ 0 đến 1 để tìm ngưỡng xác suất phù hợp
+q_grid = np.linspace(0, 1, 2000)
+
+for alpha in alpha_levels:
+    q_hat = 0.0  # Khởi tạo giá trị ngưỡng thấp nhất
+    
+    # Duyệt ngược từ 1 xuống 0 hoặc tìm q nhỏ nhất để kiểm soát FPR dưới mức alpha
+    # Ở đây chúng ta tìm ngưỡng q nhỏ nhất (để giữ lại Recall tốt nhất có thể) nhưng vẫn đảm bảo FPR <= alpha
+    for q in q_grid:
+        val_fpr = compute_fpr_loss(probs_val, y_val, q)
+        if val_fpr <= alpha:
+            q_hat = q
+            break
+            
+    # Áp dụng ngưỡng q_hat tìm được lên tập Test
+    test_fpr = compute_fpr_loss(probs_test, y_test, q_hat)
+    
+    print(f"{alpha:<18.2f}{q_hat:<22.4f}{test_fpr:<25.4f}")
+
+print("-" * 65)
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
