@@ -2,6 +2,81 @@ import torch
 import numpy as np
 
 # ==========================================
+# 1. TRÍCH XUẤT XÁC SUẤT LỚP 1 TỪ LOGITS (N, 2)
+# ==========================================
+# Sử dụng Softmax thay vì Sigmoid cho logits dạng (N, 2)
+# Sau đó chỉ lấy cột 1 (index 1) - chính là xác suất cạnh bất thường
+probs_val_2d = torch.softmax(logits_val, dim=-1)
+probs_test_2d = torch.softmax(logits_test, dim=-1)
+
+# Lấy cột 1 và đưa về mảng phẳng 1D dạng (N,)
+probs_val = probs_val_2d[:, 1].detach().cpu().numpy().reshape(-1)
+probs_test = probs_test_2d[:, 1].detach().cpu().numpy().reshape(-1)
+
+# Đưa nhãn về dạng phẳng 1D chuẩn NumPy
+y_val = y_val_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+y_test = y_te_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+
+# Kiểm tra để chắc chắn shape đã khớp hoàn toàn (N,) == (N,)
+print(f"Shape Probs Val: {probs_val.shape} | Shape Labels Val: {y_val.shape}")
+print(f"Shape Probs Test: {probs_test.shape} | Shape Labels Test: {y_test.shape}")
+assert probs_val.shape == y_val.shape, "Lỗi: Shape giữa xác suất và nhãn vẫn chưa khớp!"
+
+# ==========================================
+# 2. HÀM ĐÁNH GIÁ (GIỮ NGUYÊN)
+# ==========================================
+def compute_fpr_and_f1_numpy(probs, labels, q):
+    preds = (probs >= q).astype(int)
+    
+    tp = np.sum((labels == 1) & (preds == 1))
+    fp = np.sum((labels == 0) & (preds == 1))
+    fn = np.sum((labels == 1) & (preds == 0))
+    tn = np.sum((labels == 0) & (preds == 0))
+    
+    total_normal = fp + tn
+    fpr = fp / total_normal if total_normal > 0 else 0.0
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return fpr, f1, precision, recall
+
+# ==========================================
+# 3. VÒNG LẶP CRC QUÉT TÌM NGƯỠNG ĐỘNG
+# ==========================================
+alpha_levels = [0.01, 0.05, 0.10, 0.15, 0.20]
+q_grid = np.linspace(0.0, 1.0, 2000)
+
+print(f"\n{'Alpha (Max FPR)':<16}{'Threshold (q)':<15}{'Test FPR':<12}{'Test F1':<12}{'Test Precision':<16}{'Test Recall':<12}")
+print("-" * 85)
+
+for alpha in alpha_levels:
+    q_hat = 1.0  
+    
+    for q in q_grid:
+        val_fpr, _, _, _ = compute_fpr_and_f1_numpy(probs_val, y_val, q)
+        if val_fpr <= alpha:
+            q_hat = q
+            break
+            
+    test_fpr, test_f1, test_prec, test_rec = compute_fpr_and_f1_numpy(probs_test, y_test, q_hat)
+    print(f"{alpha:<16.2f}{q_hat:<15.4f}{test_fpr:<12.4f}{test_f1:<12.4f}{test_prec:<16.4f}{test_rec:<12.4f}")
+
+print("-" * 85)
+
+
+
+
+
+
+
+
+
+import torch
+import numpy as np
+
+# ==========================================
 # 1. ÉP PHẲNG SHAPE VỀ 1D (DẠNG MẢNG PHẲNG) NGAY TỪ ĐẦU
 # ==========================================
 # Sử dụng .reshape(-1) để biến đổi tất cả từ (N, 1) hoặc (1, N) về dạng phẳng (N,)
