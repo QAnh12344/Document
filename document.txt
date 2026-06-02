@@ -1,6 +1,126 @@
 import torch
 import numpy as np
 
+def run_crc_sgad_framework(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05):
+    """
+    Hiện thực hóa thuật toán Dual-Threshold Conformal Risk Control từ bài báo CRC-SGAD.
+    Khống chế đồng thời cả FPR và FNR bằng toán học Conformal Prediction.
+    """
+    # 1. Đưa về xác suất phẳng 1D lớp Bất thường (Class 1)
+    if logits_val.dim() == 2 and logits_val.shape[1] == 2:
+        probs_val = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+        probs_test = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+    else:
+        probs_val = torch.sigmoid(logits_val).detach().cpu().numpy().reshape(-1)
+        probs_test = torch.sigmoid(logits_test).detach().cpu().numpy().reshape(-1)
+
+    y_val = y_val_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+    y_test = y_te_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+
+    # 2. Định nghĩa hàm thiết lập Prediction Set dựa trên cặp ngưỡng lambda
+    def get_prediction_sets(probs, lam_0, lam_1):
+        """
+        Xây dựng tập dự đoán C(e) dựa trên cơ chế phân ngưỡng kép của bài báo.
+        Nhãn 0 được giữ lại nếu Xác suất bình thường (1 - p) >= lam_0
+        Nhãn 1 được giữ lại nếu Xác suất bất thường (p) >= lam_1
+        """
+        pred_sets = []
+        for p in probs:
+            s = set()
+            if (1.0 - p) >= lam_0:
+                s.add(0)
+            if p >= lam_1:
+                s.add(1)
+            # Nếu tập rỗng (do ngưỡng quá gắt), lấy nhãn có xác suất cao hơn theo luật exchangeability
+            if len(s) == 0:
+                s.add(1 if p >= 0.5 else 0)
+            pred_sets.append(s)
+        return pred_sets
+
+    # 3. Tính toán Hàm rủi ro rạch ròi (Risk Functions) trên tập Validation
+    # Quét qua không gian cấu hình của cặp ngưỡng [0, 1]
+    lambda_grid = np.linspace(0.01, 0.99, 100)
+    
+    best_lam0 = 0.5
+    best_lam1 = 0.5
+    min_risk = float('inf')
+    
+    # Bộ lọc tìm cặp lambda tối ưu thỏa mãn điều kiện biên toán học của CRC
+    for lam0 in lambda_grid:
+        for lam1 in lambda_grid:
+            val_sets = get_prediction_sets(probs_val, lam0, lam1)
+            
+            # Tính toán thực tế FPR và FNR trên tập tập tập dự đoán nhóm Validation
+            # Loại 0 (Bình thường): Thua thiệt xảy ra nếu nhãn thực là 0 nhưng C(e) không chứa 0
+            loss_fpr = np.mean([1 for idx, s in enumerate(val_sets) if y_val[idx] == 0 and 0 not in s])
+            # Loại 1 (Bất thường): Thua thiệt xảy ra nếu nhãn thực là 1 nhưng C(e) không chứa 1
+            loss_fnr = np.mean([1 for idx, s in enumerate(val_sets) if y_val[idx] == 1 and 1 not in s])
+            
+            # Điều kiện ràng buộc cốt lõi của Conformal Risk Control
+            if loss_fpr <= alpha_fpr and loss_fnr <= alpha_fnr:
+                # Mục tiêu: Tối ưu hóa để kích thước tập hợp dự đoán nhỏ nhất (tránh mơ hồ)
+                avg_set_size = np.mean([len(s) for s in val_sets])
+                if avg_set_size < min_risk:
+                    min_risk = avg_set_size
+                    best_lam0 = lam0
+                    best_lam1 = lam1
+
+    print(f"--- GIAI ĐOẠN HIỆU CHUẨN ĐÔI (DUAL CALIBRATION) ---")
+    print(f"-> Ngưỡng an toàn cho lớp Bình thường (lam_0): {best_lam0:.4f}")
+    print(f"-> Ngưỡng an toàn cho lớp Bất thường (lam_1): {best_lam1:.4f}")
+
+    # 4. ÁP DỤNG SANG TẬP TEST (MÔ PHỎNG DEPLOYMENT THỰC TẾ)
+    test_sets = get_prediction_sets(probs_test, best_lam0, best_lam1)
+    
+    # Tính toán các chỉ số toán học đầu ra của tập hợp (Set-valued metrics)
+    test_fpr_controlled = np.mean([1 for idx, s in enumerate(test_sets) if y_test[idx] == 0 and 0 not in s])
+    test_fnr_controlled = np.mean([1 for idx, s in enumerate(test_sets) if y_test[idx] == 1 and 1 not in s])
+    avg_test_set_size = np.mean([len(s) for s in test_sets])
+    
+    # Để tính điểm F1-Score so sánh, ta chuyển đổi tập dự đoán về nhãn đơn (Point prediction)
+    # Bằng cách lấy Argmax xác suất nếu tập chứa cả 2 phần tử
+    final_preds = []
+    for idx, s in enumerate(test_sets):
+        if len(s) == 1:
+            final_preds.append(list(s)[0])
+        else:
+            final_preds.append(1 if probs_test[idx] >= 0.5 else 0)
+            
+    final_preds = np.array(final_preds)
+    tp = np.sum((y_test == 1) & (final_preds == 1))
+    fp = np.sum((y_test == 0) & (final_preds == 1))
+    fn = np.sum((y_test == 1) & (final_preds == 0))
+    
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    test_f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    print(f"\n--- KẾT QUẢ ĐÁNH GIÁ ĐÚNG CHUẨN CRC-SGAD ---")
+    print(f" Ràng buộc đặt ra : Rủi ro tối đa FPR <= {alpha_fpr} | FNR <= {alpha_fnr}")
+    print(f" Thực tế đạt được : Test FPR = {test_fpr_controlled:.4f} | Test FNR = {test_fnr_controlled:.4f}")
+    print(f" Kích thước tập dự đoán trung bình (Average Set Size): {avg_test_set_size:.2f} (Càng sát 1.0 càng tốt)")
+    print(f" Điểm F1-Score sau khi ép nhãn hội tụ: {test_f1:.4f}")
+    print(f"=========================================================")
+    
+    return test_f1
+
+# Gọi hàm chạy:
+# run_crc_sgad_framework(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05)
+
+
+
+
+
+
+
+
+
+
+
+
+.import torch
+import numpy as np
+
 def run_universal_post_processing(logits_val, y_val_filtered, logits_test, y_te_filtered, edge_index_val, edge_index_test, num_nodes):
     """
     Hệ thống hậu xử lý thích ứng toàn cục (Universal Adaptive Post-processing Framework).
