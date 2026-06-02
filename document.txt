@@ -1,6 +1,151 @@
 import torch
 import numpy as np
 import scipy.sparse as sp
+
+def compute_chebyshev_basis_sparse(edge_index, x, max_order=3):
+    """
+    [SSGNC] Xấp xỉ bộ lọc Spectral bằng Đa thức Chebyshev (Eq. 14, 15, 16).
+    Tự động xoay trục ma trận cạnh từ [num_edges, 2] sang [2, num_edges].
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    
+    x = x.reshape(-1, 1)
+    N = len(x)
+
+    if isinstance(edge_index, torch.Tensor):
+        edge_index_np = edge_index.detach().cpu().numpy()
+    else:
+        edge_index_np = np.array(edge_index)
+
+    if edge_index_np.shape[1] == 2 and edge_index_np.shape[0] != 2:
+        edge_index_np = edge_index_np.T
+
+    row, col = edge_index_np[0], edge_index_np[1]
+    valid_edges = (row < N) & (col < N)
+    row, col = row[valid_edges], col[valid_edges]
+    data = np.ones_like(row)
+    
+    A = sp.coo_matrix((data, (row, col)), shape=(N, N)).tocsr()
+    
+    d = np.array(A.sum(axis=1)).flatten()
+    d_inv_sqrt = np.power(d, -0.5, where=d>0)
+    d_inv_sqrt[d == 0] = 0.0
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    L_normalized = (sp.eye(N) - D_inv_sqrt @ A @ D_inv_sqrt).tocsr()
+    
+    T = [x]
+    if max_order >= 1:
+        T.append(L_normalized.dot(x))
+        
+    for m in range(2, max_order + 1):
+        T_m = 2 * L_normalized.dot(T[-1]) - T[-2]
+        T.append(T_m)
+        
+    return np.mean(np.concatenate(T, axis=1), axis=1)
+
+
+def run_dtcrc_final_fixed(logits_val, y_val, logits_test, y_test, 
+                            edge_index_val, edge_index_test, 
+                            alpha=0.10, max_order=3):
+    """
+    BẢN FIX TRIỆT ĐỂ:
+    - Sử dụng toán học Softmax chuẩn để xử lý Logits âm/dương tự do.
+    - Đảm bảo các chỉ số không bị sập về 0.
+    """
+    # Khôi phục đồ thị đạo hàm và chuyển sang PyTorch Tensor nếu đang là mảng cấu trúc khác
+    if not isinstance(logits_val, torch.Tensor): logits_val = torch.tensor(logits_val)
+    if not isinstance(logits_test, torch.Tensor): logits_test = torch.tensor(logits_test)
+
+    # ĐƯA LOGITS VỀ XÁC SUẤT BẰNG SOFTMAX TOÁN HỌC (Sửa lỗi chia số âm trực tiếp)
+    probs_val = torch.softmax(logits_val, dim=-1).detach().cpu().numpy()
+    probs_test = torch.softmax(logits_test, dim=-1).detach().cpu().numpy()
+
+    # Tách phân phối xác suất độc lập của lớp 0 và lớp 1
+    p0_val, p1_val = probs_val[:, 0], probs_val[:, 1]
+    p0_test, p1_test = probs_test[:, 0], probs_test[:, 1]
+
+    y_val = y_val.detach().cpu().numpy().astype(int).reshape(-1) if isinstance(y_val, torch.Tensor) else np.array(y_val)
+    y_test = y_test.detach().cpu().numpy().astype(int).reshape(-1) if isinstance(y_test, torch.Tensor) else np.array(y_test)
+
+    # Hiệu chuẩn phổ cấu trúc qua bộ lọc Chebyshev (SSGNC)
+    # Ta lọc độc lập cho cả phân phối lớp 0 và lớp 1 để giữ toàn vẹn thông tin 2 cột
+    smooth_p0_val = 0.85 * p0_val + 0.15 * compute_chebyshev_basis_sparse(edge_index_val, p0_val, max_order)
+    smooth_p1_val = 0.85 * p1_val + 0.15 * compute_chebyshev_basis_sparse(edge_index_val, p1_val, max_order)
+    
+    smooth_p0_test = 0.85 * p0_test + 0.15 * compute_chebyshev_basis_sparse(edge_index_test, p0_test, max_order)
+    smooth_p1_test = 0.85 * p1_test + 0.15 * compute_chebyshev_basis_sparse(edge_index_test, p1_test, max_order)
+
+    # Quét dải ngưỡng toán học (DTCRC - Eq. 8, 9)
+    lambdas = np.linspace(0.001, 0.999, 1000)
+    
+    # Lấy phân phối lỗi thực nghiệm trên tập Calib
+    val_norm_loss = smooth_p1_val[y_val == 0] # Lỗi FPR (Thực tế sạch nhưng đoán gian lận)
+    val_ano_loss = smooth_p1_val[y_val == 1]  # Lỗi FNR (Thực tế gian lận nhưng đoán sạch)
+    
+    n_norm = len(val_norm_loss)
+    n_ano = len(val_ano_loss)
+
+    loss_fpr = np.mean(val_norm_loss[:, None] > (1.0 - lambdas[None, :]), axis=0) if n_norm > 0 else np.zeros_like(lambdas)
+    loss_fnr = np.mean(val_ano_loss[:, None] < lambdas[None, :], axis=0) if n_ano > 0 else np.zeros_like(lambdas)
+
+    # Ranh giới phòng vệ mẫu của Paper
+    bound_norm = alpha - (1.0 - alpha) / n_norm
+    bound_ano = alpha - (1.0 - alpha) / n_ano
+
+    valid_norm_idx = np.where(loss_fpr <= bound_norm)[0]
+    valid_ano_idx = np.where(loss_fnr <= bound_ano)[0]
+
+    lambda_norm = lambdas[valid_norm_idx[-1]] if len(valid_norm_idx) > 0 else lambdas[np.argmin(loss_fpr)]
+    lambda_ano = lambdas[valid_ano_idx[0]] if len(valid_ano_idx) > 0 else lambdas[np.argmin(loss_fnr)]
+
+    # Áp dụng tạo tập hợp dự đoán giao thoa (Eq. 5, 6)
+    include_0 = smooth_p1_test <= (1.0 - lambda_norm)
+    include_1 = smooth_p1_test >= lambda_ano
+
+    # Ra nhãn dự đoán cứng dựa trên lý thuyết tập hợp
+    final_preds = np.full_like(smooth_p1_test, fill_value=-1, dtype=int)
+    final_preds[include_1 & ~include_0] = 1  # Chắc chắn Anomaly
+    final_preds[include_0 & ~include_1] = 0  # Chắc chắn Normal
+
+    # Xử lý vùng tranh chấp: Trả về nhãn có xác suất cao hơn sau hiệu chuẩn
+    # Điều này đảm bảo toàn bộ các nút đều có nhãn hợp lệ, triệt tiêu nguy cơ sập chỉ số
+    ambiguous_mask = (final_preds == -1)
+    final_preds[ambiguous_mask] = (smooth_p1_test[ambiguous_mask] >= smooth_p0_test[ambiguous_mask]).astype(int)
+
+    # Đánh giá ma trận đối chiếu với Baseline gốc (Argmax của xác suất thô ban đầu)
+    base_preds = (p1_test >= p0_test).astype(int)
+    
+    def calculate_metrics(preds, labels):
+        tp = np.sum((labels == 1) & (preds == 1))
+        fp = np.sum((labels == 0) & (preds == 1))
+        fn = np.sum((labels == 1) & (preds == 0))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        return f1, prec, rec
+
+    base_f1, base_prec, base_rec = calculate_metrics(base_preds, y_test)
+    test_f1, test_prec, test_rec = calculate_metrics(final_preds, y_test)
+
+    print(f"=========================================================")
+    print(f" Mô hình GNN gốc (Argmax thô)   -> F1: {base_f1:.4f} | Precision: {base_prec:.4f} | Recall: {base_rec:.4f}")
+    print(f" Bộ Hiệu Chuẩn Sửa Đổi (DTCRC)  -> F1: {test_f1:.4f} | Precision: {test_prec:.4f} | Recall: {test_rec:.4f}")
+    print("=========================================================\n")
+    
+    return final_preds
+
+
+
+
+
+
+
+
+.
+.....import torch
+import numpy as np
+import scipy.sparse as sp
 from tqdm import tqdm
 
 def compute_chebyshev_basis_sparse(edge_index, x, max_order=3):
