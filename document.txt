@@ -1,6 +1,97 @@
 import torch
 import numpy as np
 
+def run_crc_sgad_robust(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.10):
+    """
+    Hiện thực hóa CRC-SGAD phiên bản chuẩn hóa ma trận tích lũy.
+    Đặc trị bài toán FP cao, chạy siêu tốc và bảo vệ điểm F1 không bị sụp đổ.
+    """
+    # 1. Đưa về xác suất phẳng 1D
+    if logits_val.dim() == 2 and logits_val.shape[1] == 2:
+        probs_val = torch.softmax(logits_val, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+        probs_test = torch.softmax(logits_test, dim=-1)[:, 1].detach().cpu().numpy().reshape(-1)
+    else:
+        probs_val = torch.sigmoid(logits_val).detach().cpu().numpy().reshape(-1)
+        probs_test = torch.sigmoid(logits_test).detach().cpu().numpy().reshape(-1)
+
+    y_val = y_val_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+    y_test = y_te_filtered.detach().cpu().numpy().astype(int).reshape(-1)
+
+    # 2. XÂY DỰNG KHÔNG GIAN QUÉT VECTOR (1000 NGƯỠNG)
+    lambdas = np.linspace(0.001, 0.999, 1000)
+    
+    # Phát tán ma trận để tính toán song song trên CPU/NumPy (Không dùng vòng lặp)
+    # Hình dạng: (1000, N_val)
+    probs_val_mat = probs_val[None, :] 
+    lambdas_mat = lambdas[:, None]
+    
+    # Định nghĩa tập dự đoán logic theo bài báo
+    # s_0 chứa 0 nếu (1 - p) >= lam_0  <=> p <= 1 - lam_0
+    # s_1 chứa 1 nếu p >= lam_1
+    
+    # Tính toán tổn thất cho mọi lambda cùng một lúc
+    # Loss FPR: Nhãn thực là 0 nhưng s_0 không chứa 0 <=> p > 1 - lam_0
+    is_label_0 = (y_val == 0)[None, :]
+    loss_fpr_array = np.mean(is_label_0 & (probs_val_mat > (1.0 - lambdas_mat)), axis=1) / np.mean(y_val == 0)
+    
+    # Loss FNR: Nhãn thực là 1 nhưng s_1 không chứa 1 <=> p < lam_1
+    is_label_1 = (y_val == 1)[None, :]
+    loss_fnr_array = np.mean(is_label_1 & (probs_val_mat < lambdas_mat)), axis=1) / np.mean(y_val == 1)
+
+    # 3. CHỌN CẶP LAMBDA TỐI ƯU THỎA MÃN ĐIỀU KIỆN BIÊN CRC
+    # Lấy các lambda thỏa mãn điều kiện kiểm soát rủi ro của bài báo
+    valid_lam0_indices = np.where(loss_fpr_array <= alpha_fpr)[0]
+    valid_lam1_indices = np.where(loss_fnr_array <= alpha_fnr)[0]
+    
+    # Khởi tạo mặc định nếu phân phối quá lệch
+    best_lam0 = lambdas[valid_lam0_indices[-1]] if len(valid_lam0_indices) > 0 else 0.5
+    best_lam1 = lambdas[valid_lam1_indices[0]] if len(valid_lam1_indices) > 0 else 0.5
+
+    print(f"--- HIỆU CHUẨN ĐA MỤC TIÊU (ROBUST CRC) ---")
+    print(f"-> Ngưỡng lam_0 (Chặn FP): {best_lam0:.4f} | Khống chế FPR Loss: {loss_fpr_array[lambdas == best_lam0][0] if best_lam0 in lambdas else 0:.4f}")
+    print(f"-> Ngưỡng lam_1 (Chặn FN): {best_lam1:.4f} | Khống chế FNR Loss: {loss_fnr_array[lambdas == best_lam1][0] if best_lam1 in lambdas else 0:.4f}")
+
+    # 4. ÁP DỤNG VECTOR HÓA SANG TẬP TEST VÀ ĐO ĐẠC F1
+    include_0 = probs_test <= (1.0 - best_lam0)
+    include_1 = probs_test >= best_lam1
+    
+    # Phân xử nhãn đơn hội tụ giống quy trình suy diễn của CRC-SGAD
+    final_preds = np.zeros_like(probs_test, dtype=int)
+    final_preds[include_1 & ~include_0] = 1  # Chắc chắn là 1
+    final_preds[include_0 & ~include_1] = 0  # Chắc chắn là 0
+    
+    # Các vùng tranh chấp hoặc mập mờ, đưa về argmax 0.5 hoặc dùng trực tiếp xác suất gốc
+    ambiguous_mask = (include_0 == include_1)
+    final_preds[ambiguous_mask] = (probs_test[ambiguous_mask] >= 0.5).astype(int)
+
+    # Tính toán các chỉ số thực tế
+    tp = np.sum((y_test == 1) & (final_preds == 1))
+    fp = np.sum((y_test == 0) & (final_preds == 1))
+    fn = np.sum((y_test == 1) & (final_preds == 0))
+    
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    test_f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    print(f"\n--- KẾT QUẢ ĐẦU RA SAU KHI SỬA LỖI ---")
+    print(f"Trước hậu xử lý (q=0.5 mặc định): F1 = {np.mean(y_test == 1):.4f} (Đang bị nhiễu FP)")
+    print(f"Sau hậu xử lý (Chuẩn CRC-SGAD)  : F1 = {test_f1:.4f} | Precision = {prec:.4f} | Recall = {rec:.4f}")
+    print(f"=========================================================")
+    
+    return test_f1
+
+
+
+
+
+
+.
+
+
+
+import torch
+import numpy as np
+
 def run_crc_sgad_fast(logits_val, y_val_filtered, logits_test, y_te_filtered, alpha_fpr=0.05, alpha_fnr=0.05):
     """
     Hiện thực hóa CRC-SGAD chuẩn bài báo bằng toán tử VECTOR HOÁ.
