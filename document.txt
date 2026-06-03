@@ -1,3 +1,107 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# =========================================================
+# 1. Convert logits -> probability (class 1)
+# =========================================================
+
+def get_prob_class1(logits):
+    probs = F.softmax(torch.tensor(logits), dim=-1).numpy()
+    return probs[:, 1]
+
+
+p_cal = get_prob_class1(logits_cal)
+p_test = get_prob_class1(logits_test)
+
+y_cal = y_cal.astype(int)
+y_test = y_test.astype(int)
+
+
+# =========================================================
+# 2. CRC + F1 threshold selection on CALIB
+# =========================================================
+
+def select_crc_f1_threshold(p_cal, y_cal, alpha=0.05, n_grid=300):
+
+    thresholds = np.linspace(0, 1, n_grid)
+
+    best_t = 0
+    best_f1 = -1
+
+    for t in thresholds:
+
+        pred = (p_cal > t).astype(int)
+
+        # sklearn metrics (clean + stable)
+        f1 = f1_score(y_cal, pred)
+
+        # compute FPR
+        fp = ((pred == 1) & (y_cal == 0)).sum()
+        tn = ((pred == 0) & (y_cal == 0)).sum()
+
+        fpr = fp / (fp + tn + 1e-9)
+
+        # CRC constraint
+        if fpr <= alpha:
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = t
+
+    return best_t, best_f1
+
+
+# =========================================================
+# 3. Run selection on CALIB
+# =========================================================
+
+alpha = 0.05  # tune: 0.01 / 0.05 / 0.1
+
+best_t, best_f1_cal = select_crc_f1_threshold(
+    p_cal, y_cal, alpha=alpha
+)
+
+print("Best threshold (CALIB):", best_t)
+print("Best F1 (CALIB):", best_f1_cal)
+
+
+# =========================================================
+# 4. Apply on TEST
+# =========================================================
+
+pred_test = (p_test > best_t).astype(int)
+
+f1_test = f1_score(y_test, pred_test)
+precision = precision_score(y_test, pred_test)
+recall = recall_score(y_test, pred_test)
+
+fp = ((pred_test == 1) & (y_test == 0)).sum()
+tn = ((pred_test == 0) & (y_test == 0)).sum()
+fpr = fp / (fp + tn + 1e-9)
+
+
+# =========================================================
+# 5. Final report
+# =========================================================
+
+print("\n===== FINAL TEST RESULT =====")
+print("F1 (class 1):", f1_test)
+print("Precision:", precision)
+print("Recall:", recall)
+print("FPR:", fpr)
+
+
+
+
+
+
+
+
+
+
+
+
 import numpy as np
 from sklearn.metrics import f1_score
 
