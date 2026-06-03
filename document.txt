@@ -3,6 +3,123 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DWBLoss(nn.Module):
+    def __init__(self, class_counts, reduction='mean'):
+        """
+        Khởi tạo DWB Loss.
+        
+        Args:
+            class_counts (list hoặc hoặc tuple hoặc Tensor): Số lượng mẫu của từng lớp trong tập huấn luyện.
+            reduction (str): Cách giảm thiểu loss ('mean', 'sum', hoặc 'none').
+        """
+        super(DWBLoss, self).__init__()
+        self.reduction = reduction
+        
+        # Chuyển số lượng mẫu thành tensor dạng float
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        max_count = torch.max(counts)
+        
+        # Tính trọng số tĩnh w_j cho từng lớp theo Công thức (8):
+        # w_j = log( max(n_k) / n_j ) + 1
+        # Thêm eps nhỏ để tránh chia cho 0 nếu có lớp không có mẫu nào
+        self.weights = torch.log(max_count / (counts + 1e-8)) + 1.0
+
+    def forward(self, logits, targets):
+        """
+        Tính toán DWB Loss.
+        
+        Args:
+            logits (Tensor): Đầu ra chưa qua kích hoạt của mô hình, hình dạng (batch_size, num_classes).
+            targets (Tensor): Nhãn thực tế (ground-truth dạng số nguyên), hình dạng (batch_size,).
+        """
+        # Đảm bảo trọng số w_j nằm trên cùng thiết bị (CPU/GPU) với logits
+        self.weights = self.weights.to(logits.device)
+        
+        # 1. Tính xác suất p_ij của các lớp bằng Softmax
+        probs = F.softmax(logits, dim=-1)
+        
+        # 2. Tính log(p_ij) ổn định bằng log_softmax (tránh lỗi log(0))
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # 3. Trích xuất p_y và log(p_y) của lớp thực tế (ground-truth) cho từng mẫu
+        batch_size = logits.size(0)
+        batch_indices = torch.arange(batch_size, device=logits.device)
+        
+        p_y = probs[batch_indices, targets]
+        log_p_y = log_probs[batch_indices, targets]
+        
+        # 4. Lấy trọng số tĩnh w_y tương ứng với lớp thực tế của từng mẫu
+        w_y = self.weights[targets]
+        
+        # 5. Tính Thành phần 1: Dynamically Weighted CE 
+        # công thức: - (w_y) ^ (1 - p_y) * log(p_y)
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        term1 = - dynamic_weight * log_p_y
+        
+        # 6. Tính Thành phần 2: Regularization (Entropy của Brier Score)
+        # công thức: - p_y * (1 - p_y)
+        term2 = - p_y * (1.0 - p_y)
+        
+        # 7. Tổng hợp DWB Loss cho từng mẫu theo Công thức (13)
+        loss = term1 + term2
+        
+        # Áp dụng phương thức giảm thiểu (reduction) cho cả batch
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+
+
+
+
+# Giả sử bài toán có 3 lớp với phân bổ dữ liệu bị lệch nghiêm trọng:
+# Lớp 0: 1000 mẫu (Đa số)
+# Lớp 1: 150 mẫu
+# Lớp 2: 30 mẫu (Thiểu số nguy kịch)
+class_samples = [1000, 150, 30]
+
+# Khởi tạo hàm loss
+criterion = DWBLoss(class_counts=class_samples)
+
+# Giả lập đầu ra của mô hình (logits) cho một batch gồm 4 mẫu (4 mẫu, 3 lớp)
+dummy_logits = torch.tensor([
+    [2.0, 0.5, -1.0],  # Mẫu 1
+    [-0.5, 3.0, 0.2],  # Mẫu 2
+    [0.1, 0.2, 4.0],   # Mẫu 3
+    [1.0, 1.1, 1.2]    # Mẫu 4
+], requires_grad=True)
+
+# Giả lập nhãn thực tế của batch này
+dummy_targets = torch.tensor([0, 1, 2, 2]) # Mẫu cuối cùng thực tế thuộc lớp thiểu số 2
+
+# Tính loss
+loss = criterion(dummy_logits, dummy_targets)
+print(f"DWB Loss value: {loss.item()}")
+
+# Lan truyền ngược (Backpropagation)
+loss.backward()
+print("Tính toán gradient thành công!")
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DWBLoss(nn.Module):
     def __init__(self, class_weights, reduction='mean'):
         """
         Khởi tạo DWB Loss với class_weight truyền vào trực tiếp.
