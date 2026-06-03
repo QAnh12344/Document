@@ -2,6 +2,87 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class BinaryDWBLoss(nn.Module):
+    def __init__(self, class_counts, reduction='mean'):
+        """
+        Khởi tạo Binary DWB Loss từ số lượng mẫu của 2 lớp.
+        
+        Args:
+            class_counts (list hoặc tuple): Số lượng mẫu [num_zeros, num_ones]
+            reduction (str): 'mean', 'sum', hoặc 'none'
+        """
+        super(BinaryDWBLoss, self).__init__()
+        self.reduction = reduction
+        
+        # Tính trọng số tĩnh w0 và w1 từ số lượng mẫu theo công thức (8)
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        max_count = torch.max(counts)
+        # self.weights sẽ chứa [w0, w1]
+        self.weights = torch.log(max_count / (counts + 1e-8)) + 1.0
+
+    def forward(self, logits, targets):
+        # -----------------------------------------------------------------
+        # BƯỚC SỬA LỖI: Tự động chuyển NumPy Array sang PyTorch Tensor nếu cần
+        # -----------------------------------------------------------------
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.as_tensor(logits, dtype=torch.float32)
+        if not isinstance(targets, torch.Tensor):
+            targets = torch.as_tensor(targets, dtype=torch.float32)
+
+        # Đảm bảo mảng trọng số nằm cùng thiết bị (CPU/GPU) với dữ liệu đầu vào
+        self.weights = self.weights.to(logits.device)
+        
+        # Duỗi phẳng về dạng 1D để tránh lệch kích thước giữa (batch_size, 1) và (batch_size,)
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+
+        # 1. Tính xác suất p bằng hàm Sigmoid phù hợp cho Nhị phân
+        probs = torch.sigmoid(logits)
+        
+        # 2. Lấy trọng số tĩnh w_y và xác suất p_y dựa theo nhãn thực tế của từng mẫu
+        # Nếu targets == 1 thì lấy w1 (weights[1]), ngược lại lấy w0 (weights[0])
+        w_y = torch.where(targets == 1.0, self.weights[1], self.weights[0])
+        p_y = torch.where(targets == 1.0, probs, 1.0 - probs)
+        
+        # 3. Tính log(p_y) ổn định số học bằng logsigmoid (tránh lỗi log(0) ra NaN/Inf)
+        log_p_pos = F.logsigmoid(logits)     # tương đương log(p)
+        log_p_neg = F.logsigmoid(-logits)    # tương đương log(1-p)
+        log_p_y = torch.where(targets == 1.0, log_p_pos, log_p_neg)
+
+        # 4. Thành phần 1: Dynamically Weighted CE
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        term1 = - dynamic_weight * log_p_y
+        
+        # 5. Thành phần 2: Regularization (Entropy của Brier Score)
+        # Với nhị phân, p_y * (1 - p_y) luôn bằng probs * (1 - probs) cho cả 2 lớp
+        term2 = - probs * (1.0 - probs)
+        
+        # 6. Tổng hợp loss
+        loss = term1 + term2
+        
+        # Áp dụng phương thức giảm thiểu
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class DWBLoss(nn.Module):
     def __init__(self, class_counts, reduction='mean'):
         """
