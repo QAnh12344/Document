@@ -4,6 +4,107 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 # =========================================================
+# 1. logits -> probability (robust version)
+# =========================================================
+
+def get_prob(logits):
+    logits = torch.tensor(logits)
+
+    # safe binary case handling
+    if logits.ndim == 1 or logits.shape[-1] == 1:
+        return torch.sigmoid(logits).numpy().reshape(-1)
+
+    probs = F.softmax(logits, dim=-1).numpy()
+    return probs[:, 1]
+
+
+p_cal = get_prob(logits_cal)
+p_test = get_prob(logits_test)
+
+y_cal = np.asarray(y_cal).astype(int)
+y_test = np.asarray(y_test).astype(int)
+
+
+# =========================================================
+# 2. FPR risk (CRC constraint)
+# =========================================================
+
+def fpr_risk(p, y, tau):
+
+    pred = (p >= tau)
+
+    fp = np.sum((pred == 1) & (y == 0))
+    tn = np.sum((pred == 0) & (y == 0))
+
+    return fp / (fp + tn + 1e-12)
+
+
+# =========================================================
+# 3. CRC threshold selection
+# =========================================================
+
+def crc_select_threshold(p_cal, y_cal, alpha=0.05, n_grid=1000):
+
+    taus = np.linspace(0.0, 1.0, n_grid)
+
+    feasible = []
+
+    for tau in taus:
+        risk = fpr_risk(p_cal, y_cal, tau)
+
+        if risk <= alpha:
+            feasible.append(tau)
+
+    # fallback
+    if len(feasible) == 0:
+        return 1.0
+
+    # CRC choice:
+    # max tau = most conservative (higher precision)
+    return np.max(feasible)
+
+
+best_tau = crc_select_threshold(p_cal, y_cal, alpha=0.05)
+
+print("CRC selected threshold:", best_tau)
+
+
+# =========================================================
+# 4. Evaluation
+# =========================================================
+
+pred_test = (p_test >= best_tau)
+
+f1 = f1_score(y_test, pred_test)
+precision = precision_score(y_test, pred_test)
+recall = recall_score(y_test, pred_test)
+
+fp = np.sum((pred_test == 1) & (y_test == 0))
+tn = np.sum((pred_test == 0) & (y_test == 0))
+fpr = fp / (fp + tn + 1e-12)
+
+print("\n===== TEST RESULTS =====")
+print("F1:", f1)
+print("Precision:", precision)
+print("Recall:", recall)
+print("FPR:", fpr)
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# =========================================================
 # 1. probs
 # =========================================================
 
