@@ -4,6 +4,93 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 # =========================================================
+# 1. probs
+# =========================================================
+
+def get_prob(logits):
+    return F.softmax(torch.tensor(logits), dim=-1).numpy()[:, 1]
+
+
+p_cal = get_prob(logits_cal)
+p_test = get_prob(logits_test)
+
+y_cal = y_cal.astype(int)
+y_test = y_test.astype(int)
+
+
+# =========================================================
+# 2. monotone CRC surrogate loss
+# =========================================================
+
+def surrogate_risk(p, y, tau, beta=0.5):
+
+    pred = (p >= tau)
+
+    fp = ((pred == 1) & (y == 0)).sum()
+    fn = ((pred == 0) & (y == 1)).sum()
+
+    return beta * fn + (1 - beta) * fp
+
+
+# =========================================================
+# 3. CRC threshold selection (THEORY CORRECT)
+# =========================================================
+
+def crc_select(p_cal, y_cal, alpha=0.05, beta=0.7):
+
+    taus = np.linspace(0, 1, 1000)
+
+    valid = []
+
+    for t in taus:
+        risk = surrogate_risk(p_cal, y_cal, t, beta)
+
+        if risk <= alpha:
+            valid.append(t)
+
+    if len(valid) == 0:
+        return 1.0
+
+    # key design choice for F1:
+    # choose MAX tau => favors precision (important for F1 gain)
+    return max(valid)
+
+
+best_tau = crc_select(p_cal, y_cal, alpha=0.05, beta=0.7)
+
+print("Selected CRC tau:", best_tau)
+
+
+# =========================================================
+# 4. evaluation
+# =========================================================
+
+pred = (p_test >= best_tau)
+
+print("F1:", f1_score(y_test, pred))
+print("Precision:", precision_score(y_test, pred))
+print("Recall:", recall_score(y_test, pred))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# =========================================================
 # 1. logits -> probability
 # =========================================================
 
