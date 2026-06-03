@@ -1,3 +1,107 @@
+import numpy as np
+from sklearn.metrics import f1_score
+
+# =========================
+# 1. Sigmoid function
+# =========================
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
+# =========================
+# 2. Convert logits → prob
+# =========================
+p_cal = sigmoid(logits_cal)
+p_test = sigmoid(logits_test)
+
+y_cal = y_cal.astype(int)
+y_test = y_test.astype(int)
+
+
+# =========================
+# 3. CRC + F1 optimization on CALIB
+# =========================
+
+def f1_crc_threshold(p_cal, y_cal, alpha=0.05, n_grid=300):
+
+    taus = np.linspace(0, 1, n_grid)
+
+    best_t = None
+    best_f1 = -1
+
+    for t in taus:
+
+        pred = (p_cal > t).astype(int)
+
+        TP = ((pred == 1) & (y_cal == 1)).sum()
+        FP = ((pred == 1) & (y_cal == 0)).sum()
+        FN = ((pred == 0) & (y_cal == 1)).sum()
+
+        f1 = 2 * TP / (2 * TP + FP + FN + 1e-9)
+
+        # False Positive Rate constraint (CRC part)
+        TN = ((y_cal == 0)).sum()
+        FPR = FP / (TN + 1e-9)
+
+        # CRC constraint
+        if FPR <= alpha:
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = t
+
+    return best_t, best_f1
+
+
+# =========================
+# 4. Run CRC selection
+# =========================
+
+alpha = 0.05   # bạn có thể tune 0.01 / 0.05 / 0.1
+
+best_t, best_f1_cal = f1_crc_threshold(p_cal, y_cal, alpha=alpha)
+
+print("Best threshold (CALIB):", best_t)
+print("Best F1 on CALIB:", best_f1_cal)
+
+
+# =========================
+# 5. Evaluate on TEST
+# =========================
+
+pred_test = (p_test > best_t).astype(int)
+
+TP = ((pred_test == 1) & (y_test == 1)).sum()
+FP = ((pred_test == 1) & (y_test == 0)).sum()
+FN = ((pred_test == 0) & (y_test == 1)).sum()
+
+f1_test = 2 * TP / (2 * TP + FP + FN + 1e-9)
+
+print("FINAL TEST F1 (class 1):", f1_test)
+
+
+# =========================
+# 6. Extra diagnostics (optional but useful)
+# =========================
+
+precision = TP / (TP + FP + 1e-9)
+recall = TP / (TP + FN + 1e-9)
+fpr = FP / ((y_test == 0).sum() + 1e-9)
+
+print("Precision:", precision)
+print("Recall:", recall)
+print("FPR:", fpr)
+
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import numpy as np
 import scipy.sparse as sp
