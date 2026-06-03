@@ -1,5 +1,143 @@
 import torch
 import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class ExSTraQtPnaEdgeGatedAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # ExSTraQt statistics normalization
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # Edge-level attention (6 node stats + tau + log_amount = 8 dims)
+        self.edge_gate = nn.Sequential(
+            nn.Linear(8, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+        # PNA Aggregator Configuration
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+        
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        pna_out_features = len(aggregators) * len(scalers) * n_hidden
+
+        # Multi-layer Perceptrons
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+
+        for m in self.edge_gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Group statistics & Time Normalization (tau)
+        edge_counts = torch.bincount(index, minlength=num_groups).float()
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+        
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # 2. Extract ExSTraQt Temporal & Flow Features
+        # tf_c (Time-flow Centrality)
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        # tf_std (Time Variance)
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        # Burst density & Money velocity
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        # Flow skewness
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(centered ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        skew_den = (scatter(centered ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        # Average inter-arrival time
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        # 3. ExSTraQt Fusion & Gating Mechanism
+        exstraqt_raw = torch.stack([tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1)
+        exstraqt_raw = self.exstraqt_ln(exstraqt_raw)
+
+        edge_context = exstraqt_raw[index]
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        
+        edge_feat = torch.cat([edge_context, edge_local], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        # 4. PNA Aggregation & Residual Transition
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+        
+        output = self.post_transition(pna_feats) + pna_feats
+
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 class DWBLoss(nn.Module):
