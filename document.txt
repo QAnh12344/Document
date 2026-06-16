@@ -372,6 +372,11 @@ class MultiEdgeAggModule(nn.Module):
             d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
             deg = torch.bincount(d, minlength=1)
             self.agg = PnaAgg(n_hidden=n_hidden, deg=deg)
+        elif agg_type == 'pna':
+            uniq_index, inverse_indices = torch.unique(index, return_inverse=True)
+            d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+            deg = torch.bincount(d, minlength=1)
+            self.agg = ExSTraQtPnaEdgeGatedAgg(n_hidden=n_hidden, deg=deg)
         elif agg_type == 'sum':
             self.agg = SumAgg()
         elif agg_type == 'transformer':
@@ -383,10 +388,11 @@ class MultiEdgeAggModule(nn.Module):
         else:
             self.agg = IdentityAgg()
         
-    def forward(self, edge_index, edge_attr, simp_edge_batch, times):
+    def forward(self, edge_index, edge_attr, simp_edge_batch, times, amounts):
         _, inverse_indices = torch.unique(simp_edge_batch, return_inverse=True)
         new_edge_index = scatter(edge_index, inverse_indices, dim=1, reduce='mean') if self.agg_type is not None else edge_index
-
+        if (self.agg_type == 'exstraqt'):
+            new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times, log_amounts=amounts)
         if (self.agg_type == 'transformer') or (self.agg_type == 'gru'):
             new_edge_attr = self.agg(x= edge_attr, index=inverse_indices, timestamps_=times)
         else:
@@ -441,10 +447,22 @@ class MultiMPNN(torch.nn.Module):
                     ("node", 'to', 'node'): self.edge_emb(data['node', 'to', 'node'].edge_attr), 
                     ("node", 'rev_to', 'node'): self.edge_emb_rev(data['node', 'rev_to', 'node'].edge_attr),    
                 }
+
+            time_dict = {
+                    ("node", 'to', 'node'): data['node', 'to', 'node'].timestamps, 
+                    ("node", 'rev_to', 'node'): data['node', 'to', 'node'].timestamps,     
+                }
+
+            amount_dict = {
+                    ("node", 'to', 'node'): data['node', 'to', 'node'].log_amount, 
+                    ("node", 'rev_to', 'node'): data['node', 'to', 'node'].log_amount,     
+                }
+
+
             simp_edge_batch_dict = data.simp_edge_batch_dict if self.args.flatten_edges else None
 
             # Message Passing Layers
-            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict)
+            x_dict, edge_attr_dict = self.gnn(x_dict, data.edge_index_dict, edge_attr_dict, simp_edge_batch_dict, time_dict, amount_dict)
             x = x_dict['node']
             edge_attr = edge_attr_dict['node', 'to', 'node']
 
@@ -530,8 +548,8 @@ class GnnHelper(torch.nn.Module):
         self.num_gnn_layers = num_gnn_layers
         self.edge_updates = edge_updates
         self.final_dropout = final_dropout
-        self.flatten_edges = args.flatten_edges
-        self.edge_agg_type = args.edge_agg_type
+        self.flatten_edges = True
+        self.edge_agg_type = 'exstraqt'
         self.args = args
 
     
@@ -542,6 +560,8 @@ class GnnHelper(torch.nn.Module):
      
         self.edge_aggrs = nn.ModuleList()
         self.convs = nn.ModuleList()
+        self.edge_norms = nn.ModuleList()
+        self.edge_gates = nn.ModuleList()
         self.emlps = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
         for _ in range(self.num_gnn_layers):
@@ -568,11 +588,19 @@ class GnnHelper(torch.nn.Module):
                 nn.Linear(self.n_hidden, self.n_hidden),
             ))
             if self.flatten_edges:
-                edge_agg = MultiEdgeAggModule(n_hidden, agg_type=args.edge_agg_type, index=index_)
+                edge_agg = MultiEdgeAggModule(n_hidden, agg_type='exstraqt', index=index_)
                 self.edge_aggrs.append(edge_agg)
             self.convs.append(conv)
             self.batch_norms.append(BatchNorm(n_hidden))
-        
+            self.edge_norms.append(nn.LayerNorm(n_hidden))
+            self.edge_gates.append(
+                 nn.Sequential(
+                     nn.Linear(n_hidden * 2, n_hidden),
+                     nn.Relu(),
+                     nn.Linear(n_hidden, n_hidden),
+                     nn.Sigmoid()
+                 )
+            )        
 
         if self.edge_agg_type == 'adamm':
             self.edge_aggrs = None
@@ -599,8 +627,14 @@ class GnnHelper(torch.nn.Module):
                     n_edge_index, n_edge_attr, inverse_indices  = self.edge_aggrs[i](edge_index, edge_attr, simp_edge_batch, times)
                     x = (x + F.relu(self.batch_norms[i](self.convs[i](x, n_edge_index, n_edge_attr)))) / 2
                     if self.edge_updates: 
-                        remapped_edge_attr = torch.index_select(n_edge_attr, 0, inverse_indices) # artificall node attributes 
-                        edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], remapped_edge_attr, edge_attr], dim=-1)) / 2
+                        remapped_edge_attr = n_edge_attr[inverse_indices]
+                        edge_input =  torch.cat([x[src], remapped_edge_attr, edge_attr], dim=-1)
+                        edge_update = self.emlps[i](edge_input)
+                        gate = self.edge_gates[i](
+'                           torch.cat([edge_attr, edge_attr], dim=-1)
+                        )
+                        edge_attr = edge_attr = gate * edge_update
+                        edge_attr = edge_attr + self.edge_norms[i](edge_attr)
                 else:
                     x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
                     if self.edge_updates: 
