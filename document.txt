@@ -1,3 +1,371 @@
+import torch
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.typing import OptTensor
+import numpy as np
+import multiprocessing as mp
+import pandas as pd
+import ports_cpp
+import pandas as pd
+import numpy as np
+import torch
+import logging
+import itertools
+from types import SimpleNamespace
+import torch
+import tqdm
+from torch_geometric.transforms import BaseTransform
+from typing import Union
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import LinkNeighborLoader
+from sklearn.metrics import f1_score
+import json
+import os
+import numpy as np
+import sklearn.metrics
+import negative_sampling
+from torch_geometric.transforms import BaseTransform
+from torch_geometric.utils import degree
+from torch_scatter import scatter
+import torch.nn as nn
+from torch_geometric.nn import GINEConv, BatchNorm, Linear, GATConv, PNAConv, RGCNConv, to_hetero
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+import torch.nn.functional as F
+# from genagg.MLPAutoencoder import MLPAutoencoder
+from tqdm import tqdm
+from sklearn.metrics import f1_score
+import json
+import os
+import numpy as np
+import sklearn.metrics
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch_geometric.utils import softmax
+import math
+scaler_edge = StandardScaler()
+
+def assign_ports_with_cpp(graph, process_batch=True):
+    if isinstance(graph, HeteroGraphData):
+        if process_batch:
+            '''
+                If we have a Hetero Graph then merge the edge indices of forward and reverse edges for consistent port_id assignment.
+            '''
+            edge_index = torch.cat([graph['node', 'to', 'node'].edge_index, graph['node', 'rev_to', 'node'].edge_index], dim=1)
+            timestamp = torch.cat([graph['node', 'to', 'node'].timestamps, graph['node', 'rev_to', 'node'].timestamps], dim=0)
+        else:
+            edge_index = graph['node', 'to', 'node'].edge_index
+            timestamp = graph['node', 'to', 'node'].timestamps
+    else:
+        edge_index = graph.edge_index
+        timestamp = graph.timestamps
+
+    edges = torch.cat([edge_index.T, timestamp.reshape((-1,1))], dim=1).numpy().astype('int')
+    ports_1, ports_2 = ports_cpp.assign_ports(edges,edge_index.numpy().astype('int'), graph.num_nodes)
+    ports_arr = torch.stack([torch.tensor(ports_1), torch.tensor(ports_2)], dim=1)
+
+    if isinstance(graph, HeteroGraphData):
+        if process_batch:
+            cut_point = graph['node', 'to', 'node'].num_edges
+            graph['node', 'to', 'node'].edge_attr = torch.cat([graph['node', 'to', 'node'].edge_attr, ports_arr[:cut_point, :]], dim=1)
+            graph['node', 'rev_to', 'node'].edge_attr = torch.cat([graph['node', 'rev_to', 'node'].edge_attr, ports_arr[cut_point:, :]], dim=1)
+        else:
+            graph['node', 'to', 'node'].edge_attr = torch.cat([graph['node', 'to', 'node'].edge_attr, ports_arr], dim=1)
+    else:
+        graph.edge_attr = torch.cat([graph.edge_attr, ports_arr], dim=1)
+
+    return
+
+
+def to_adj_nodes_with_times(data):
+    num_nodes = data.num_nodes
+    timestamps = torch.zeros((data.edge_index.shape[1], 1)) if data.timestamps is None else data.timestamps.reshape((-1,1))
+    edges = torch.cat((data.edge_index.T, timestamps), dim=1) if not isinstance(data, HeteroData) else torch.cat((data['node', 'to', 'node'].edge_index.T, timestamps), dim=1)
+    adj_list_out = dict([(i, []) for i in range(num_nodes)])
+    adj_list_in = dict([(i, []) for i in range(num_nodes)])
+    for u,v,t in edges:
+        u,v,t = int(u), int(v), int(t)
+        adj_list_out[u] += [(v, t)]
+        adj_list_in[v] += [(u, t)]
+    return adj_list_in, adj_list_out
+
+def to_adj_edges_with_times(data):
+    num_nodes = data.num_nodes
+    timestamps = torch.zeros((data.edge_index.shape[1], 1)) if data.timestamps is None else data.timestamps.reshape((-1,1))
+    edges = torch.cat((data.edge_index.T, timestamps), dim=1)
+    # calculate adjacent edges with times per node
+    adj_edges_out = dict([(i, []) for i in range(num_nodes)])
+    adj_edges_in = dict([(i, []) for i in range(num_nodes)])
+    for i, (u,v,t) in enumerate(edges):
+        u,v,t = int(u), int(v), int(t)
+        adj_edges_out[u] += [(i, v, t)]
+        adj_edges_in[v] += [(i, u, t)]
+    return adj_edges_in, adj_edges_out
+
+def ports(edge_index, adj_list):
+    ports = torch.zeros(edge_index.shape[1], 1)
+    ports_dict = {}
+    for v, nbs in adj_list.items():
+        if len(nbs) < 1: continue
+        a = np.array(nbs)
+        a = a[a[:, -1].argsort()]
+        _, idx = np.unique(a[:,[0]],return_index=True,axis=0)
+        nbs_unique = a[np.sort(idx)][:,0]
+        for i, u in enumerate(nbs_unique):
+            ports_dict[(u,v)] = i
+    for i, e in enumerate(edge_index.T):
+        ports[i] = ports_dict[tuple(e.numpy())]
+    return ports
+
+def time_deltas(data, adj_edges_list):
+    time_deltas = torch.zeros(data.edge_index.shape[1], 1)
+    if data.timestamps is None:
+        return time_deltas
+    for v, edges in adj_edges_list.items():
+        if len(edges) < 1: continue
+        a = np.array(edges)
+        a = a[a[:, -1].argsort()]
+        a_tds = [0] + [a[i+1,-1] - a[i,-1] for i in range(a.shape[0]-1)]
+        tds = np.hstack((a[:,0].reshape(-1,1), np.array(a_tds).reshape(-1,1)))
+        for i,td in tds:
+            time_deltas[i] = td
+    return time_deltas
+
+class GraphData(Data):
+    '''This is the homogenous graph object we use for GNN training if reverse MP is not enabled'''
+    def __init__(
+        self, x: OptTensor = None, edge_index: OptTensor = None, edge_attr: OptTensor = None, y: OptTensor = None, pos: OptTensor = None,
+        readout: str = 'edge',
+        num_nodes: int = None,
+        timestamps: OptTensor = None,
+        node_timestamps: OptTensor = None,
+        **kwargs
+        ):
+        super().__init__(x, edge_index, edge_attr, y, pos, **kwargs)
+        self.readout = readout
+        self.loss_fn = 'ce'
+        self.num_nodes = int(self.x.shape[0])
+        self.node_timestamps = node_timestamps
+        if timestamps is not None:
+            self.timestamps = timestamps
+        elif edge_attr is not None:
+            self.timestamps = edge_attr[:,0].clone()
+        else:
+            self.timestamps = None
+
+    def add_ports(self):
+        '''Adds port numberings to the edge features'''
+        reverse_ports = True
+        adj_list_in, adj_list_out = to_adj_nodes_with_times(self)
+        in_ports = ports(self.edge_index, adj_list_in)
+        out_ports = [ports(self.edge_index.flipud(), adj_list_out)] if reverse_ports else []
+        self.edge_attr = torch.cat([self.edge_attr, in_ports] + out_ports, dim=1)
+        return self
+
+    def add_time_deltas(self):
+        '''Adds time deltas (i.e. the time between subsequent transactions) to the edge features'''
+        reverse_tds = True
+        adj_list_in, adj_list_out = to_adj_edges_with_times(self)
+        in_tds = time_deltas(self, adj_list_in)
+        out_tds = [time_deltas(self, adj_list_out)] if reverse_tds else []
+        self.edge_attr = torch.cat([self.edge_attr, in_tds] + out_tds, dim=1)
+        return self
+
+class HeteroGraphData(HeteroData):
+    '''This is the heterogenous graph object we use for GNN training if reverse MP is enabled'''
+    def __init__(
+        self,
+        readout: str = 'edge',
+        **kwargs
+        ):
+        super().__init__(**kwargs)
+        self.readout = readout
+
+    @property
+    def num_nodes(self):
+        return self['node'].x.shape[0]
+
+    @property
+    def timestamps(self):
+        return self['node', 'to', 'node'].timestamps
+
+    def add_ports(self):
+        '''Adds port numberings to the edge features'''
+        adj_list_in, adj_list_out = to_adj_nodes_with_times(self)
+        in_ports = ports(self['node', 'to', 'node'].edge_index, adj_list_in)
+        out_ports = ports(self['node', 'rev_to', 'node'].edge_index, adj_list_out)
+        self['node', 'to', 'node'].edge_attr = torch.cat([self['node', 'to', 'node'].edge_attr, in_ports], dim=1)
+        self['node', 'rev_to', 'node'].edge_attr = torch.cat([self['node', 'rev_to', 'node'].edge_attr, out_ports], dim=1)
+        return self
+
+    def add_time_deltas(self):
+        '''Adds time deltas (i.e. the time between subsequent transactions) to the edge features'''
+        adj_list_in, adj_list_out = to_adj_edges_with_times(self)
+        in_tds = time_deltas(self, adj_list_in)
+        out_tds = time_deltas(self, adj_list_out)
+        self['node', 'to', 'node'].edge_attr = torch.cat([self['node', 'to', 'node'].edge_attr, in_tds], dim=1)
+        self['node', 'rev_to', 'node'].edge_attr = torch.cat([self['node', 'rev_to', 'node'].edge_attr, out_tds], dim=1)
+        return self
+
+def z_norm(data):
+    std = data.std(0).unsqueeze(0)
+    std = torch.where(std == 0, torch.tensor(1, dtype=torch.float32).cpu(), std)
+    return (data - data.mean(0).unsqueeze(0)) / std
+
+def create_hetero_obj(x,  y,  edge_index,  edge_attr, timestamps, log_amount simp_edge_batch=None, batch=None):
+    '''Creates a heterogenous graph object for reverse message passing'''
+    data = HeteroGraphData()
+
+    data['node'].x = x
+
+    data['node', 'to', 'node'].y = y
+    data['node', 'to', 'node'].edge_index = edge_index
+    data['node', 'rev_to', 'node'].edge_index = edge_index.flipud()
+    data['node', 'to', 'node'].edge_attr = edge_attr
+    data['node', 'rev_to', 'node'].edge_attr = edge_attr
+
+    data['node', 'to', 'node'].simp_edge_batch = simp_edge_batch
+    data['node', 'rev_to', 'node'].simp_edge_batch = simp_edge_batch
+
+    data['node', 'rev_to', 'node'].edge_attr[:, [-1, -2]] = data['node', 'rev_to', 'node'].edge_attr[:, [-2, -1]]
+    data['node', 'to', 'node'].timestamps = timestamps
+    data['node', 'rev_to', 'node'].timestamps = timestamps
+    data['node', 'to', 'node'].log_amount = log_amount
+    data['node', 'rev_to', 'node'].log_amount = log_amount
+
+    return data
+
+def find_parallel_edges(edge_index):
+    simplified_edge_mapping = {}
+    simplified_edge_batch = []
+    i = 0
+    for edge in edge_index.T:
+        tuple_edge = tuple(edge.tolist())
+        if tuple_edge not in simplified_edge_mapping:
+            simplified_edge_mapping[tuple_edge] = i
+            i += 1
+        simplified_edge_batch.append(simplified_edge_mapping[tuple_edge])
+    simplified_edge_batch = torch.LongTensor(simplified_edge_batch)
+
+    return simplified_edge_batch
+
+transaction_file = '/kaggle/input/datasets/qucanhphan/dataset-aml/formatted_transactions.csv'
+df_edges = pd.read_csv(transaction_file)
+
+df_edges['Timestamp'] = df_edges['Timestamp'] - df_edges['Timestamp'].min()
+max_n_id = df_edges.loc[:, ['from_id', 'to_id']].to_numpy().max() + 1
+df_nodes = pd.DataFrame({'NodeID': np.arange(max_n_id), 'Feature': np.ones(max_n_id)})
+timestamps = torch.Tensor(df_edges['Timestamp'].to_numpy())
+y = torch.LongTensor(df_edges['Is Laundering'].to_numpy())
+edge_features = ['Timestamp', 'Amount Received', 'Received Currency', 'Payment Format']
+node_features = ['Feature']
+x = torch.tensor(df_nodes.loc[:, node_features].to_numpy()).float()
+edge_index = torch.LongTensor(df_edges.loc[:, ['from_id', 'to_id']].to_numpy().T)
+edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
+
+
+config.num_neighs = [100, 100]
+config.batch_size=4096
+
+def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, args):
+    if isinstance(tr_data, HeteroData):
+        tr_edge_label_index = tr_data['node', 'to', 'node'].edge_index
+        tr_edge_label = tr_data['node', 'to', 'node'].y
+
+
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), tr_edge_label_index),
+                                    edge_label=tr_edge_label, batch_size=args.batch_size, shuffle=True, transform=transform)
+
+        val_edge_label_index = val_data['node', 'to', 'node'].edge_index[:,val_inds]
+        val_edge_label = val_data['node', 'to', 'node'].y[val_inds]
+
+
+        val_loader =  LinkNeighborLoader(val_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), val_edge_label_index),
+                                    edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+
+        te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
+        te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
+
+
+        te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
+                                    edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+    else:
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, batch_size=args.batch_size, shuffle=True, transform=transform)
+        val_loader = LinkNeighborLoader(val_data,num_neighbors=args.num_neighs, edge_label_index=val_data.edge_index[:, val_inds],
+                                        edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+        te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
+                                edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+
+    return tr_loader, val_loader, te_loader
+
+class AddEgoIds(BaseTransform):
+    r"""Add IDs to the centre nodes of the batch.
+    """
+    def __init__(self):
+        pass
+
+    def forward(self, data: Union[Data, HeteroData]):
+        x = data.x if not isinstance(data, HeteroData) else data['node'].x
+        device = x.device
+        ids = torch.zeros((x.shape[0], 1), device=device)
+        if not isinstance(data, HeteroData):
+            nodes = torch.unique(data.edge_label_index.view(-1)).to(device)
+        else:
+            nodes = torch.unique(data['node', 'to', 'node'].edge_label_index.view(-1)).to(device)
+        ids[nodes] = 1
+        if not isinstance(data, HeteroData):
+            data.x = torch.cat([x, ids], dim=1)
+        else:
+            data['node'].x = torch.cat([x, ids], dim=1)
+
+        return data
+
+
+def add_arange_ids(data_list):
+    '''
+    Add the index as an id to the edge features to find seed edges in training, validation and testing.
+
+    Args:
+    - data_list (str): List of tr_data, val_data and te_data.
+    '''
+    for data in data_list:
+        if isinstance(data, HeteroData):
+            data['node', 'to', 'node'].edge_attr = torch.cat([torch.arange(data['node', 'to', 'node'].edge_attr.shape[0]).view(-1, 1), data['node', 'to', 'node'].edge_attr], dim=1)
+            offset = data['node', 'to', 'node'].edge_attr.shape[0]
+            data['node', 'rev_to', 'node'].edge_attr = torch.cat([torch.arange(offset, data['node', 'rev_to', 'node'].edge_attr.shape[0] + offset).view(-1, 1), data['node', 'rev_to', 'node'].edge_attr], dim=1)
+        else:
+            data.edge_attr = torch.cat([torch.arange(data.edge_attr.shape[0]).view(-1, 1), data.edge_attr], dim=1)
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
+transform = AddEgoIds()
+
+add_arange_ids([tr_data, val_data, te_data])
+tr_loader, val_loader, te_loader = get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, config)
+
+sample_batch = next(iter(tr_loader))
+
+if isinstance(sample_batch, HeteroData):
+  sample_batch['node', 'to', 'node'].edge_attr = sample_batch['node', 'to', 'node'].edge_attr[:, 1:]
+  sample_batch['node', 'rev_to', 'node'].edge_attr = sample_batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+else:
+  sample_batch.edge_attr = sample_batch.edge_attr[:, 1:]
+
+if isinstance(sample_batch, HeteroData):
+  sample_batch['node', 'to', 'node'].edge_attr = torch.cat([sample_batch['node', 'to', 'node'].edge_attr, torch.zeros((sample_batch['node', 'to', 'node'].edge_attr.shape[0], 2))], dim=1)
+  sample_batch['node', 'rev_to', 'node'].edge_attr = torch.cat([sample_batch['node', 'rev_to', 'node'].edge_attr, torch.zeros((sample_batch['node', 'rev_to', 'node'].edge_attr.shape[0], 2))], dim=1)
+else:
+  sample_batch.edge_attr = torch.cat([sample_batch.edge_attr, torch.zeros((sample_batch.edge_attr.shape[0], 2))], dim=1)
+
+uniq_index, inverse_indices = torch.unique(sample_batch['node', 'to', 'node'].simp_edge_batch, return_inverse=True)
+d = degree(inverse_indices, num_nodes=uniq_index.numel(), dtype=torch.long)
+deg = torch.bincount(d, minlength=1)
+
+sample_batch['node', 'to', 'node'].simp_edge_batch
 
 class DiscreteEncoder(nn.Module):
     def __init__(self, hidden_channels, max_num_features=10, max_num_values=500): #10
@@ -641,6 +1009,202 @@ class GnnHelper(torch.nn.Module):
                         edge_attr = edge_attr + self.emlps[i](torch.cat([x[src], x[dst], edge_attr], dim=-1)) / 2
                     
         return x, edge_attr
+
+
+
+def get_model(sample_batch, config):
+    n_feats = sample_batch.x.shape[1] if not isinstance(sample_batch, HeteroData) else sample_batch['node'].x.shape[1]
+    e_dim = (sample_batch.edge_attr.shape[1]) if not isinstance(sample_batch, HeteroData) else (sample_batch['node', 'to', 'node'].edge_attr.shape[1])
+
+    index_ = sample_batch.simp_edge_batch if not isinstance(sample_batch, HeteroData) else sample_batch['node', 'to', 'node'].simp_edge_batch
+
+    if not isinstance(sample_batch, HeteroData):
+      s_edges = torch.unique(sample_batch.edge_index, dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+    else:
+      s_edges = torch.unique(torch.cat((sample_batch['node', 'to', 'node'].edge_index, sample_batch['node', 'rev_to', 'node'].edge_index), 1), dim=1)
+      d = degree(s_edges[1], num_nodes=sample_batch.num_nodes, dtype=torch.long)
+
+    deg = torch.bincount(d, minlength=1)
+
+    model = MultiMPNN(num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
+                      n_hidden=round(config.n_hidden), edge_updates=True, edge_dim=e_dim,
+                      final_dropout=config.final_dropout, index_=index_, deg=deg)
+
+    return model
+
+def compute_binary_metrics(preds: np.array, labels: np.array):
+    probs = preds[:,1]
+    preds = preds.argmax(axis=-1)
+
+    precisions, recalls, _ = sklearn.metrics.precision_recall_curve(labels, probs)
+    f1 = sklearn.metrics.f1_score(labels, preds, zero_division=0)
+    auc = sklearn.metrics.auc(recalls, precisions)
+
+    precision = sklearn.metrics.precision_score(labels, preds, zero_division=0)
+    recall = sklearn.metrics.recall_score(labels, preds, zero_division=0)
+
+    return f1, auc, precision, recall
+
+@torch.no_grad()
+def evaluate_hetero(loader, inds, model, data, device):
+    model.eval()
+    preds = []
+    ground_truths = []
+    for batch in tqdm(loader):
+        assign_ports_with_cpp(batch)
+        inds = inds.detach().cpu()
+        batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+        batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+        mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+
+        missing = ~torch.isin(batch_edge_ids, batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu())
+
+        batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+        batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+        with torch.no_grad():
+            batch.to(device)
+            out = model(batch)
+            out = out[mask]
+            pred = out
+            preds.append(pred.detach().cpu())
+            ground_truths.append(batch['node', 'to', 'node'].y[mask].detach().cpu())
+
+    pred = torch.cat(preds, dim=0).numpy()
+    ground_truth = torch.cat(ground_truths, dim=0).numpy()
+    f1, auc, precision, recall = compute_binary_metrics(pred, ground_truth)
+
+    model.train()
+    return pred, ground_truth, f1, auc, precision, recall
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DWBLoss(nn.Module):
+    def __init__(self, class_counts, reduction='mean'):
+        """
+        Khởi tạo DWB Loss.
+        
+        Args:
+            class_counts (list hoặc hoặc tuple hoặc Tensor): Số lượng mẫu của từng lớp trong tập huấn luyện.
+            reduction (str): Cách giảm thiểu loss ('mean', 'sum', hoặc 'none').
+        """
+        super(DWBLoss, self).__init__()
+        self.reduction = reduction
+        
+        # Chuyển số lượng mẫu thành tensor dạng float
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        max_count = torch.max(counts)
+        
+        # Tính trọng số tĩnh w_j cho từng lớp theo Công thức (8):
+        # w_j = log( max(n_k) / n_j ) + 1
+        # Thêm eps nhỏ để tránh chia cho 0 nếu có lớp không có mẫu nào
+        self.weights = torch.log(max_count / (counts + 1e-8)) + 1.0
+
+    def forward(self, logits, targets):
+        """
+        Tính toán DWB Loss.
+        
+        Args:
+            logits (Tensor): Đầu ra chưa qua kích hoạt của mô hình, hình dạng (batch_size, num_classes).
+            targets (Tensor): Nhãn thực tế (ground-truth dạng số nguyên), hình dạng (batch_size,).
+        """
+        # Đảm bảo trọng số w_j nằm trên cùng thiết bị (CPU/GPU) với logits
+        self.weights = self.weights.to(logits.device)
+        
+        # 1. Tính xác suất p_ij của các lớp bằng Softmax
+        probs = F.softmax(logits, dim=-1)
+        
+        # 2. Tính log(p_ij) ổn định bằng log_softmax (tránh lỗi log(0))
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # 3. Trích xuất p_y và log(p_y) của lớp thực tế (ground-truth) cho từng mẫu
+        batch_size = logits.size(0)
+        batch_indices = torch.arange(batch_size, device=logits.device)
+        
+        p_y = probs[batch_indices, targets]
+        log_p_y = log_probs[batch_indices, targets]
+        
+        # 4. Lấy trọng số tĩnh w_y tương ứng với lớp thực tế của từng mẫu
+        w_y = self.weights[targets]
+        
+        # 5. Tính Thành phần 1: Dynamically Weighted CE 
+        # công thức: - (w_y) ^ (1 - p_y) * log(p_y)
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        term1 = - dynamic_weight * log_p_y
+        
+        # 6. Tính Thành phần 2: Regularization (Entropy của Brier Score)
+        # công thức: - p_y * (1 - p_y)
+        term2 = - p_y * (1.0 - p_y)
+        
+        # 7. Tổng hợp DWB Loss cho từng mẫu theo Công thức (13)
+        loss = term1 + term2
+        
+        # Áp dụng phương thức giảm thiểu (reduction) cho cả batch
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+model = get_model(sample_batch, config)
+model.to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+sample_batch.to(device)
+loss_fn = torch.nn.CrossEntropyLoss(weight=torch.FloatTensor([config.w_ce1, config.w_ce2]).to(device))
+class_samples = [3245143176, 2350]
+criterion = DWBLoss(class_samples)
+
+best_val_f1 = 0
+for epoch in range(config.epochs):
+  total_loss = total_examples = 0
+  preds = []
+  ground_truths = []
+
+  for batch in tqdm(tr_loader):
+    assign_ports_with_cpp(batch, process_batch=True)
+    optimizer.zero_grad()
+
+    inds = tr_inds.detach().cpu()
+    batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
+    batch_edge_ids = tr_loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+    mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+    batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+    batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+    batch.to(device)
+    out = model(batch)
+    pred = out[mask]
+    ground_truth = batch['node', 'to', 'node'].y[mask]
+    loss = criterion(pred, ground_truth)
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    total_loss += float(loss) * pred.numel()
+    total_examples += pred.numel()
+    preds.append(pred.detach().cpu())
+    ground_truths.append(ground_truth.detach().cpu())
+
+  pred = torch.cat(preds, dim=0).numpy()
+  ground_truth = torch.cat(ground_truths, dim=0).numpy()
+  f1, auc, precision, recall = compute_binary_metrics(pred, ground_truth)
+
+  val_pred, val_ground_truth, val_f1, val_auc, val_precision, val_recall = evaluate_hetero(val_loader, val_inds, model, val_data, device)
+  print(f"Epoch: {epoch}, Loss: {total_loss}, F1: {f1}, auc: {auc}, precision: {precision}, recall: {recall}")
+  print(f"val_F1: {val_f1}, val_auc: {val_auc}, val_precision: {val_precision}, val_recall: {val_recall}")
+  if val_f1 > best_val_f1:
+    best_val_f1 = val_f1
+    torch.save({
+          'epoch': epoch + 1,
+          'model_state_dict': model.state_dict(),
+          'optimizer_state_dict': optimizer.state_dict()
+        },
+        f'/kaggle/working/epoch_{epoch+1}.tar'
+    )
 
 
 
