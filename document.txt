@@ -1,3 +1,38 @@
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+
+X_2d = TSNE(
+    n_components=2,
+    perplexity=30,
+    random_state=42
+).fit_transform(X)
+
+plt.scatter(
+    X_2d[y==0,0],
+    X_2d[y==0,1],
+    s=5,
+    label="Normal"
+)
+
+plt.scatter(
+    X_2d[y==1,0],
+    X_2d[y==1,1],
+    s=5,
+    label="Fraud"
+)
+
+plt.legend()
+plt.show()
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
