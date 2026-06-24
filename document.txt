@@ -1,3 +1,49 @@
+import pickle
+import csv
+
+with open("MulDiGraph.pkl", "rb") as f:
+    G = pickle.load(f)
+
+# Nodes
+with open("nodes.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["node_id", "isp"])
+
+    for node, attr in G.nodes(data=True):
+        writer.writerow([
+            node,
+            attr.get("isp", 0)
+        ])
+
+# Edges
+with open("edges.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "src",
+        "dst",
+        "edge_id",
+        "amount",
+        "timestamp"
+    ])
+
+    for src, dst, key, attr in G.edges(keys=True, data=True):
+        writer.writerow([
+            src,
+            dst,
+            key,
+            attr.get("amount"),
+            attr.get("timestamp")
+        ])
+
+
+
+
+
+
+
+
+
+
 ### Downloading
 
 1. Máy tính của tôi đang downloading bản cập nhật phần mềm mới nhất.
