@@ -1,3 +1,31 @@
+nodes = pd.read_csv("nodes-kaggle.csv")
+edges = pd.read_csv("edges-kaggle.csv")
+
+nodes.drop('Unnamed: 0', axis=1, inplace=True)
+edges.drop('Unnamed: 0', axis=1, inplace=True)
+
+nodes['node'] = nodes['node'].astype(str)
+edges['from_address'] = edges['from_address'].astype(str)
+edges['to_address'] = edges['to_address'].astype(str)
+
+node_set = set(nodes['node'])
+
+missing_from = set(edges['from_address']) - node_set
+missing_to = set(edges['to_address']) - node_set
+
+print("missing_from =", len(missing_from))
+print("missing_to   =", len(missing_to))
+
+if len(missing_from):
+    print("sample from:", list(missing_from)[:5])
+
+if len(missing_to):
+    print("sample to:", list(missing_to)[:5])
+
+
+
+
+
 import pickle
 import csv
 from tqdm import tqdm
