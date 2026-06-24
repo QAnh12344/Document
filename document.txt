@@ -1,3 +1,13 @@
+### GDPR
+
+1. Công ty đã cập nhật chính sách bảo mật để tuân thủ các yêu cầu của GDPR.
+2. GDPR quy định rằng người dùng có quyền yêu cầu xóa dữ liệu cá nhân của mình khỏi hệ thống.
+3. Nhiều doanh nghiệp công nghệ phải điều chỉnh quy trình xử lý dữ liệu sau khi GDPR có hiệu lực.
+4. Việc vi phạm GDPR có thể khiến tổ chức phải đối mặt với các khoản phạt rất lớn.
+5. Khóa đào tạo về GDPR giúp nhân viên hiểu rõ trách nhiệm của mình trong việc bảo vệ dữ liệu cá nhân.
+
+
+
 ### Alzheimer
 
 1. Bà tôi được chẩn đoán mắc bệnh Alzheimer nên gia đình luôn thay phiên nhau chăm sóc.
