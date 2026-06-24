@@ -1,5 +1,106 @@
 import pickle
 import csv
+from tqdm import tqdm
+
+with open("MulDiGraph.pkl", "rb") as f:
+    G = pickle.load(f)
+
+print("Nodes:", G.number_of_nodes())
+print("Edges:", G.number_of_edges())
+
+# =====================================================
+# Tìm first_transaction cho từng node
+# =====================================================
+
+first_tx = {}
+
+for u, v, _, attr in tqdm(
+        G.edges(keys=True, data=True),
+        total=G.number_of_edges(),
+        desc="Finding first transaction"):
+
+    ts = attr["timestamp"]
+
+    if u not in first_tx:
+        first_tx[u] = ts
+    else:
+        first_tx[u] = min(first_tx[u], ts)
+
+    if v not in first_tx:
+        first_tx[v] = ts
+    else:
+        first_tx[v] = min(first_tx[v], ts)
+
+# =====================================================
+# nodes-kaggle.csv
+# =====================================================
+
+with open("nodes-kaggle.csv", "w", newline="") as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "Unnamed: 0",
+        "node",
+        "label",
+        "first_transaction",
+        "Feature"
+    ])
+
+    for idx, (node, attr) in enumerate(
+            tqdm(G.nodes(data=True),
+                 total=G.number_of_nodes(),
+                 desc="Writing nodes")):
+
+        writer.writerow([
+            idx,
+            node,
+            attr.get("isp", 0),      # loader cần cột label
+            first_tx.get(node, 0),
+            1                        # placeholder feature
+        ])
+
+# =====================================================
+# edges-kaggle.csv
+# =====================================================
+
+with open("edges-kaggle.csv", "w", newline="") as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "Unnamed: 0",
+        "from_address",
+        "to_address",
+        "amount",
+        "timestamp"
+    ])
+
+    for eid, (u, v, _, attr) in enumerate(
+            tqdm(G.edges(keys=True, data=True),
+                 total=G.number_of_edges(),
+                 desc="Writing edges")):
+
+        writer.writerow([
+            eid,
+            u,
+            v,
+            attr.get("amount", 0),
+            attr.get("timestamp", 0)
+        ])
+
+print("Done.")
+
+
+
+
+
+
+
+
+
+import pickle
+import csv
 
 with open("MulDiGraph.pkl", "rb") as f:
     G = pickle.load(f)
