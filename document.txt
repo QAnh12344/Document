@@ -1,3 +1,43 @@
+### Alzheimer
+
+1. Bà tôi được chẩn đoán mắc bệnh Alzheimer nên gia đình luôn thay phiên nhau chăm sóc.
+2. Các nhà khoa học đang nghiên cứu nhiều phương pháp mới để làm chậm tiến triển của bệnh Alzheimer.
+3. Bộ phim đã khắc họa cảm động cuộc sống của một người cao tuổi mắc bệnh Alzheimer.
+4. Việc phát hiện sớm các dấu hiệu của bệnh Alzheimer có thể giúp cải thiện chất lượng cuộc sống của người bệnh.
+5. Nhiều tổ chức y tế thường xuyên tổ chức các chiến dịch nâng cao nhận thức về bệnh Alzheimer.
+
+### Trống điện tử
+
+1. Anh ấy luyện tập trống điện tử mỗi tối để không làm ảnh hưởng đến hàng xóm.
+2. Trường âm nhạc vừa trang bị thêm một số bộ trống điện tử hiện đại cho học viên.
+3. Nhờ có tai nghe, người chơi trống điện tử có thể tập luyện bất cứ lúc nào.
+4. Ban nhạc quyết định sử dụng trống điện tử trong buổi biểu diễn ngoài trời vì tính linh hoạt của nó.
+5. Cô bé rất hào hứng khi lần đầu tiên được thử chơi trống điện tử.
+
+### Xông hơi
+
+1. Sau một ngày làm việc căng thẳng, tôi thường dành thời gian để xông hơi thư giãn.
+2. Khu nghỉ dưỡng này nổi tiếng với dịch vụ xông hơi bằng thảo dược thiên nhiên.
+3. Nhiều người thích xông hơi vào mùa đông để cảm thấy ấm áp và dễ chịu hơn.
+4. Bác sĩ khuyên anh ấy nên tham khảo ý kiến chuyên môn trước khi xông hơi thường xuyên.
+5. Phòng xông hơi của khách sạn được thiết kế rộng rãi và hiện đại.
+
+### Dual Messenger
+
+1. Tôi sử dụng Dual Messenger để đăng nhập hai tài khoản mạng xã hội trên cùng một điện thoại.
+2. Tính năng Dual Messenger rất hữu ích cho những người muốn tách biệt công việc và cuộc sống cá nhân.
+3. Sau khi bật Dual Messenger, tôi có thể nhận tin nhắn từ cả hai tài khoản cùng lúc.
+4. Một số ứng dụng không hỗ trợ Dual Messenger nên người dùng cần kiểm tra trước khi cài đặt.
+5. Nhờ Dual Messenger, việc quản lý nhiều tài khoản trở nên thuận tiện và nhanh chóng hơn.
+
+
+
+
+
+
+
+
+
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
