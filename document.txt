@@ -1,3 +1,14 @@
+### Downloading
+
+1. Máy tính của tôi đang downloading bản cập nhật phần mềm mới nhất.
+2. Quá trình downloading tệp dữ liệu lớn mất nhiều thời gian hơn dự kiến.
+3. Cô ấy đang downloading các bài giảng để học khi không có kết nối Internet.
+4. Trong lúc downloading ứng dụng, tôi vẫn có thể sử dụng các chức năng khác của điện thoại.
+5. Tốc độ mạng chậm khiến việc downloading video độ phân giải cao trở nên khó khăn.
+
+
+
+
 ### GDPR
 
 1. Công ty đã cập nhật chính sách bảo mật để tuân thủ các yêu cầu của GDPR.
