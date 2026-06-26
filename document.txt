@@ -1,3 +1,18 @@
+1. Tôi thường bật ambient sound của tiếng mưa để giúp bản thân tập trung khi học.
+
+2. Chiếc tai nghe này có tính năng phát ambient sound nhằm tạo cảm giác thư giãn hơn.
+
+3. Nhà phát triển trò chơi đã bổ sung ambient sound của rừng cây để tăng tính chân thực cho môi trường.
+
+4. Nhiều ứng dụng thiền cho phép người dùng lựa chọn ambient sound như tiếng sóng biển hoặc tiếng chim hót.
+
+5. Ambient sound trong bộ phim được xử lý rất tốt, khiến người xem có cảm giác như đang ở ngay trong khung cảnh đó.
+
+
+
+
+
+
 1. Chỉ số AGE trong hồ sơ bệnh nhân cho biết độ tuổi của người được khám.
 
 2. Hệ thống sử dụng chỉ số AGE để phân nhóm người dùng theo từng độ tuổi.
