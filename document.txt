@@ -1,3 +1,18 @@
+1. Chỉ số AGE trong hồ sơ bệnh nhân cho biết độ tuổi của người được khám.
+
+2. Hệ thống sử dụng chỉ số AGE để phân nhóm người dùng theo từng độ tuổi.
+
+3. Nhà nghiên cứu đưa chỉ số AGE vào mô hình nhằm đánh giá ảnh hưởng của tuổi đến kết quả thí nghiệm.
+
+4. Trước khi phân tích dữ liệu, nhóm nghiên cứu đã kiểm tra xem chỉ số AGE có bị thiếu hay không.
+
+5. Chỉ số AGE là một trong những biến quan trọng được sử dụng để dự đoán nguy cơ mắc bệnh.
+
+
+
+
+
+
 1. Các nhà khoa học vẫn đang nghiên cứu vai trò của AGE trong sự phát triển của nhiều bệnh lý liên quan đến tuổi tác.
 
 2. Kết quả xét nghiệm cho thấy nồng độ AGE trong máu của bệnh nhân cao hơn mức bình thường.
