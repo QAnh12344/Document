@@ -1,3 +1,20 @@
+1. Các nhà khoa học vẫn đang nghiên cứu vai trò của AGE trong sự phát triển của nhiều bệnh lý liên quan đến tuổi tác.
+
+2. Kết quả xét nghiệm cho thấy nồng độ AGE trong máu của bệnh nhân cao hơn mức bình thường.
+
+3. Một số loại thực phẩm chế biến ở nhiệt độ cao chứa nhiều AGE hơn so với thực phẩm được luộc hoặc hấp.
+
+4. Bác sĩ khuyên người bệnh điều chỉnh chế độ ăn để hạn chế sự tích tụ của AGE trong cơ thể.
+
+5. Nhóm nghiên cứu đã sử dụng chỉ số AGE để đánh giá ảnh hưởng của thói quen ăn uống đến sức khỏe của người tham gia.
+
+
+
+
+
+
+
+
 nodes = pd.read_csv("nodes-kaggle.csv")
 edges = pd.read_csv("edges-kaggle.csv")
 
