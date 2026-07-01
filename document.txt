@@ -1,3 +1,113 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DWBLoss(nn.Module):
+    """
+    Entropy-Calibrated Dynamically Weighted Balancing Loss
+
+    Proposed version based on DWB Loss.
+    """
+
+    def __init__(
+        self,
+        class_counts,
+        lambda_entropy=0.5,
+        beta=1.0,
+        reduction="mean",
+    ):
+        super().__init__()
+
+        self.lambda_entropy = lambda_entropy
+        self.beta = beta
+        self.reduction = reduction
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        max_count = counts.max()
+
+        weights = torch.log(max_count / (counts + 1e-8)) + 1.0
+
+        self.register_buffer("weights", weights)
+
+    def forward(self, logits, targets):
+
+        # -----------------------------------
+        # probabilities
+        # -----------------------------------
+        probs = F.softmax(logits, dim=1)
+
+        log_probs = F.log_softmax(logits, dim=1)
+
+        batch_idx = torch.arange(
+            logits.size(0),
+            device=logits.device
+        )
+
+        p_y = probs[batch_idx, targets]
+
+        log_p_y = log_probs[batch_idx, targets]
+
+        # -----------------------------------
+        # class weight
+        # -----------------------------------
+        w_y = self.weights[targets]
+
+        # -----------------------------------
+        # normalized entropy
+        # -----------------------------------
+        entropy = -(probs * log_probs).sum(dim=1)
+
+        entropy = entropy / math.log(logits.size(1))
+
+        entropy = entropy.clamp(0.0, 1.0)
+
+        # -----------------------------------
+        # Entropy-Calibrated Dynamic Weight
+        #
+        # w^( (1-p)*(1+lambda*(1-H)) )
+        # -----------------------------------
+        exponent = (
+            (1.0 - p_y)
+            *
+            (
+                1.0
+                + self.lambda_entropy
+                * (1.0 - entropy)
+            )
+        )
+
+        dynamic_weight = torch.pow(
+            w_y,
+            exponent
+        )
+
+        # -----------------------------------
+        # Classification loss
+        # -----------------------------------
+        cls_loss = -dynamic_weight * log_p_y
+
+        # -----------------------------------
+        # Brier regularization
+        # -----------------------------------
+        brier_reg = -self.beta * p_y * (1.0 - p_y)
+
+        loss = cls_loss + brier_reg
+
+        if self.reduction == "mean":
+            return loss.mean()
+
+        elif self.reduction == "sum":
+            return loss.sum()
+
+        return loss
+
+
+
+
+
+
 ## BTS
 
 1. Video BTS của bộ phim cho thấy nhiều cảnh quay thú vị mà khán giả không được thấy trong phiên bản chính.
