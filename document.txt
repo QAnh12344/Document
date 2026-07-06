@@ -1,3 +1,22 @@
+## 1. cược martingale
+
+1. Anh ấy thử áp dụng **cược martingale** trong trò roulette, nhưng chỉ sau vài ván thua liên tiếp đã chạm giới hạn vốn.
+2. Nhiều người mới chơi lầm tưởng rằng **cược martingale** là chiến lược chắc thắng, trong khi rủi ro thực tế lại rất cao.
+3. Bài viết phân tích ưu và nhược điểm của **cược martingale** dưới góc độ xác suất và quản lý tài chính.
+
+## 2. karate
+
+1. Cô bé đã học **karate** được ba năm và vừa giành huy chương vàng ở giải đấu cấp tỉnh.
+2. Tập **karate** không chỉ giúp nâng cao thể lực mà còn rèn luyện tính kỷ luật và sự tự tin.
+3. Sau giờ học, Minh thường đến câu lạc bộ **karate** để luyện các bài quyền cùng huấn luyện viên.
+
+
+
+
+
+
+
+
 import math
 import torch
 import torch.nn as nn
