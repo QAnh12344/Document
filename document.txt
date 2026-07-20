@@ -5,6 +5,210 @@ import networkx as nx
 from torch_geometric.utils import k_hop_subgraph
 
 
+# ===================================
+# 1. Chọn False Negative transaction
+# ===================================
+
+target_edge_id = int(fn_edge_ids[0])
+
+edge_index = data['node', 'to', 'node'].edge_index
+edge_attr = data['node', 'to', 'node'].edge_attr
+
+
+# ===================================
+# 2. Tìm edge trong graph gốc
+# ===================================
+
+edge_pos = (edge_attr[:, 0] == target_edge_id).nonzero(as_tuple=True)[0]
+
+if len(edge_pos) == 0:
+    raise ValueError("Không tìm thấy edge")
+
+edge_pos = edge_pos.item()
+
+
+src = edge_index[0, edge_pos].item()
+dst = edge_index[1, edge_pos].item()
+
+
+print("Target FN")
+print("Edge ID:", target_edge_id)
+print("Source:", src)
+print("Destination:", dst)
+
+
+
+# ===================================
+# 3. Extract neighborhood
+# ===================================
+
+subset, sub_edge_index, mapping, edge_mask = k_hop_subgraph(
+    node_idx=[src, dst],
+    num_hops=2,
+    edge_index=edge_index,
+    relabel_nodes=True
+)
+
+
+
+# ===================================
+# 4. Build NetworkX
+# ===================================
+
+G = nx.DiGraph()
+
+edge_draw_info = []
+
+
+# vị trí cạnh trong graph gốc
+original_edge_indices = torch.where(edge_mask)[0]
+
+
+for i, original_idx in enumerate(original_edge_indices):
+
+    original_idx = original_idx.item()
+
+    u = sub_edge_index[0, i].item()
+    v = sub_edge_index[1, i].item()
+
+    G.add_edge(u, v)
+
+
+    edge_id = int(edge_attr[original_idx, 0])
+
+
+    # mặc định:
+    # context edge (không thuộc test)
+    color = "lightgray"
+    width = 1
+
+
+    # tìm edge trong tập test
+    idx = (edge_ids == edge_id).nonzero(as_tuple=True)[0]
+
+
+    if len(idx) > 0:
+
+        idx = idx.item()
+
+        true = int(ground_truth[idx])
+        pred = int(pred_label[idx])
+
+
+        # AML đúng
+        if true == 1 and pred == 1:
+            color = "green"
+            width = 2
+
+
+        # Normal đúng
+        elif true == 0 and pred == 0:
+            color = "gray"
+            width = 1
+
+
+        # False Negative
+        elif true == 1 and pred == 0:
+            color = "red"
+            width = 4
+
+
+        # False Positive
+        elif true == 0 and pred == 1:
+            color = "orange"
+            width = 3
+
+
+
+    # ép cạnh target luôn đỏ
+    if edge_id == target_edge_id:
+        color = "red"
+        width = 5
+
+
+    edge_draw_info.append(
+        (u, v, color, width, edge_id)
+    )
+
+
+
+# ===================================
+# 5. Vẽ graph
+# ===================================
+
+plt.figure(figsize=(12,10))
+
+pos = nx.spring_layout(
+    G,
+    seed=42
+)
+
+
+# Nodes
+nx.draw_networkx_nodes(
+    G,
+    pos,
+    node_size=700
+)
+
+
+nx.draw_networkx_labels(
+    G,
+    pos,
+    font_size=9
+)
+
+
+
+# Edges
+for u, v, color, width, eid in edge_draw_info:
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        edgelist=[(u,v)],
+        edge_color=color,
+        width=width,
+        arrows=True
+    )
+
+
+
+plt.title(
+    f"False Negative Transaction {target_edge_id}\n"
+    f"{src} -> {dst}, 2-hop neighborhood"
+)
+
+plt.axis("off")
+plt.show()
+
+
+
+# ===================================
+# 6. Thông tin
+# ===================================
+
+print("\nSubgraph")
+print("----------------")
+print("Nodes:", len(subset))
+print("Edges:", sub_edge_index.shape[1])
+
+print("\nEdge IDs:")
+print(edge_attr[edge_mask,0])
+
+
+
+
+
+
+
+import torch
+import matplotlib.pyplot as plt
+import networkx as nx
+
+from torch_geometric.utils import k_hop_subgraph
+
+
 # ============================
 # 1. Chọn một False Negative
 # ============================
