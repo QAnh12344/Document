@@ -1,3 +1,44 @@
+from torch_geometric.utils import k_hop_subgraph
+
+# ===== Lấy một False Negative =====
+target_edge_id = int(fn_edge_ids[0])
+
+edge_index = data['node', 'to', 'node'].edge_index
+edge_attr = data['node', 'to', 'node'].edge_attr
+
+# Tìm vị trí của cạnh trong graph
+edge_pos = (edge_attr[:, 0] == target_edge_id).nonzero(as_tuple=True)[0].item()
+
+# Hai node đầu mút của transaction
+src = edge_index[0, edge_pos].item()
+dst = edge_index[1, edge_pos].item()
+
+# Trích xuất 2-hop subgraph
+subset, sub_edge_index, mapping, edge_mask = k_hop_subgraph(
+    node_idx=[src, dst],
+    num_hops=2,
+    edge_index=edge_index,
+    relabel_nodes=False,
+)
+
+# Các cạnh thuộc subgraph
+sub_edge_attr = edge_attr[edge_mask]
+
+print("Target Edge ID:", target_edge_id)
+print("Source:", src)
+print("Destination:", dst)
+print("Number of nodes:", len(subset))
+print("Number of edges:", sub_edge_index.size(1))
+print("Node IDs:", subset)
+print("Edge IDs in subgraph:", sub_edge_attr[:, 0])
+
+
+
+
+
+
+
+
 1. Điện thoại của tôi hỗ trợ UWB nên việc tìm thiết bị thất lạc trở nên chính xác hơn.
 
 2. Tôi đã bật UWB để chia sẻ dữ liệu với thiết bị ở gần một cách nhanh chóng.
