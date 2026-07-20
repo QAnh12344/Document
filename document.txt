@@ -1,3 +1,159 @@
+import torch
+import matplotlib.pyplot as plt
+import networkx as nx
+
+from torch_geometric.utils import k_hop_subgraph
+
+
+# ============================
+# 1. Chọn một False Negative
+# ============================
+
+target_edge_id = int(fn_edge_ids[0])
+
+edge_index = data['node', 'to', 'node'].edge_index
+edge_attr = data['node', 'to', 'node'].edge_attr
+
+
+# ============================
+# 2. Tìm vị trí cạnh trong graph
+# ============================
+
+edge_pos = (edge_attr[:, 0] == target_edge_id).nonzero(as_tuple=True)[0]
+
+if len(edge_pos) == 0:
+    raise ValueError("Không tìm thấy edge id trong graph")
+
+edge_pos = edge_pos.item()
+
+
+# ============================
+# 3. Lấy source và destination
+# ============================
+
+src = edge_index[0, edge_pos].item()
+dst = edge_index[1, edge_pos].item()
+
+print("False Negative edge:")
+print("Edge ID:", target_edge_id)
+print("Source:", src)
+print("Destination:", dst)
+
+
+# ============================
+# 4. Extract 2-hop subgraph
+# ============================
+
+subset, sub_edge_index, mapping, edge_mask = k_hop_subgraph(
+    node_idx=[src, dst],
+    num_hops=2,
+    edge_index=edge_index,
+    relabel_nodes=True
+)
+
+
+# ============================
+# 5. Tạo NetworkX graph
+# ============================
+
+G = nx.DiGraph()
+
+for i in range(sub_edge_index.shape[1]):
+    u = sub_edge_index[0, i].item()
+    v = sub_edge_index[1, i].item()
+    G.add_edge(u, v)
+
+
+# ============================
+# 6. Xác định cạnh FN trong subgraph
+# ============================
+
+src_sub = mapping[0].item()
+dst_sub = mapping[1].item()
+
+
+# ============================
+# 7. Vẽ graph
+# ============================
+
+plt.figure(figsize=(10, 8))
+
+pos = nx.spring_layout(G, seed=42)
+
+
+# node
+nx.draw_networkx_nodes(
+    G,
+    pos,
+    node_size=700
+)
+
+
+# edge bình thường
+normal_edges = [
+    e for e in G.edges()
+    if e != (src_sub, dst_sub)
+]
+
+nx.draw_networkx_edges(
+    G,
+    pos,
+    edgelist=normal_edges,
+    arrows=True,
+    width=1
+)
+
+
+# edge bị FN
+nx.draw_networkx_edges(
+    G,
+    pos,
+    edgelist=[(src_sub, dst_sub)],
+    arrows=True,
+    width=4
+)
+
+
+# label node
+nx.draw_networkx_labels(
+    G,
+    pos,
+    font_size=10
+)
+
+
+plt.title(
+    f"False Negative Transaction {target_edge_id}\n"
+    f"{src} -> {dst} (2-hop neighborhood)"
+)
+
+plt.axis("off")
+plt.show()
+
+
+# ============================
+# 8. In thông tin subgraph
+# ============================
+
+print("\nSubgraph information")
+print("--------------------")
+print("Number of nodes:", len(subset))
+print("Number of edges:", sub_edge_index.shape[1])
+
+print("\nNode IDs:")
+print(subset)
+
+print("\nEdge IDs:")
+print(edge_attr[edge_mask,0])
+
+
+
+
+
+
+
+
+
 from torch_geometric.utils import k_hop_subgraph
 
 # ===== Lấy một False Negative =====
