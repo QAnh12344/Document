@@ -1,3 +1,99 @@
+import matplotlib.pyplot as plt
+import networkx as nx
+
+
+edge_index = data['node', 'to', 'node'].edge_index
+edge_attr = data['node', 'to', 'node'].edge_attr
+
+
+G = nx.DiGraph()
+
+edge_draw = []
+
+
+# duyệt toàn bộ edge test
+for i, eid in enumerate(edge_ids):
+
+    eid = int(eid)
+
+    # tìm vị trí cạnh trong graph gốc
+    pos = (edge_attr[:,0] == eid).nonzero(as_tuple=True)[0]
+
+    if len(pos) == 0:
+        continue
+
+    pos = pos.item()
+
+    src = edge_index[0,pos].item()
+    dst = edge_index[1,pos].item()
+
+
+    G.add_edge(src, dst)
+
+
+    true = int(ground_truth[i])
+    pred = int(pred_label[i])
+
+
+    if true == 1 and pred == 1:
+        color = "green"      # TP
+
+    elif true == 1 and pred == 0:
+        color = "red"        # FN
+
+    elif true == 0 and pred == 1:
+        color = "orange"     # FP
+
+    else:
+        color = "gray"       # TN
+
+
+    edge_draw.append(
+        (src,dst,color)
+    )
+
+
+# =====================
+# Draw
+# =====================
+
+plt.figure(figsize=(15,15))
+
+pos = nx.spring_layout(
+    G,
+    seed=42
+)
+
+
+nx.draw_networkx_nodes(
+    G,
+    pos,
+    node_size=20
+)
+
+
+for u,v,c in edge_draw:
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        edgelist=[(u,v)],
+        edge_color=c,
+        width=0.5,
+        arrows=False
+    )
+
+
+plt.title("Test Transaction Graph")
+plt.axis("off")
+plt.show()
+
+
+
+
+
+
+
 import torch
 import matplotlib.pyplot as plt
 import networkx as nx
