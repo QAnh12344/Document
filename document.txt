@@ -1,3 +1,134 @@
+import torch
+import pandas as pd
+from tqdm import tqdm
+
+def evaluate_hetero(loader, inds, model, data, device):
+
+    model.eval()
+
+    preds = []
+    probs = []
+    labels = []
+    edge_ids = []
+
+    edge_attr = loader.data['node', 'to', 'node'].edge_attr.cpu()
+    edge_index = loader.data['node', 'to', 'node'].edge_index.cpu()
+
+    ############################################################
+    # edge_id --> (edge_index, src, dst)
+    ############################################################
+    id2edge = {}
+
+    for i in range(edge_attr.size(0)):
+        eid = int(edge_attr[i, 0])
+        id2edge[eid] = (
+            i,
+            int(edge_index[0, i]),
+            int(edge_index[1, i])
+        )
+
+    ############################################################
+
+    for batch in tqdm(loader):
+
+        assign_ports_with_cpp(batch)
+
+        inds_cpu = inds.cpu()
+
+        batch_edge_inds = inds_cpu[
+            batch['node', 'to', 'node'].input_id.cpu()
+        ]
+
+        batch_edge_ids = edge_attr[
+            batch_edge_inds, 0
+        ]
+
+        mask = torch.isin(
+            batch['node', 'to', 'node'].edge_attr[:, 0].cpu(),
+            batch_edge_ids
+        )
+
+        batch['node', 'to', 'node'].edge_attr = \
+            batch['node', 'to', 'node'].edge_attr[:, 1:]
+
+        batch['node', 'rev_to', 'node'].edge_attr = \
+            batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+        with torch.no_grad():
+
+            batch = batch.to(device)
+
+            out = model(batch)
+
+            out = out[mask]
+
+            prob = torch.softmax(out, dim=1)[:, 1]
+            pred = out.argmax(dim=1)
+            label = batch['node', 'to', 'node'].y[mask]
+
+        preds.append(pred.cpu())
+        probs.append(prob.cpu())
+        labels.append(label.cpu())
+        edge_ids.append(batch_edge_ids)
+
+    pred = torch.cat(preds).numpy()
+    prob = torch.cat(probs).numpy()
+    label = torch.cat(labels).numpy()
+    edge_ids = torch.cat(edge_ids).numpy()
+
+    f1, auc, precision, recall = compute_binary_metrics(prob, label)
+
+    ############################################################
+    # Wrong cases
+    ############################################################
+
+    wrong = pred != label
+
+    records = []
+
+    for eid, p, y, pr in zip(
+        edge_ids[wrong],
+        pred[wrong],
+        label[wrong],
+        prob[wrong]
+    ):
+
+        edge_idx, src, dst = id2edge[int(eid)]
+
+        records.append({
+            "edge_id": int(eid),
+            "edge_index": edge_idx,
+            "src": src,
+            "dst": dst,
+            "label": int(y),
+            "pred": int(p),
+            "prob": float(pr)
+        })
+
+    wrong_df = pd.DataFrame(records)
+
+    model.train()
+
+    return (
+        pred,
+        prob,
+        label,
+        edge_ids,
+        wrong_df,
+        f1,
+        auc,
+        precision,
+        recall,
+    )
+
+
+
+
+
+
+
+
+
 def evaluate_hetero(loader, inds, model, data, device):
     model.eval()
 
