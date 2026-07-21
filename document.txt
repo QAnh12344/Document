@@ -1,3 +1,81 @@
+@torch.no_grad()
+def evaluate_hetero(loader, inds, model, data, device):
+
+    model.eval()
+
+    preds = []
+    ground_truths = []
+    edge_ids = []
+
+    inds = inds.detach().cpu()
+
+    for batch in tqdm(loader):
+
+        assign_ports_with_cpp(batch)
+
+        batch_edge_inds = inds[
+            batch['node', 'to', 'node'].input_id.detach().cpu()
+        ]
+
+        batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[
+            batch_edge_inds, 0
+        ]
+
+        graph_edge_ids = batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu()
+
+        mask = torch.isin(
+            graph_edge_ids,
+            batch_edge_ids
+        )
+
+        batch['node', 'to', 'node'].edge_attr = \
+            batch['node', 'to', 'node'].edge_attr[:, 1:]
+
+        batch['node', 'rev_to', 'node'].edge_attr = \
+            batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+        batch = batch.to(device)
+
+        out = model(batch)
+        out = out[mask]
+
+        preds.append(out.detach().cpu())
+
+        ground_truths.append(
+            batch['node', 'to', 'node'].y[mask].detach().cpu()
+        )
+
+        edge_ids.append(
+            graph_edge_ids[mask]
+        )
+
+    pred = torch.cat(preds, dim=0).numpy()
+    ground_truth = torch.cat(ground_truths, dim=0).numpy()
+    edge_ids = torch.cat(edge_ids, dim=0).numpy()
+
+    f1, auc, precision, recall = compute_binary_metrics(
+        pred,
+        ground_truth
+    )
+
+    model.train()
+
+    return (
+        pred,
+        ground_truth,
+        edge_ids,
+        f1,
+        auc,
+        precision,
+        recall,
+    )
+
+
+
+
+
+
+
 import torch
 import pandas as pd
 from tqdm import tqdm
