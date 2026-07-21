@@ -1,3 +1,84 @@
+def evaluate_hetero(loader, inds, model, data, device):
+    model.eval()
+
+    preds = []
+    probs = []
+    ground_truths = []
+    edge_ids = []
+
+    for batch in tqdm(loader):
+        assign_ports_with_cpp(batch)
+
+        inds_cpu = inds.detach().cpu()
+
+        batch_edge_inds = inds_cpu[
+            batch['node', 'to', 'node'].input_id.detach().cpu()
+        ]
+
+        batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[
+            batch_edge_inds, 0
+        ]
+
+        mask = torch.isin(
+            batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(),
+            batch_edge_ids
+        )
+
+        batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+        batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+
+        with torch.no_grad():
+            batch = batch.to(device)
+
+            out = model(batch)
+            out = out[mask]
+
+            prob = torch.softmax(out, dim=1)[:, 1]
+            pred = out.argmax(dim=1)
+
+            preds.append(pred.cpu())
+            probs.append(prob.cpu())
+            ground_truths.append(
+                batch['node', 'to', 'node'].y[mask].cpu()
+            )
+
+            # edge id tương ứng với từng prediction
+            edge_ids.append(batch_edge_ids)
+
+    pred = torch.cat(preds).numpy()
+    prob = torch.cat(probs).numpy()
+    ground_truth = torch.cat(ground_truths).numpy()
+    edge_ids = torch.cat(edge_ids).numpy()
+
+    f1, auc, precision, recall = compute_binary_metrics(prob, ground_truth)
+
+    wrong = pred != ground_truth
+
+    wrong_cases = {
+        "edge_id": edge_ids[wrong],
+        "pred": pred[wrong],
+        "label": ground_truth[wrong],
+        "prob": prob[wrong],
+    }
+
+    model.train()
+
+    return (
+        pred,
+        prob,
+        ground_truth,
+        edge_ids,
+        wrong_cases,
+        f1,
+        auc,
+        precision,
+        recall,
+    )
+
+
+
+
+
 import matplotlib.pyplot as plt
 import networkx as nx
 
