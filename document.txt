@@ -1,3 +1,51 @@
+## 1. Mạt sát
+1. Đừng **mạt sát** người khác chỉ vì họ có ý kiến khác với bạn.
+2. Cô giáo nhắc cả lớp không nên **mạt sát** bạn bè trên mạng xã hội.
+3. Sau trận đấu, một số cổ động viên đã **mạt sát** trọng tài vì quyết định gây tranh cãi.
+
+## 2. Toàn đi vơ vét
+1. Mỗi lần siêu thị giảm giá, anh ấy **toàn đi vơ vét** đồ dùng cần thiết.
+2. Có người phàn nàn rằng khách du lịch **toàn đi vơ vét** quà lưu niệm.
+3. Đừng **toàn đi vơ vét** mọi thứ, hãy để người khác cũng có cơ hội mua.
+
+## 3. Bọn bò đỏ
+1. Trên mạng xã hội, có người dùng cụm từ **"bọn bò đỏ"** để chỉ một nhóm mà họ bất đồng quan điểm chính trị.
+2. Trong cuộc tranh luận, anh ấy khuyên mọi người không nên gọi người khác là **"bọn bò đỏ"** vì dễ làm cuộc nói chuyện căng thẳng.
+3. Thay vì dùng cụm từ **"bọn bò đỏ"**, hãy tập trung phản biện vào lập luận.
+
+## 4. MasterChef Việt Nam
+1. Tôi thường xem **MasterChef Việt Nam** vào cuối tuần để học nấu ăn.
+2. Thí sinh của **MasterChef Việt Nam** đã chế biến nhiều món ăn rất sáng tạo.
+3. Bạn tôi mơ ước một ngày được tham gia **MasterChef Việt Nam**.
+
+## 5. Voọc Cát Bà FHD
+1. Tôi xem một video **Voọc Cát Bà FHD** với hình ảnh rất sắc nét.
+2. Bộ phim tài liệu **Voọc Cát Bà FHD** giúp tôi hiểu hơn về loài động vật quý hiếm này.
+3. Giáo viên đã mở video **Voọc Cát Bà FHD** trong giờ học sinh học.
+
+## 6. Hashtag
+1. Hãy thêm **hashtag** phù hợp để bài đăng dễ tiếp cận hơn.
+2. Chiến dịch sử dụng **hashtag** #SaveNature đã thu hút nhiều người tham gia.
+3. Nhiều bạn trẻ thích sáng tạo **hashtag** độc đáo cho ảnh của mình.
+
+## 7. My Galaxy
+1. Tôi lưu ảnh lên **My Galaxy** để đồng bộ giữa các thiết bị Samsung.
+2. Bạn có thể đăng nhập **My Galaxy** bằng tài khoản Samsung của mình.
+3. Ứng dụng **My Galaxy** cung cấp nhiều ưu đãi dành cho người dùng.
+
+## 8. Sương giá
+1. Sáng sớm, cánh đồng phủ một lớp **sương giá** trắng xóa.
+2. **Sương giá** có thể làm hư hại nhiều loại cây trồng.
+3. Khách du lịch rất thích ngắm **sương giá** trên những đỉnh núi cao vào mùa đông.
+
+
+
+
+
+
+
+
+
 @torch.no_grad()
 def evaluate_hetero(loader, inds, model, data, device):
 
