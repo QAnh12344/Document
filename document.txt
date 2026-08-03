@@ -1,3 +1,163 @@
+import torch
+from collections import defaultdict
+
+def build_temporal_flow_line_graph(
+    edge_index,
+    edge_attr,
+    timestamps,
+    time_window=3600,
+    amount_ratio=0.2,
+):
+    """
+    Temporal Flow Line Graph
+
+    Node:
+        transaction
+
+    Edge:
+        Ti -> Tj
+
+    if
+        dst(Ti)==src(Tj)
+        tj > ti
+        tj-ti <= time_window
+        amount similar
+
+    Parameters
+    ----------
+    edge_index : [2,E]
+    edge_attr  : [E,F]
+                 amount nằm ở cột 1
+    timestamps : [E]
+
+    Returns
+    -------
+    line_edge_index
+    line_edge_attr
+    """
+
+    src = edge_index[0].cpu().numpy()
+    dst = edge_index[1].cpu().numpy()
+
+    amount = edge_attr[:,1].cpu().numpy()
+    time = timestamps.cpu().numpy()
+
+    E = len(time)
+
+    #################################################
+    # outgoing transactions of every account
+    #################################################
+
+    outgoing = defaultdict(list)
+
+    for eid in range(E):
+        outgoing[src[eid]].append(eid)
+
+    #################################################
+    # sort by time
+    #################################################
+
+    for acc in outgoing:
+        outgoing[acc].sort(key=lambda x: time[x])
+
+    #################################################
+    # build temporal flow graph
+    #################################################
+
+    line_src = []
+    line_dst = []
+
+    line_attr = []
+
+    for i in range(E):
+
+        receiver = dst[i]
+
+        if receiver not in outgoing:
+            continue
+
+        next_trx = outgoing[receiver]
+
+        for j in next_trx:
+
+            if time[j] <= time[i]:
+                continue
+
+            dt = time[j] - time[i]
+
+            if dt > time_window:
+                break
+
+            diff = abs(amount[j]-amount[i])
+
+            ratio = diff / max(amount[i],1e-8)
+
+            if ratio > amount_ratio:
+                continue
+
+            same_currency = 1.0 if edge_attr[i,2]==edge_attr[j,2] else 0.0
+            same_payment  = 1.0 if edge_attr[i,3]==edge_attr[j,3] else 0.0
+
+            flow_score = (
+                torch.exp(torch.tensor(-dt/time_window)).item()
+                *
+                torch.exp(torch.tensor(-ratio)).item()
+            )
+
+            line_src.append(i)
+            line_dst.append(j)
+
+            line_attr.append([
+                dt,
+                ratio,
+                same_currency,
+                same_payment,
+                flow_score
+            ])
+
+    line_edge_index = torch.tensor(
+        [line_src,line_dst],
+        dtype=torch.long
+    )
+
+    line_edge_attr = torch.tensor(
+        line_attr,
+        dtype=torch.float
+    )
+
+    return line_edge_index, line_edge_attr
+
+
+
+line_edge_index, line_edge_attr = build_temporal_flow_line_graph(
+    data.edge_index,
+    data.edge_attr,
+    data.timestamps
+)
+
+line_x = data.edge_attr
+
+h_line = self.line_gnn(
+    x=line_x,
+    edge_index=line_edge_index,
+    edge_attr=line_edge_attr
+)
+
+edge_attr = torch.cat(
+    [data.edge_attr, h_line],
+    dim=1
+)
+
+
+
+
+
+
+
+
+
+
+
 # Routine (thói quen, quy trình thường ngày)
 
 1. Từ khi đi làm, tôi cố gắng duy trì **routine** dậy lúc 6 giờ sáng để tập thể dục.
