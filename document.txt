@@ -1,4 +1,345 @@
 import torch
+import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter, scatter_softmax
+
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+
+        # -----------------------------
+        # ExSTraQt statistics branch
+        # -----------------------------
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # -----------------------------
+        # Learnable behavior branch
+        # -----------------------------
+        self.behavior_encoder = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU()
+        )
+
+        # -----------------------------
+        # Fusion
+        # -----------------------------
+        self.behavior_fusion = nn.Sequential(
+            nn.Linear(6 + n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+
+            nn.Linear(n_hidden, n_hidden),
+            nn.SiLU()
+        )
+
+        # -----------------------------
+        # Edge gate
+        # -----------------------------
+        self.edge_gate = nn.Sequential(
+            nn.Linear(n_hidden, 64),
+            nn.SiLU(),
+
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+        # -----------------------------
+        # PNA
+        # -----------------------------
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_core = DegreeScalerAggregation(
+            aggregators,
+            scalers,
+            deg
+        )
+
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+
+        self.exstraqt_ln.reset_parameters()
+        self.pna_core.reset_parameters()
+
+        for module in [
+            self.behavior_encoder,
+            self.behavior_fusion,
+            self.edge_gate,
+            self.pna_project,
+            self.post_transition,
+        ]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(
+                        m.weight,
+                        nonlinearity="relu"
+                    )
+                    nn.init.zeros_(m.bias)
+
+                elif isinstance(m, nn.LayerNorm):
+                    m.reset_parameters()
+
+    def forward(
+        self,
+        x,
+        index,
+        timestamps_,
+        log_amounts,
+        num_groups=None
+    ):
+
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = (
+                index.max().item() + 1
+                if num_edges > 0
+                else 0
+            )
+
+        if num_edges == 0:
+            return torch.zeros(
+                num_groups,
+                self.n_hidden,
+                device=x.device
+            )
+
+        ####################################################
+        # Group statistics
+        ####################################################
+
+        edge_counts = torch.bincount(
+            index,
+            minlength=num_groups
+        ).float()
+
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(
+            timestamps_,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="min"
+        )
+
+        max_t = scatter(
+            timestamps_,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="max"
+        )
+
+        duration_safe = (max_t - min_t) + 1.0
+
+        tau = (
+            timestamps_
+            - min_t[index]
+        ) / duration_safe[index]
+
+        ####################################################
+        # ExSTraQt statistics
+        ####################################################
+
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+
+        raw_weights = scatter_softmax(
+            log_amounts / (temperature * global_std),
+            index,
+            dim=0
+        )
+
+        amt_weights = raw_weights / eps_counts[index]
+
+        tf_c = scatter(
+            amt_weights * tau,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="sum"
+        )
+
+        mean_tau = scatter(
+            tau,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="mean"
+        )
+
+        time_var = scatter(
+            (tau - mean_tau[index]) ** 2,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="sum"
+        ) / eps_counts
+
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+
+        mean_log_amount = scatter(
+            log_amounts,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="mean"
+        )
+
+        money_velocity = torch.log1p(
+            mean_log_amount /
+            torch.log1p(duration_safe)
+        )
+
+        centered = (
+            log_amounts
+            - mean_log_amount[index]
+        )
+
+        skew_num = scatter(
+            centered ** 3,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="sum"
+        ) / eps_counts
+
+        skew_den = (
+            scatter(
+                centered ** 2,
+                index,
+                dim=0,
+                dim_size=num_groups,
+                reduce="sum"
+            ) / eps_counts
+        ) ** 1.5 + 1e-5
+
+        flow_skew = torch.clamp(
+            skew_num / skew_den,
+            -2,
+            2
+        )
+
+        avg_inter_arrival = torch.log1p(
+            duration_safe / eps_counts
+        )
+
+        exstraqt_feat = torch.stack(
+            [
+                tf_c,
+                tf_std,
+                burst_density,
+                money_velocity,
+                flow_skew,
+                avg_inter_arrival,
+            ],
+            dim=-1,
+        )
+
+        exstraqt_feat = self.exstraqt_ln(
+            exstraqt_feat
+        )
+
+        ####################################################
+        # Learnable behavior branch
+        ####################################################
+
+        behavior_edge = self.behavior_encoder(x)
+
+        behavior_group = scatter(
+            behavior_edge,
+            index,
+            dim=0,
+            dim_size=num_groups,
+            reduce="mean"
+        )
+
+        ####################################################
+        # Fusion
+        ####################################################
+
+        fusion_input = torch.cat(
+            [
+                exstraqt_feat,
+                behavior_group
+            ],
+            dim=-1
+        )
+
+        behavior_context = self.behavior_fusion(
+            fusion_input
+        )
+
+        edge_context = behavior_context[index]
+
+        ####################################################
+        # Adaptive edge weighting
+        ####################################################
+
+        edge_weight = self.edge_gate(
+            edge_context
+        )
+
+        filtered_x = x * edge_weight
+
+        ####################################################
+        # PNA
+        ####################################################
+
+        pna_raw = self.pna_core(
+            filtered_x,
+            index
+        )
+
+        pna_feat = self.pna_project(
+            pna_raw
+        )
+
+        output = (
+            self.post_transition(
+                pna_feat
+            )
+            + pna_feat
+        )
+
+        return output
+
+
+
+
+
+
+import torch
 from collections import defaultdict
 
 def build_temporal_flow_line_graph(
