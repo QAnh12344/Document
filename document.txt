@@ -1,3 +1,67 @@
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4, learnable_dim=4): # Thu nhỏ dim
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # 1. Thu nhỏ Encoder & Giảm overfitting
+        self.raw_trans_encoder = nn.Sequential(
+            nn.Linear(2, learnable_dim),
+            nn.SiLU(),
+            nn.Dropout(0.3),
+            nn.Linear(learnable_dim, learnable_dim),
+            nn.SiLU()
+        )
+        self.learned_pattern_ln = nn.LayerNorm(learnable_dim)
+
+        # 2. Gate input chỉ còn 12 dims (6 stat + 4 learned + 2 local)
+        gate_input_dim = 6 + learnable_dim + 2
+        self.edge_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+        # ... (Phần PNA giữ nguyên)
+
+    def reset_parameters(self):
+        # ... (khai báo init giữ nguyên) ...
+        
+        # 3. ÉP GATE MẶC ĐỊNH LỌC KHẮT KHE (Khởi tạo bias âm để giảm FP)
+        # Lớp Linear cuối của edge_gate là index [2]
+        nn.init.constant_(self.edge_gate[2].bias, -1.5) 
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        # ... (Tiền xử lý & ExSTraQt giữ nguyên) ...
+
+        # BRANCH B: Bỏ Max-pooling hoàn toàn, CHỈ DÙNG Mean-pooling
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        raw_embeds = self.raw_trans_encoder(edge_local)
+        
+        learned_pattern = scatter(raw_embeds, index, dim=0, dim_size=num_groups, reduce='mean')
+        learned_pattern = self.learned_pattern_ln(learned_pattern)
+
+        # FUSION
+        edge_context_stat = exstraqt_raw[index]
+        edge_context_learned = learned_pattern[index]
+        
+        edge_feat = torch.cat([edge_context_stat, edge_context_learned, edge_local], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        # ... (Phần PNA forward giữ nguyên) ...
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
