@@ -1,3 +1,85 @@
+import numpy as np
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    roc_curve,
+)
+
+
+def compute_ece(y_true, y_prob, n_bins=10):
+    """Tính Expected Calibration Error (ECE) bằng Numpy thuần."""
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    n_samples = len(y_true)
+
+    for i in range(n_bins):
+        # Lọc các mẫu nằm trong khoảng bin
+        in_bin = (y_prob > bin_boundaries[i]) & (
+            y_prob <= bin_boundaries[i + 1]
+        )
+        prop_in_bin = np.mean(in_bin)
+
+        if prop_in_bin > 0:
+            acc_in_bin = np.mean(y_true[in_bin])  # Tỷ lệ Fraud thực tế
+            conf_in_bin = np.mean(
+                y_prob[in_bin]
+            )  # Xác suất dự đoán trung bình
+            ece += np.abs(acc_in_bin - conf_in_bin) * prop_in_bin
+
+    return ece
+
+
+def evaluate_fraud_metrics(y_true, y_prob):
+    # 1. PR-AUC
+    pr_auc = average_precision_score(y_true, y_prob)
+
+    # 2. Brier Score
+    brier = brier_score_loss(y_true, y_prob)
+
+    # 3. Recall @ FPR = 1%
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    idx_1percent = np.where(fpr <= 0.01)[0][-1]  # Vị trí FPR gần 1% nhất
+    recall_at_1fpr = tpr[idx_1percent]
+
+    # 4. ECE
+    ece = compute_ece(y_true, y_prob, n_bins=10)
+
+    return {
+        "PR-AUC": round(pr_auc, 4),
+        "Recall@FPR=1%": round(recall_at_1fpr, 4),
+        "Brier Score": round(brier, 4),
+        "ECE": round(ece, 4),
+    }
+
+
+# Ví dụ minh họa sử dụng:
+# y_true = np.array([0, 0, 0, 0, 1, 0, 1, 0, 0, 1])
+# y_prob = np.array([0.05, 0.1, 0.02, 0.8, 0.9, 0.15, 0.85, 0.01, 0.05, 0.7])
+# print(evaluate_fraud_metrics(y_true, y_prob))
+
+
+
+
+import torch
+from torchmetrics.classification import (
+    BinaryAveragePrecision,
+    BinaryCalibrationError,
+)
+
+# y_true_tensor và y_prob_tensor là PyTorch Tensors trên GPU
+calc_pr_auc = BinaryAveragePrecision().to(device)
+calc_ece = BinaryCalibrationError(n_bins=10, norm="l1").to(device)
+
+pr_auc = calc_pr_auc(y_prob_tensor, y_true_tensor)
+ece = calc_ece(y_prob_tensor, y_true_tensor)
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
