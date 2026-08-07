@@ -1,3 +1,144 @@
+"""
+CBFMLoss (Class-Balanced Focal Margin Loss)
+--------------------------------------------
+Thay thế cho DWBLoss / FAADWLoss, thiết kế cho bài toán mất cân bằng
+cực lệch như AML / fraud detection.
+
+Gồm 3 thành phần, KHÔNG có thành phần nào đối kháng (triệt tiêu) nhau
+về gradient — đây chính là lỗi khiến DWBLoss/FAADWLoss cải thiện hạn chế:
+
+  1. Class-Balanced weight theo "effective number of samples"
+     (Cui et al., CVPR 2019) — xử lý mất cân bằng tốt hơn công thức
+     log(max/n)+1 khi các mẫu lớp minority có overlap/redundancy
+     (rất phổ biến trong AML vì các giao dịch gian lận thường lặp pattern).
+
+  2. Focal modulating factor (Lin et al., ICCV 2017) — tự động hạ trọng
+     số các mẫu dễ (p_y cao), tập trung học các mẫu khó, mà KHÔNG kéo
+     ngược gradient của mẫu tự tin đúng như term Brier trong bản cũ.
+
+  3. LDAM-style additive margin (Cao et al., NeurIPS 2019) — trừ một
+     margin vào logit của lớp đúng trước softmax, ép mô hình đẩy
+     decision boundary ra xa hơn cho lớp minority (fraud).
+
+Sử dụng:
+    loss_fn = CBFMLoss(class_counts=[n_legit, n_fraud])
+    loss = loss_fn(logits, targets)
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CBFMLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts,
+        beta_cb: float = 0.9999,
+        gamma: float = 2.0,
+        max_margin: float = 0.5,
+        reduction: str = "mean",
+    ):
+        """
+        Args:
+            class_counts (list/tuple/Tensor): số lượng mẫu mỗi lớp,
+                thứ tự theo index label, vd [n_legit, n_fraud].
+            beta_cb (float): hệ số cho Class-Balanced weight, càng gần 1
+                càng nhấn mạnh hiệu ứng "effective number of samples".
+                Giá trị thường dùng: 0.9, 0.99, 0.999, 0.9999.
+            gamma (float): hệ số focal, gamma=0 -> tắt focal (chỉ còn CE
+                có trọng số). Thường dùng 1.0 - 3.0, mặc định 2.0.
+            max_margin (float): margin lớn nhất áp cho lớp hiếm nhất.
+                Thường dùng 0.3 - 0.7. Đặt 0.0 để tắt LDAM margin.
+            reduction (str): 'mean', 'sum', hoặc 'none'.
+        """
+        super().__init__()
+        assert reduction in ("mean", "sum", "none")
+        self.reduction = reduction
+        self.gamma = gamma
+
+        counts = torch.as_tensor(class_counts, dtype=torch.float32)
+        assert torch.all(counts > 0), "class_counts phải > 0 cho mọi lớp"
+
+        # ---- 1) Class-Balanced weights (effective number of samples) ----
+        effective_num = 1.0 - torch.pow(beta_cb, counts)
+        cb_weights = (1.0 - beta_cb) / (effective_num + 1e-8)
+        cb_weights = cb_weights / cb_weights.sum() * len(counts)
+        self.register_buffer("cb_weights", cb_weights)
+
+        # ---- 2) LDAM-style margin: lớp ít mẫu -> margin lớn hơn ----
+        margins = 1.0 / torch.pow(counts, 0.25)
+        margins = margins * (max_margin / margins.max()) if max_margin > 0 else margins * 0.0
+        self.register_buffer("margins", margins)
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (Tensor): (batch_size, num_classes), chưa qua softmax.
+            targets (LongTensor): (batch_size,), nhãn số nguyên.
+        """
+        eps = 1e-7
+        batch_size = logits.size(0)
+        idx = torch.arange(batch_size, device=logits.device)
+
+        # Trừ margin của lớp đúng trước softmax
+        margin_per_sample = self.margins.to(logits.device)[targets]
+        adjusted_logits = logits.clone()
+        adjusted_logits[idx, targets] = adjusted_logits[idx, targets] - margin_per_sample
+
+        log_probs = F.log_softmax(adjusted_logits, dim=-1)
+        probs = log_probs.exp()
+
+        log_p_y = log_probs[idx, targets]
+        p_y = probs[idx, targets].clamp(min=eps, max=1.0 - eps)
+
+        # Focal modulating factor — không đối kháng gradient với w_y
+        focal_weight = torch.pow(1.0 - p_y, self.gamma)
+
+        w_y = self.cb_weights.to(logits.device)[targets]
+
+        loss = -w_y * focal_weight * log_p_y
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+# ---------------------------------------------------------------------
+# Ví dụ sử dụng nhanh + so sánh baseline để chạy ablation cho reviewer
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    batch_size, num_classes = 16, 2
+    logits = torch.randn(batch_size, num_classes, requires_grad=True)
+    targets = torch.randint(0, num_classes, (batch_size,))
+
+    class_counts = [98000, 2000]  # ví dụ tỷ lệ lệch AML ~ 49:1
+
+    loss_fn = CBFMLoss(class_counts=class_counts, beta_cb=0.9999,
+                        gamma=2.0, max_margin=0.5)
+    loss = loss_fn(logits, targets)
+    print("CBFMLoss:", loss.item())
+    loss.backward()
+
+    # Ablation gợi ý để đưa vào bài báo / rebuttal:
+    #   - CBFMLoss(gamma=0, max_margin=0)  -> chỉ còn CB weighted CE (baseline)
+    #   - CBFMLoss(beta_cb=0, gamma=2.0)   -> chỉ còn Focal Loss chuẩn
+    #   - CBFMLoss(gamma=0)                -> CB weight + margin, không focal
+    #   - CBFMLoss(max_margin=0)           -> CB weight + focal, không margin
+    #   - CBFMLoss() đầy đủ                -> phương pháp đề xuất
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
