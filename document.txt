@@ -1,3 +1,349 @@
+import torch
+import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+from torch_scatter import scatter, scatter_softmax
+
+# from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    """
+    DWBA (Dynamic Weighted Behavioral Aggregation) — bản trả lời trực tiếp comment:
+
+        "The proposed DWBA module depends entirely on six hand-engineered
+        statistical behavioral features ... Without an end-to-end learnable
+        branch to automatically extract transactional behavioral patterns
+        from raw data, the model suffers restricted generalization ability."
+
+    Những gì đã thay đổi để thực sự khắc phục (không chỉ vá kỹ thuật):
+
+    1. RAW SEQUENCE BRANCH (GRU):
+       Thay vì MLP-per-edge + mean-pool (chỉ học 1 vector "trung bình", mất thứ
+       tự), giờ mỗi group giao dịch được coi là 1 CHUỖI theo thời gian và đi qua
+       GRU. Đây là nhánh end-to-end thực sự học "pattern" (structuring, bursts,
+       tăng/giảm dần amount...) từ raw data, không phải thống kê tĩnh.
+
+    2. RAW FEATURE MỞ RỘNG:
+       Cho phép nhận thêm `raw_extra` (bất kỳ raw edge feature nào khác ngoài
+       tau/log_amount — vd loại giao dịch, kênh, mã hoá giờ trong ngày dạng
+       sin/cos, degree tức thời...). Trước đây nhánh "raw" chỉ dùng đúng 2
+       feature đã bị ExSTraQt "ăn" hết thông tin.
+
+    3. PER-CHANNEL GATE (LayerScale-style) thay vì 1 scalar gamma:
+       Mỗi chiều học được có tốc độ "mở van" riêng, tránh việc cả nhánh DL bị
+       nén xuống 1 con số duy nhất.
+
+    4. REPRESENTATIONAL INJECTION (điểm mấu chốt nhất):
+       Trước đây nhánh DL CHỈ ảnh hưởng gián tiếp qua edge_attention (1 scalar
+       nhân với x). Giờ learned_pattern còn được PROJECT VÀ CỘNG TRỰC TIẾP vào
+       pna_feats — cho nó một kênh đóng góp thật sự vào embedding cuối, không
+       chỉ đóng vai trò "gia vị" cho attention.
+
+    5. `use_raw_branch` flag để chạy ablation A/B — bằng chứng thực nghiệm
+       (F1 có/không nhánh DL) mới là thứ thuyết phục reviewer, code chỉ là điều
+       kiện cần.
+    """
+
+    def __init__(
+        self,
+        n_hidden,
+        deg,
+        dropout_p=0.4,
+        learnable_dim=8,
+        raw_core_dim=2,          # tau, log_amounts
+        raw_extra_dim=0,         # số chiều raw feature bổ sung (nếu có)
+        gate_init=-2.0,          # sigmoid(-2) ~ 0.12 -> khởi đầu thận trọng nhưng không = 0
+        use_raw_branch=True,     # tắt để chạy ablation (chỉ ExSTraQt)
+    ):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.learnable_dim = learnable_dim
+        self.use_raw_branch = use_raw_branch
+        self.raw_feat_dim = raw_core_dim + raw_extra_dim
+
+        # 1. ExSTraQt statistics normalization (6 hand-engineered features)
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # 2. RAW SEQUENCE BRANCH — GRU over chronologically-sorted edges per group
+        self.raw_gru = nn.GRU(
+            input_size=self.raw_feat_dim,
+            hidden_size=learnable_dim,
+            batch_first=True,
+        )
+        self.learned_pattern_ln = nn.LayerNorm(learnable_dim)
+
+        # Per-channel gate (vector, không phải scalar) — LayerScale-style
+        self.channel_gate = nn.Parameter(torch.full((learnable_dim,), float(gate_init)))
+
+        # Projection để tiêm learned_pattern trực tiếp vào pna_feats (representational injection)
+        self.learned_proj = nn.Linear(learnable_dim, n_hidden)
+
+        # 3. Edge-level attention (Gate) — vẫn dùng ExSTraQt + learned + local để giữ
+        #    khả năng diễn giải / kiểm soát precision (quan trọng cho fraud detection)
+        gate_input_dim = 6 + learnable_dim + raw_core_dim
+        self.edge_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(),
+        )
+
+        # 4. PNA Aggregator Configuration
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        pna_out_features = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self._gate_init_value = float(gate_init)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        self.learned_pattern_ln.reset_parameters()
+
+        with torch.no_grad():
+            self.channel_gate.fill_(self._gate_init_value)
+
+        for name, p in self.raw_gru.named_parameters():
+            if 'weight' in name:
+                nn.init.orthogonal_(p)
+            elif 'bias' in name:
+                nn.init.zeros_(p)
+
+        nn.init.kaiming_normal_(self.learned_proj.weight, nonlinearity='relu')
+        nn.init.zeros_(self.learned_proj.bias)
+
+        for m in self.edge_gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+        # Bias âm khắt khe để siết Precision (giảm báo động giả FP ngay từ đầu)
+        nn.init.constant_(self.edge_gate[2].bias, -1.5)
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def gate_values(self):
+        """Trả về gate hiện tại theo từng channel — dùng để log/monitor."""
+        with torch.no_grad():
+            return torch.sigmoid(self.channel_gate).cpu()
+
+    # -------------------------------------------------------------
+    # Raw sequence branch: nhóm các cạnh theo group, sort theo thời
+    # gian, chạy GRU để học pattern trình tự thay vì chỉ mean-pool.
+    # -------------------------------------------------------------
+    def _extract_temporal_pattern(self, edge_local, index, timestamps_, num_groups):
+        device = edge_local.device
+        edge_counts = torch.bincount(index, minlength=num_groups)
+        non_empty_mask = edge_counts > 0
+
+        if int(non_empty_mask.sum().item()) == 0:
+            return torch.zeros(num_groups, self.learnable_dim, device=device)
+
+        # sắp xếp cạnh theo (group, thời gian) để có thứ tự chronological trong mỗi group
+        t_range = timestamps_.max() - timestamps_.min() + 1.0
+        sort_key = index.to(timestamps_.dtype) * (t_range + 1.0) + \
+            (timestamps_ - timestamps_.min())
+        sort_idx = torch.argsort(sort_key)
+
+        sorted_local = edge_local[sort_idx]
+        counts_list = edge_counts.tolist()
+
+        # tách chuỗi cho từng group (bỏ qua group rỗng)
+        splits = torch.split(sorted_local, counts_list)
+        nonempty_splits = [s for s, c in zip(splits, counts_list) if c > 0]
+        nonempty_group_ids = torch.nonzero(non_empty_mask, as_tuple=True)[0]
+        lengths = torch.tensor([s.shape[0] for s in nonempty_splits], device=device)
+
+        padded = pad_sequence(nonempty_splits, batch_first=True)  # [G_ne, max_len, raw_feat_dim]
+        packed = pack_padded_sequence(
+            padded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, h_n = self.raw_gru(packed)  # h_n: [1, G_ne, learnable_dim]
+        group_repr_nonempty = h_n.squeeze(0)
+
+        group_repr = torch.zeros(num_groups, self.learnable_dim, device=device)
+        group_repr[nonempty_group_ids] = group_repr_nonempty
+        return group_repr
+
+    def forward(self, x, index, timestamps_, log_amounts, raw_extra=None, num_groups=None):
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Group statistics & Time Normalization (tau)
+        edge_counts = torch.bincount(index, minlength=num_groups).float()
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # -------------------------------------------------------------
+        # BRANCH A: Hand-engineered Domain Features (ExSTraQt 6 features)
+        # -------------------------------------------------------------
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(centered ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        skew_den = (scatter(centered ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        exstraqt_raw = torch.stack(
+            [tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1
+        )
+        exstraqt_raw = self.exstraqt_ln(exstraqt_raw)
+
+        # -------------------------------------------------------------
+        # BRANCH B: End-to-End Raw Sequence Behavioral Extraction (GRU)
+        # -------------------------------------------------------------
+        edge_local_core = torch.stack([tau, log_amounts], dim=-1)
+        if raw_extra is not None:
+            edge_local_full = torch.cat([edge_local_core, raw_extra], dim=-1)
+        else:
+            edge_local_full = edge_local_core
+
+        if self.use_raw_branch:
+            learned_pattern = self._extract_temporal_pattern(
+                edge_local_full, index, timestamps_, num_groups
+            )
+            learned_pattern = self.learned_pattern_ln(learned_pattern)
+        else:
+            # Ablation: tắt hoàn toàn nhánh DL để so sánh với ExSTraQt-only
+            learned_pattern = torch.zeros(num_groups, self.learnable_dim, device=x.device)
+
+        gate = torch.sigmoid(self.channel_gate)          # [learnable_dim], per-channel
+        gated_learned = learned_pattern * gate            # [num_groups, learnable_dim]
+
+        # -------------------------------------------------------------
+        # FUSION
+        #   (a) edge_gate vẫn dùng ExSTraQt + learned + local -> giữ khả năng
+        #       diễn giải & kiểm soát precision qua attention scalar.
+        #   (b) learned_pattern CÒN được tiêm trực tiếp (representational
+        #       injection) vào pna_feats -> nhánh DL có kênh đóng góp thật sự,
+        #       không chỉ ảnh hưởng gián tiếp qua 1 con số.
+        # -------------------------------------------------------------
+        edge_context_stat = exstraqt_raw[index]
+        edge_context_learned = gated_learned[index]
+
+        edge_feat = torch.cat([edge_context_stat, edge_context_learned, edge_local_core], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+
+        learned_inject = self.learned_proj(gated_learned)   # [num_groups, n_hidden]
+        fused = pna_feats + learned_inject
+
+        output = self.post_transition(fused) + fused
+
+        return output
+
+
+# ---------------------------------------------------------------------------
+# Param groups: channel_gate + raw_gru + learned_proj học nhanh hơn phần còn lại
+# ---------------------------------------------------------------------------
+def build_param_groups(model, base_lr=1e-3, dl_branch_lr_mult=5.0, weight_decay=1e-4):
+    dl_branch_names = ('channel_gate', 'raw_gru', 'learned_proj', 'learned_pattern_ln')
+    dl_params, other_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(name.startswith(n) or f'.{n}' in name for n in dl_branch_names):
+            dl_params.append(p)
+        else:
+            other_params.append(p)
+
+    groups = [{'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay}]
+    if dl_params:
+        groups.append({
+            'params': dl_params,
+            'lr': base_lr * dl_branch_lr_mult,
+            'weight_decay': weight_decay * 0.1,
+        })
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Gợi ý chạy ablation để có SỐ LIỆU trả lời reviewer (quan trọng hơn code)
+# ---------------------------------------------------------------------------
+def run_ablation(model_cls, model_kwargs, train_fn, eval_fn):
+    """
+    train_fn(model) -> trained model
+    eval_fn(model) -> dict chứa ít nhất {'f1': float}
+
+    Kết quả mong đợi để phản biện reviewer:
+        ExSTraQt-only (use_raw_branch=False)  -> F1_a
+        Full DWBA (use_raw_branch=True)       -> F1_b > F1_a
+    Đưa cả 2 số vào rebuttal + bảng ablation trong paper.
+    """
+    results = {}
+    for use_raw in (False, True):
+        kwargs = dict(model_kwargs)
+        kwargs['use_raw_branch'] = use_raw
+        model = model_cls(**kwargs)
+        model = train_fn(model)
+        metrics = eval_fn(model)
+        tag = 'full_dwba' if use_raw else 'exstraqt_only'
+        results[tag] = metrics
+        print(f"[ablation] {tag}: {metrics}")
+    return results
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import numpy as np
 from sklearn.metrics import (
     average_precision_score,
