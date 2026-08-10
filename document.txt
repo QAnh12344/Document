@@ -1,5 +1,104 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class AMDWBLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts,
+        margin_scale=0.5,
+        gamma_pos=2.0,
+        gamma_neg=0.5,
+        brier_reg=1.0,
+        reduction="mean",
+    ):
+        """
+        Asymmetric Margin-Calibrated Dynamic Weighted Loss (AM-DWBLoss)
+        Tối ưu PR AUC cho dữ liệu cực kỳ mất cân bằng.
+
+        Args:
+            class_counts (list/Tensor): Số lượng mẫu [n_class0, n_class1].
+            margin_scale (float): Hệ số C mở rộng logit margin cho lớp hiếm (LDAM theory).
+            gamma_pos (float): Gamma cho lớp hiếm (tập trung vào Hard Positives -> Tăng Recall).
+            gamma_neg (float): Gamma cho lớp đa số (đèn nén Easy Negatives -> Giữ Precision).
+            brier_reg (float): Hệ số điều chỉnh Calibration (Brier score entropy từ DWB gốc).
+            reduction (str): 'mean' | 'sum' | 'none'.
+        """
+        super().__init__()
+        assert (
+            len(class_counts) == 2
+        ), "Chỉ áp dụng cho bài toán nhị phân [n_0, n_1]"
+        self.reduction = reduction
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.brier_reg = brier_reg
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        N = counts.sum()
+
+        # 1. Effective Number of Samples (Cui et al., 2019)
+        beta = (N - 1.0) / N
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta)
+        w_eff_raw = 1.0 / effective_num
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()
+
+        # Damping bằng sqrt để giữ tính ổn định gradient
+        self.w_eff = torch.sqrt(w_eff_ratio)
+
+        # 2. Tính toán Logit Margin theo lý thuyết LDAM (Cao et al., 2019)
+        # Margin chỉ áp dụng ép thêm vào Logit của Class 1
+        m_1 = margin_scale * torch.pow(self.w_eff[1] / self.w_eff[0], 0.25)
+        margin_vector = torch.tensor([0.0, m_1], dtype=torch.float32)
+
+        self.register_buffer("weights", self.w_eff)
+        self.register_buffer("margins", margin_vector)
+
+    def forward(self, logits, targets):
+        self.weights = self.weights.to(logits.device)
+        self.margins = self.margins.to(logits.device)
+
+        # 1. Điều chỉnh Logit Space bằng Margin (Tránh phân loại nhầm ở ranh giới)
+        adjusted_logits = logits - self.margins.unsqueeze(0)
+
+        # 2. Log-Softmax và Softmax trên Logit đã Margin-Adjusted
+        probs = F.softmax(adjusted_logits, dim=-1)
+        log_probs = F.log_softmax(adjusted_logits, dim=-1)
+
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        p_y = probs[batch_idx, targets]
+        log_p_y = log_probs[batch_idx, targets]
+        w_y = self.weights[targets]
+
+        # 3. Asymmetric Dynamic Focusing Factor (gamma_pos != gamma_neg)
+        gamma = torch.where(targets == 1, self.gamma_pos, self.gamma_neg)
+        dynamic_weight = w_y * torch.pow(1.0 - p_y, gamma)
+
+        # 4. Term 1: Asymmetric Margin Weighted Cross-Entropy
+        term1 = -dynamic_weight * log_p_y
+
+        # 5. Term 2: Brier Score Calibration Regularizer (Giữ chuẩn hóa dải xác suất cho PR AUC)
+        term2 = -self.brier_reg * p_y * (1.0 - p_y)
+
+        loss = term1 + term2
+
+        if self.reduction == "mean":
+            return torch.mean(loss)
+        elif self.reduction == "sum":
+            return torch.sum(loss)
+        else:
+            return loss
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 
 # from torch_geometric.nn.aggr import DegreeScalerAggregation
