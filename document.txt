@@ -1,5 +1,57 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
+class EADWBLoss(nn.Module):
+    def __init__(self, class_counts, cost_ratio_fn_fp=10.0, reduction="mean"):
+        super().__init__()
+        assert len(class_counts) == 2, "Chỉ nhận đúng 2 giá trị: [n_class0, n_class1]"
+        self.reduction = reduction
+
+        counts = torch.as_tensor(class_counts, dtype=torch.float32)
+        N = counts.sum().item()
+        K = float(counts.numel())
+
+        # Effective Number of Samples (Cui et al., 2019)
+        beta = (N - 1.0) / max(N, 1.0)
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta + 1e-12)
+        w_eff_raw = 1.0 / (effective_num + 1e-12)
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()
+
+        # Entropy-Adaptive Damping Factor (\gamma)
+        pi = counts / N
+        H_raw = -(pi * torch.log(pi.clamp_min(1e-12))).sum()
+        H_norm = (H_raw / math.log(K)).clamp(0.0, 1.0)
+        gamma = 0.5 + 0.5 * H_norm
+        w_eff_damped = torch.pow(w_eff_ratio, gamma)
+
+        self.register_buffer("gamma_used", gamma)
+
+        # Final Class Weights
+        cost_multiplier = torch.tensor([1.0, float(cost_ratio_fn_fp)], dtype=torch.float32)
+        w_final = w_eff_damped * cost_multiplier
+        self.register_buffer("weights", w_final)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+
+        targets_col = targets.unsqueeze(1)
+        log_p_y = log_probs.gather(1, targets_col).squeeze(1)
+        p_y = probs.gather(1, targets_col).squeeze(1)
+        w_y = self.weights[targets]
+
+        # Khớp chính xác với công thức toán
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        loss = -dynamic_weight * log_p_y - p_y * (1.0 - p_y)
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 
