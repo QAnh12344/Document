@@ -3,6 +3,70 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class EADWBLoss(nn.Module):
+    """
+    Entropy-Adaptive DWB Loss dựa 100% trên công thức DWBLoss gốc.
+    
+    Trọng số gốc DWB: w_j = log( max_n / n_j ) + 1.0
+    Trọng số EA-DWB:  w_j = (log( max_n / n_j ))^\gamma + 1.0
+    với \gamma = 0.5 + 0.5 * H_norm
+    """
+    def __init__(self, class_counts, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+        counts = torch.as_tensor(class_counts, dtype=torch.float32)
+        N = counts.sum().item()
+        K = float(counts.numel())
+        max_count = torch.max(counts)
+
+        # 1. Tính Normalized Shannon Entropy (H_norm) của tập train
+        pi = counts / N
+        H_raw = -(pi * torch.log(pi.clamp_min(1e-12))).sum()
+        H_norm = (H_raw / math.log(K)).clamp(0.0, 1.0)
+        
+        # 2. Tính hệ số damping gamma in [0.5, 1.0]
+        gamma = 0.5 + 0.5 * H_norm
+
+        # 3. Tính trọng số DWB có Entropy-Adaptive Damping
+        # Damping phần log-ratio giúp kiểm soát trọng số không bị bùng nổ -> Giữ Precision cao
+        log_ratio = torch.log(max_count / (counts + 1e-8))
+        self.weights = torch.pow(log_ratio, gamma) + 1.0
+
+        self.register_buffer("gamma_used", gamma)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        self.weights = self.weights.to(logits.device)
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+
+        targets_col = targets.unsqueeze(1)
+        log_p_y = log_probs.gather(1, targets_col).squeeze(1)
+        p_y = probs.gather(1, targets_col).squeeze(1)
+        w_y = self.weights[targets]
+
+        # 100% Công thức DWB gốc
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        loss = -dynamic_weight * log_p_y - p_y * (1.0 - p_y)
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+
+
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 class EADWBLoss(nn.Module):
     def __init__(self, class_counts, cost_ratio_fn_fp=10.0, reduction="mean"):
