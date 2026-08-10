@@ -1,5 +1,146 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PSCDWBLoss(nn.Module):
+    """
+    Prior-Shift Corrected Dynamically Weighted Balanced Loss (PSC-DWB).
+
+    Kế thừa AMLDWBLoss (effective number + cost ratio), bổ sung DUY NHẤT
+    một cơ chế mới: hiệu chỉnh xác suất hậu nghiệm theo độ lệch giữa
+    prior lớp trong tập TRAIN (thường bị resample) và prior lớp THẬT
+    ngoài production, dựa trên:
+
+      - King & Zeng (2001), "Logistic Regression in Rare Events Data",
+        Political Analysis 9(2) — chứng minh MLE trên rare-event data bị
+        lệch hệ số chặn theo thiết kế lấy mẫu (case-control sampling),
+        cần hiệu chỉnh xác suất hậu nghiệm.
+      - Saerens, Latinne & Decaestecker (2002), "Adjusting the Outputs
+        of a Classifier to New a Priori Probabilities", Neural
+        Computation 14(1) — công thức Bayes tổng quát để chuyển xác
+        suất học theo prior A sang prior B.
+
+    Ý nghĩa: effective-number weighting và cost ratio xử lý MẤT CÂN BẰNG
+    TẦN SUẤT và CHI PHÍ BẤT ĐỐI XỨNG (trọng số tĩnh theo lớp). Chúng KHÔNG
+    xử lý việc p_y (xác suất hậu nghiệm mô hình học được) tự nó đã bị lệch
+    một cách hệ thống nếu tập train được under/oversample so với thực tế
+    vận hành — đây là nguồn lỗi thứ ba, độc lập, đặc trưng của rare-event
+    learning. PSC-DWB hiệu chỉnh p_y bằng Bayes TRƯỚC KHI đưa vào cả dynamic
+    weight lẫn regularization term, nên sửa lỗi tại đúng gốc rễ toán học
+    thay vì chỉ bù bằng hằng số.
+
+    Nếu true_prior=None, prior_ratio = 1 với mọi lớp ->公式 thoái lui
+    CHÍNH XÁC về AMLDWBLoss gốc (không breaking, không thay đổi hành vi
+    khi người dùng chưa cung cấp prior thật).
+    """
+
+    def __init__(
+        self,
+        class_counts,
+        cost_ratio_fn_fp=10.0,
+        true_prior=None,
+        reduction="mean",
+    ):
+        """
+        Args:
+            class_counts (list/tuple/Tensor): [n_class0, n_class1] trong
+                tập TRAIN (đã qua resample nếu có).
+            cost_ratio_fn_fp (float): r = C_FN / C_FP, tham số nghiệp vụ
+                (giữ nguyên như AMLDWBLoss).
+            true_prior (list/tuple/Tensor, optional): [pi'_0, pi'_1] - tỉ
+                lệ lớp THẬT ngoài production, KHÁC với tỉ lệ trong tập
+                train nếu có resample. Nên lấy từ base rate SAR lịch sử
+                của compliance team, đo TRƯỚC khi áp bất kỳ kỹ thuật
+                resample nào. Nếu None -> không hiệu chỉnh (= bản cũ).
+            reduction (str): 'mean' | 'sum' | 'none'.
+        """
+        super().__init__()
+        assert len(class_counts) == 2, "Chỉ nhận đúng 2 giá trị: [n_class0, n_class1]"
+        self.reduction = reduction
+        self.cost_ratio_fn_fp = cost_ratio_fn_fp
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        N = counts.sum()
+
+        # --- Effective Number of Samples (Cui et al., 2019) ---
+        beta = (N - 1.0) / N
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta)
+        w_eff_raw = 1.0 / effective_num
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()
+        w_eff_damped = torch.sqrt(w_eff_ratio)
+
+        cost_multiplier = torch.tensor([1.0, cost_ratio_fn_fp])
+        w_final = w_eff_damped * cost_multiplier
+        self.register_buffer("weights", w_final)
+
+        # --- Prior-shift correction ratio (điểm NOVELTY chính) ---
+        train_prior = counts / N
+        if true_prior is None:
+            true_prior_t = train_prior.clone()
+        else:
+            true_prior_t = torch.tensor(true_prior, dtype=torch.float32)
+            true_prior_t = true_prior_t / true_prior_t.sum()
+        # prior_ratio = 1 với mọi lớp khi true_prior=None -> không đổi p_y
+        self.register_buffer("prior_ratio", true_prior_t / train_prior)
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (Tensor): (batch_size, 2) - đầu ra chưa activation.
+            targets (Tensor): (batch_size,) - nhãn 0/1.
+        """
+        self.weights = self.weights.to(logits.device)
+        self.prior_ratio = self.prior_ratio.to(logits.device)
+
+        probs = F.softmax(logits, dim=-1)
+
+        # --- Bayes prior-shift correction (King & Zeng 2001; Saerens 2002) ---
+        # p'_y(x) = [p_y(x) * (pi'_y/pi_y)] / sum_k [p_k(x) * (pi'_k/pi_k)]
+        adjusted = probs * self.prior_ratio
+        adjusted = adjusted / adjusted.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        log_adjusted = torch.log(adjusted.clamp_min(1e-12))
+
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        p_y = adjusted[batch_idx, targets]
+        log_p_y = log_adjusted[batch_idx, targets]
+        w_y = self.weights[targets]
+
+        # Cấu trúc công thức GIỮ NGUYÊN như DWB gốc (13) - chỉ p_y/log_p_y
+        # giờ là bản đã hiệu chỉnh prior, thay vì raw softmax output.
+        dynamic_weight = torch.pow(w_y, 1.0 - p_y)
+        term1 = -dynamic_weight * log_p_y
+        term2 = -p_y * (1.0 - p_y)
+        loss = term1 + term2
+
+        if self.reduction == "mean":
+            return torch.mean(loss)
+        elif self.reduction == "sum":
+            return torch.sum(loss)
+        else:
+            return loss
+
+    @torch.no_grad()
+    def predict_proba(self, logits):
+        """
+        QUAN TRỌNG: dùng hàm này để inference, KHÔNG dùng raw softmax(logits).
+        Đảm bảo nhất quán train/inference - nếu chỉ hiệu chỉnh lúc train mà
+        không hiệu chỉnh lúc predict, model sẽ bị lệch ngược lại theo prior
+        đã resample của tập train.
+        """
+        probs = F.softmax(logits, dim=-1)
+        adjusted = probs * self.prior_ratio.to(logits.device)
+        return adjusted / adjusted.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 
 
 class UltraFastAMDWBLoss(nn.Module):
