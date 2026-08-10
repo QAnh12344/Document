@@ -3,6 +3,88 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class FastAMDWBLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts,
+        margin_scale=0.5,
+        gamma_pos=2.0,
+        gamma_neg=0.5,
+        brier_reg=1.0,
+        reduction="mean",
+    ):
+        super().__init__()
+        assert (
+            len(class_counts) == 2
+        ), "Chỉ áp dụng cho bài toán nhị phân [n_0, n_1]"
+        self.reduction = reduction
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.brier_reg = brier_reg
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        N = counts.sum()
+
+        # 1. Effective Number of Samples (Cui et al., 2019)
+        beta = (N - 1.0) / N
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta)
+        w_eff_raw = 1.0 / effective_num
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()
+        w_eff = torch.sqrt(w_eff_ratio)
+
+        # 2. Logit Margin (LDAM)
+        m_1 = margin_scale * torch.pow(w_eff[1] / w_eff[0], 0.25)
+        margin_vector = torch.tensor([0.0, m_1], dtype=torch.float32)
+
+        # register_buffer giúp tự động đi theo model.to(device), KHÔNG CẦN .to() trong forward
+        self.register_buffer("weights", w_eff)
+        self.register_buffer("margins", margin_vector)
+
+    def forward(self, logits, targets):
+        # 1. Điều chỉnh Logit Space bằng Margin (Broadcast tự động)
+        adjusted_logits = logits - self.margins
+
+        # 2. Chỉ tính log_softmax, suy ra probs bằng exp() -> Nhanh gấp đôi
+        log_probs = F.log_softmax(adjusted_logits, dim=-1)
+        probs = torch.exp(log_probs)
+
+        # 3. Trích xuất p_y và log_p_y bằng gather (Nhanh hơn advanced indexing)
+        targets_unsqueezed = targets.unsqueeze(1)
+        log_p_y = log_probs.gather(1, targets_unsqueezed).squeeze(1)
+        p_y = probs.gather(1, targets_unsqueezed).squeeze(1)
+        w_y = self.weights[targets]
+
+        # 4. Dynamic Focusing Factor & Loss Calculation
+        gamma = torch.where(targets == 1, self.gamma_pos, self.gamma_neg)
+
+        # Thêm 1e-8 tránh lỗi nổ autograd khi p_y gần bằng 1.0
+        dynamic_weight = w_y * torch.pow(1.0 - p_y + 1e-8, gamma)
+
+        term1 = -dynamic_weight * log_p_y
+        term2 = -self.brier_reg * p_y * (1.0 - p_y)
+
+        loss = term1 + term2
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class AMDWBLoss(nn.Module):
     def __init__(
         self,
