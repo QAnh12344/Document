@@ -1,5 +1,94 @@
 import torch
 import torch.nn as nn
+
+
+class UltraFastAMDWBLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts,
+        margin_scale=0.5,
+        gamma_pos=2.0,
+        gamma_neg=0.5,
+        brier_reg=1.0,
+        reduction="mean",
+    ):
+        """
+        Ultra-Fast AMDWB Loss: Tối ưu hóa cực hạn cho GPU.
+        Biến đổi 2-Class Softmax thành Sigmoid Delta Logit để đạt tốc độ tối đa.
+        """
+        super().__init__()
+        self.reduction = reduction
+        self.gamma_pos = float(gamma_pos)
+        self.gamma_neg = float(gamma_neg)
+        self.brier_reg = float(brier_reg)
+
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        N = counts.sum()
+
+        # 1. Effective Number of Samples (Cui et al., 2019)
+        beta = (N - 1.0) / N
+        effective_num = (1.0 - torch.pow(beta, counts)) / (1.0 - beta)
+        w_eff_raw = 1.0 / effective_num
+        w_eff_ratio = w_eff_raw / w_eff_raw.min()
+        w_eff = torch.sqrt(w_eff_ratio)
+
+        # 2. Logit Margin m_1 (LDAM)
+        m_1 = margin_scale * torch.pow(w_eff[1] / w_eff[0], 0.25)
+
+        self.register_buffer("w0", w_eff[0])
+        self.register_buffer("w1", w_eff[1])
+        self.register_buffer("m1", m_1)
+
+    def forward(self, logits, targets):
+        # Biến đổi toán học: Softmax([z0, z1 - m1])_1 == Sigmoid(z1 - z0 - m1)
+        # Loại bỏ hoàn toàn log_softmax và gather -> Tiết kiệm 50% phép tính exp()
+        delta_logits = logits[:, 1] - logits[:, 0] - self.m1
+        p1 = torch.sigmoid(delta_logits)
+
+        # Tách mask boolean để ép PyTorch dùng Scalar Exponent (CUDA Native Speed)
+        pos_mask = targets == 1
+        neg_mask = ~pos_mask
+
+        loss_pos = torch.empty(0, device=logits.device)
+        loss_neg = torch.empty(0, device=logits.device)
+
+        # --- Lớp 1 (Rửa tiền / Hiếm) ---
+        if pos_mask.any():
+            p1_pos = p1[pos_mask]
+            # (1 - p1_pos) ** gamma_pos là SCALAR exponent -> Chạy cực nhanh trên GPU
+            dynamic_w_pos = self.w1 * torch.pow(1.0 - p1_pos, self.gamma_pos)
+            ce_pos = -dynamic_w_pos * torch.log(p1_pos + 1e-8)
+            brier_pos = -self.brier_reg * p1_pos * (1.0 - p1_pos)
+            loss_pos = ce_pos + brier_pos
+
+        # --- Lớp 0 (Bình thường / Đa số) ---
+        if neg_mask.any():
+            p1_neg = p1[neg_mask]
+            # p1_neg chính là (1 - p0_neg), p1_neg ** gamma_neg là SCALAR exponent
+            dynamic_w_neg = self.w0 * torch.pow(p1_neg, self.gamma_neg)
+            ce_neg = -dynamic_w_neg * torch.log(1.0 - p1_neg + 1e-8)
+            brier_neg = -self.brier_reg * p1_neg * (1.0 - p1_neg)
+            loss_neg = ce_neg + brier_neg
+
+        # Tái hợp loss
+        total_loss = torch.cat([loss_pos, loss_neg])
+
+        if self.reduction == "mean":
+            return total_loss.mean()
+        elif self.reduction == "sum":
+            return total_loss.sum()
+        else:
+            return total_loss
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
