@@ -1,5 +1,269 @@
 import torch
 import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+
+# from torch_geometric.nn.aggr import DegreeScalerAggregation
+
+
+class ExSTraQtPnaGatedFusionAgg(nn.Module):
+    """
+    Bản tối ưu hóa tốc độ (High-Performance Vectorized Version):
+    - Fast Vectorized Padding: Xóa bỏ hoàn toàn tolist() và vòng lặp Python.
+    - Full GPU Execution: Tính toán thứ tự chuỗi và position hoàn toàn bằng GPU kernel.
+    - Truncated Sequence: Khống chế max_seq_len (mặc định 20) giúp chống tràn RAM/VRAM.
+    """
+
+    def __init__(
+        self,
+        n_hidden,
+        deg,
+        dropout_p=0.4,
+        learnable_dim=8,
+        raw_core_dim=2,          # tau, log_amounts
+        raw_extra_dim=0,         # raw features bổ sung
+        gate_init=-2.0,          # sigmoid(-2) ~ 0.12
+        use_raw_branch=True,
+        max_seq_len=20,          # [TỐI ƯU]: Chỉ lấy tối đa N giao dịch gần nhất per group
+    ):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.learnable_dim = learnable_dim
+        self.use_raw_branch = use_raw_branch
+        self.raw_feat_dim = raw_core_dim + raw_extra_dim
+        self.max_seq_len = max_seq_len
+
+        # 1. ExSTraQt statistics normalization
+        self.exstraqt_ln = nn.LayerNorm(6)
+
+        # 2. RAW SEQUENCE BRANCH — Vectorized GRU over GPU
+        self.raw_gru = nn.GRU(
+            input_size=self.raw_feat_dim,
+            hidden_size=learnable_dim,
+            batch_first=True,
+        )
+        self.learned_pattern_ln = nn.LayerNorm(learnable_dim)
+        self.branch_dropout = nn.Dropout(dropout_p)
+
+        # Per-channel gate
+        self.channel_gate = nn.Parameter(torch.full((learnable_dim,), float(gate_init)))
+
+        # Projection
+        self.learned_proj = nn.Sequential(
+            nn.Linear(learnable_dim, n_hidden),
+            nn.LayerNorm(n_hidden)
+        )
+
+        # 3. Edge-level attention (Gate)
+        gate_input_dim = 6 + learnable_dim + raw_core_dim
+        self.edge_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+        # 4. PNA Aggregator Configuration
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        pna_out_features = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self._gate_init_value = float(gate_init)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+        self.learned_pattern_ln.reset_parameters()
+
+        with torch.no_grad():
+            self.channel_gate.fill_(self._gate_init_value)
+
+        for name, p in self.raw_gru.named_parameters():
+            if 'weight' in name:
+                nn.init.orthogonal_(p)
+            elif 'bias' in name:
+                nn.init.zeros_(p)
+
+        nn.init.kaiming_normal_(self.learned_proj[0].weight, nonlinearity='relu')
+        nn.init.zeros_(self.learned_proj[0].bias)
+        self.learned_proj[1].reset_parameters()
+
+        for m in self.edge_gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.edge_gate[2].bias)
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def gate_values(self):
+        with torch.no_grad():
+            return torch.sigmoid(self.channel_gate).cpu()
+
+    # -------------------------------------------------------------
+    # VECTORIZED GRU PATTERN EXTRACTION (No Python Loops / No GPU-CPU Sync)
+    # -------------------------------------------------------------
+    def _extract_temporal_pattern_fast(self, edge_local, index, timestamps_, num_groups):
+        device = edge_local.device
+        num_edges = edge_local.size(0)
+
+        # 1. Sắp xếp cạnh theo (group, time) trực tiếp bằng Tensor operations
+        t_range = timestamps_.max() - timestamps_.min() + 1.0
+        sort_key = index.to(timestamps_.dtype) * (t_range + 1.0) + (timestamps_ - timestamps_.min())
+        sort_idx = torch.argsort(sort_key)
+
+        sorted_index = index[sort_idx]
+        sorted_local = edge_local[sort_idx]
+
+        # 2. Tính toán position trong từng group hoàn toàn trên GPU bằng Prefix Sum
+        edge_counts = torch.bincount(sorted_index, minlength=num_groups)
+        cum_counts = torch.zeros(num_groups + 1, dtype=torch.long, device=device)
+        cum_counts[1:] = torch.cumsum(edge_counts, dim=0)
+
+        pos_in_group = torch.arange(num_edges, device=device) - cum_counts[sorted_index]
+
+        # 3. Truncate: Chỉ lấy tối đa max_seq_len giao dịch gần nhất
+        valid_mask = pos_in_group < self.max_seq_len
+        valid_idx = sorted_index[valid_mask]
+        valid_pos = pos_in_group[valid_mask]
+        valid_feats = sorted_local[valid_mask]
+
+        # 4. Gán trực tiếp vào Dense Tensor padded bằng GPU Advanced Indexing
+        padded = torch.zeros(num_groups, self.max_seq_len, self.raw_feat_dim, device=device)
+        padded[valid_idx, valid_pos] = valid_feats
+
+        # 5. Chạy GRU nguyên khối (không dùng packed sequence nữa - cực nhanh cho fixed tensor)
+        gru_out, _ = self.raw_gru(padded)  # [num_groups, max_seq_len, learnable_dim]
+
+        # 6. Lấy hidden state cuối cùng của mỗi nhóm (vectorized indexing)
+        seq_lens = edge_counts.clamp(max=self.max_seq_len)
+        last_step_idx = (seq_lens - 1).clamp(min=0)
+        
+        group_repr = gru_out[torch.arange(num_groups, device=device), last_step_idx]
+        
+        # Zero-out những group hoàn toàn rỗng giao dịch
+        group_repr = group_repr * (edge_counts > 0).unsqueeze(-1)
+
+        return group_repr
+
+    def forward(self, x, index, timestamps_, log_amounts, raw_extra=None, num_groups=None):
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Group statistics & Time Normalization (tau)
+        edge_counts = torch.bincount(index, minlength=num_groups).float()
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # -------------------------------------------------------------
+        # BRANCH A: Hand-engineered Domain Features (ExSTraQt 6 features)
+        # -------------------------------------------------------------
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(centered ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        skew_den = (scatter(centered ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        exstraqt_raw = torch.stack(
+            [tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival], dim=-1
+        )
+        exstraqt_raw = self.exstraqt_ln(exstraqt_raw)
+
+        # -------------------------------------------------------------
+        # BRANCH B: End-to-End Fast Vectorized Sequence Extraction (GRU)
+        # -------------------------------------------------------------
+        edge_local_core = torch.stack([tau, log_amounts], dim=-1)
+        if raw_extra is not None:
+            edge_local_full = torch.cat([edge_local_core, raw_extra], dim=-1)
+        else:
+            edge_local_full = edge_local_core
+
+        if self.use_raw_branch:
+            learned_pattern = self._extract_temporal_pattern_fast(
+                edge_local_full, index, timestamps_, num_groups
+            )
+            learned_pattern = self.learned_pattern_ln(learned_pattern)
+            learned_pattern = self.branch_dropout(learned_pattern)
+        else:
+            learned_pattern = torch.zeros(num_groups, self.learnable_dim, device=x.device)
+
+        gate = torch.sigmoid(self.channel_gate)           # [learnable_dim]
+        gated_learned = learned_pattern * gate            # [num_groups, learnable_dim]
+
+        # -------------------------------------------------------------
+        # FUSION
+        # -------------------------------------------------------------
+        edge_context_stat = exstraqt_raw[index]
+        edge_context_learned = gated_learned[index]
+
+        edge_feat = torch.cat([edge_context_stat, edge_context_learned, edge_local_core], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+
+        learned_inject = self.learned_proj(gated_learned)
+        fused = pna_feats + learned_inject
+
+        output = self.post_transition(fused) + fused
+
+        return output
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 from torch_scatter import scatter, scatter_softmax
 
