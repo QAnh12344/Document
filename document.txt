@@ -3,6 +3,158 @@ import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
 from torch_geometric.nn.aggr import DegreeScalerAggregation
 
+class ExSTraQtPnaBranchA_Flexible(nn.Module):
+    """
+    Biến thể Branch A hỗ trợ tùy chọn số lượng đặc trưng ExSTraQt (3 hoặc 6 features)
+    để chạy Ablation Study chính xác trên kiến trúc PNA + Edge Gate.
+    """
+    def __init__(
+        self,
+        n_hidden,
+        deg,
+        dropout_p=0.4,
+        raw_core_dim=2,          # tau, log_amounts
+        selected_features=[0, 1, 2, 3, 4, 5] # Mặc định dùng đủ 6 feats
+    ):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.raw_core_dim = raw_core_dim
+        self.selected_features = selected_features
+        self.num_exstraqt_feats = len(selected_features)
+
+        # 1. LayerNorm cho đúng số lượng feature được chọn
+        self.exstraqt_ln = nn.LayerNorm(self.num_exstraqt_feats)
+
+        # 2. Edge-level attention (Gate) nhận (Num_Feats + Core_Dim)
+        gate_input_dim = self.num_exstraqt_feats + raw_core_dim
+        self.edge_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+        # 3. PNA Aggregator Configuration
+        aggregators = ['mean', 'min', 'max', 'std']
+        scalers = ['identity', 'amplification', 'attenuation']
+
+        self.pna_core = DegreeScalerAggregation(aggregators, scalers, deg)
+        pna_out_features = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out_features, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p),
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        self.exstraqt_ln.reset_parameters()
+
+        for m in self.edge_gate:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.edge_gate[2].bias)
+
+        nn.init.kaiming_normal_(self.pna_project[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.post_transition[0].weight, nonlinearity='relu')
+        self.pna_project[1].reset_parameters()
+        self.post_transition[1].reset_parameters()
+
+    def forward(self, x, index, timestamps_, log_amounts, num_groups=None):
+        num_edges = x.size(0)
+
+        if num_groups is None:
+            num_groups = index.max().item() + 1 if num_edges > 0 else 0
+
+        if num_edges == 0:
+            return torch.zeros(num_groups, self.n_hidden, device=x.device)
+
+        # 1. Group statistics & Time Normalization (tau)
+        edge_counts = torch.bincount(index, minlength=num_groups).float()
+        eps_counts = edge_counts + 1e-5
+
+        min_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='min')
+        max_t = scatter(timestamps_, index, dim=0, dim_size=num_groups, reduce='max')
+
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (timestamps_ - min_t[index]) / duration_safe[index]
+
+        # 2. Tính toán đủ 6 đặc trưng ExSTraQt gốc
+        temperature = 3.0
+        global_std = torch.std(log_amounts) + 1e-5
+        raw_weights = scatter_softmax(log_amounts / (global_std * temperature), index, dim=0)
+        amt_weights = raw_weights / eps_counts[index]
+        tf_c = scatter(amt_weights * tau, index, dim=0, dim_size=num_groups, reduce='sum')
+
+        mean_tau = scatter(tau, index, dim=0, dim_size=num_groups, reduce='mean')
+        time_var = scatter((tau - mean_tau[index]) ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        tf_std = torch.sqrt(time_var + 1e-5)
+
+        burst_density = torch.log1p(edge_counts)
+        mean_log_amount = scatter(log_amounts, index, dim=0, dim_size=num_groups, reduce='mean')
+        money_velocity = torch.log1p(mean_log_amount / torch.log1p(duration_safe))
+
+        centered = log_amounts - mean_log_amount[index]
+        skew_num = scatter(centered ** 3, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts
+        skew_den = (scatter(centered ** 2, index, dim=0, dim_size=num_groups, reduce='sum') / eps_counts) ** 1.5 + 1e-5
+        flow_skew = torch.clamp(skew_num / skew_den, min=-2.0, max=2.0)
+
+        avg_inter_arrival = torch.log1p(duration_safe / eps_counts)
+
+        # Gom 6 đặc trưng gốc
+        all_exstraqt = [tf_c, tf_std, burst_density, money_velocity, flow_skew, avg_inter_arrival]
+        
+        # CHỈ LỌC LẤY CÁC FEATURE ĐƯỢC CHỌN (Ví dụ: 3 features)
+        selected_exstraqt = [all_exstraqt[i] for i in self.selected_features]
+
+        exstraqt_raw = torch.stack(selected_exstraqt, dim=-1)
+        exstraqt_raw = self.exstraqt_ln(exstraqt_raw)
+
+        # 3. FUSION & AGGREGATION
+        edge_context_stat = exstraqt_raw[index]
+        edge_local_core = torch.stack([tau, log_amounts], dim=-1)
+
+        edge_feat = torch.cat([edge_context_stat, edge_local_core], dim=-1)
+        edge_attention = self.edge_gate(edge_feat)
+
+        filtered_x = x * edge_attention
+
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+
+        fused = pna_feats
+        output = self.post_transition(fused) + fused
+
+        return output
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from torch_scatter import scatter, scatter_softmax
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+
 
 class ExSTraQtPnaBranchA(nn.Module):
     """
