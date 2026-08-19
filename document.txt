@@ -1,3 +1,11 @@
+The proposed DWBA module depends entirely on six hand-engineered statistical behavioral features of account pairs to perform adaptive edge weighting. Without an end-to-end learnable branch to automatically extract transactional behavioral patterns from raw data, the model suffers restricted generalization ability across diverse financial transaction scenarios
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
