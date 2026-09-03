@@ -1,3 +1,133 @@
+import numpy as np
+import pandas as pd
+from ucimlrepo import fetch_ucirepo
+from sklearn.model_selection import train_test_split, KFold, cross_validate
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# ==========================================
+# 1. TẢI DỮ LIỆU TỪ UCI (id = 165: Concrete Compressive Strength)
+# ==========================================
+print("Đang tải dữ liệu từ UCI repository...")
+concrete_dataset = fetch_ucirepo(id=165)
+
+# Lấy các đặc trưng (X) và biến mục tiêu (y)
+X = concrete_dataset.data.features
+y = concrete_dataset.data.targets.iloc[:, 0]
+
+# Chia tập Train (80%) và Test (20%) bằng seed cố định
+SEED = 42
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_split_size=0.2, random_state=SEED
+)
+
+print(f"-> Tải dữ liệu thành công!")
+print(f"-> Kích thước tập Train: {X_train.shape}")
+print(f"-> Kích thước tập Test:  {X_test.shape}\n")
+
+# ==========================================
+# 2. ĐỊNH NGHĨA MÔ HÌNH VÀ CẤU HÌNH CV
+# ==========================================
+cv = KFold(n_splits=5, shuffle=True, random_state=SEED)
+
+# Baseline: Linear Regression
+# 3 Mô hình so sánh: Random Forest, XGBoost, SVR
+models = {
+    'Linear Regression (Baseline)': LinearRegression(),
+    'Random Forest': RandomForestRegressor(n_estimators=100, random_state=SEED),
+    'XGBoost': XGBRegressor(n_estimators=100, random_state=SEED, verbosity=0),
+    'SVR': SVR(C=10.0, epsilon=0.1)
+}
+
+scoring = {
+    'mae': 'neg_mean_absolute_error',
+    'rmse': 'neg_root_mean_squared_error',
+    'r2': 'r2'
+}
+
+# ==========================================
+# 3. THỰC THI CROSS-VALIDATION (CÓ VÀ KHÔNG CÓ PCA)
+# ==========================================
+results = []
+
+for name, model in models.items():
+    # --- 1. Pipeline KHÔNG dùng PCA ---
+    pipe_no_pca = Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', model)
+    ])
+    scores_no_pca = cross_validate(pipe_no_pca, X_train, y_train, cv=cv, scoring=scoring)
+    
+    results.append({
+        'Model': name,
+        'PCA': 'Không',
+        'CV MAE (Mean)': -scores_no_pca['test_mae'].mean(),
+        'CV RMSE (Mean)': -scores_no_pca['test_rmse'].mean(),
+        'CV R² (Mean)': scores_no_pca['test_r2'].mean(),
+        'CV R² Std (Độ ổn định)': scores_no_pca['test_r2'].std() # Std càng nhỏ càng ổn định
+    })
+    
+    # --- 2. Pipeline CÓ dùng PCA (giữ 95% phương sai) ---
+    pipe_pca = Pipeline([
+        ('scaler', StandardScaler()),
+        ('pca', PCA(n_components=0.95, random_state=SEED)),
+        ('regressor', model)
+    ])
+    scores_pca = cross_validate(pipe_pca, X_train, y_train, cv=cv, scoring=scoring)
+    
+    results.append({
+        'Model': name,
+        'PCA': 'Có (95% Var)',
+        'CV MAE (Mean)': -scores_pca['test_mae'].mean(),
+        'CV RMSE (Mean)': -scores_pca['test_rmse'].mean(),
+        'CV R² (Mean)': scores_pca['test_r2'].mean(),
+        'CV R² Std (Độ ổn định)': scores_pca['test_r2'].std()
+    })
+
+# Tạo Bảng tổng hợp kết quả CV
+df_results = pd.DataFrame(results).sort_values(by='CV R² (Mean)', ascending=False)
+
+print("=========================================================================================")
+print("BẢNG 1: SO SÁNH HIỆU NĂNG CV VÀ TÁC ĐỘNG CỦA PCA (ĐÁNH GIÁ TRÊN TẬP TRAIN VIA 5-FOLD CV)")
+print("=========================================================================================")
+print(df_results.to_string(index=False))
+
+# ==========================================
+# 4. CHỌN MÔ HÌNH TỐI ƯU VÀ NGHIỆM THU TRÊN TẬP TEST
+# ==========================================
+# Dựa trên kết quả CV, chọn mô hình có R² cao nhất và Std nhỏ nhất (Thường là XGBoost Không PCA)
+best_pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('regressor', XGBRegressor(n_estimators=100, random_state=SEED, verbosity=0))
+])
+
+# Huấn luyện lại Pipeline tối ưu trên TOÀN BỘ 80% tập Train
+best_pipeline.fit(X_train, y_train)
+
+# Thực hiện dự báo 1 LẦN DUY NHẤT trên tập Test độc lập (20%)
+y_pred_test = best_pipeline.predict(X_test)
+
+print("\n=========================================================================================")
+print("BẢNG 2: ĐÁNH GIÁ MÔ HÌNH TỐI ƯU NHẤT (XGBoost - Không PCA) TRÊN TẬP TEST ĐỘC LẬP")
+print("=========================================================================================")
+print(f"MAE  trên Test : {mean_absolute_error(y_test, y_pred_test):.4f}")
+print(f"RMSE trên Test : {np.sqrt(mean_squared_error(y_test, y_pred_test)):.4f}")
+print(f"R²   trên Test : {r2_score(y_test, y_pred_test):.4f}")
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 from torch_scatter import scatter, scatter_softmax
