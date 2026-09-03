@@ -12,6 +12,140 @@ from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ==========================================
+# 1. TẢI DỮ LIỆU & CHIA TRAIN/TEST
+# ==========================================
+print("Đang tải dữ liệu Concrete Compressive Strength từ UCI Repository...")
+concrete_dataset = fetch_ucirepo(id=165)
+X = concrete_dataset.data.features
+y = concrete_dataset.data.targets.iloc[:, 0]
+
+SEED = 42
+# Cắt riêng 20% dữ liệu làm tập TEST (nhốt lại, không cho tham gia chọn mô hình)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_split_size=0.2, random_state=SEED
+)
+
+print(f"-> Tập Train (Dùng cho CV chọn mô hình): {X_train.shape[0]} mẫu")
+print(f"-> Tập Test  (Dùng để kiểm chứng cuối)  : {X_test.shape[0]} mẫu\n")
+
+# ==========================================
+# 2. KHỞI TẠO MÔ HÌNH VÀ 5-FOLD CROSS-VALIDATION
+# ==========================================
+cv = KFold(n_splits=5, shuffle=True, random_state=SEED)
+
+models = {
+    'Linear Regression (Baseline)': LinearRegression(),
+    'Random Forest': RandomForestRegressor(n_estimators=100, random_state=SEED),
+    'XGBoost': XGBRegressor(n_estimators=100, random_state=SEED, verbosity=0),
+    'SVR': SVR(C=10.0, epsilon=0.1)
+}
+
+scoring = {
+    'mae': 'neg_mean_absolute_error',
+    'rmse': 'neg_root_mean_squared_error',
+    'r2': 'r2'
+}
+
+# ==========================================
+# 3. CHẠY CV TRÊN TẬP TRAIN (SO SÁNH CÁC MÔ HÌNH & TÁC ĐỘNG PCA)
+# ==========================================
+cv_results = []
+
+for name, model in models.items():
+    for use_pca in [False, True]:
+        # Dựng Pipeline tiền xử lý + giảm chiều + mô hình
+        steps = [('scaler', StandardScaler())]
+        if use_pca:
+            steps.append(('pca', PCA(n_components=0.95, random_state=SEED)))
+        steps.append(('regressor', model))
+        
+        pipe = Pipeline(steps)
+        
+        # Chạy 5-Fold Cross Validation trên X_train
+        scores = cross_validate(pipe, X_train, y_train, cv=cv, scoring=scoring)
+        
+        # Thu thập Mean và Std cho cả 3 Metrics
+        cv_results.append({
+            'Model': name,
+            'PCA': 'Có (95%)' if use_pca else 'Không',
+            'MAE Mean': -scores['test_mae'].mean(),
+            'MAE Std': scores['test_mae'].std(),
+            'RMSE Mean': -scores['test_rmse'].mean(),
+            'RMSE Std': scores['test_rmse'].std(),
+            'R² Mean': scores['test_r2'].mean(),
+            'R² Std': scores['test_r2'].std() # Std thể hiện độ ổn định qua CV
+        })
+
+df_cv = pd.DataFrame(cv_results).sort_values(by='R² Mean', ascending=False)
+
+print("=========================================================================================================")
+print("BẢNG 1: BÁO CÁO KẾT QUẢ CROSS-VALIDATION (TRÊN TẬP TRAIN) - ĐÁNH GIÁ CÁC MÔ HÌNH & TÁC ĐỘNG CỦA PCA")
+print("=========================================================================================================")
+print(df_cv.to_string(index=False))
+
+# ==========================================
+# 4. CHỌN MÔ HÌNH VÔ ĐỊCH VÀ KIỂM CHỨNG LẦN CUỐI TRÊN TẬP TEST
+# ==========================================
+# Lấy tên mô hình và cấu hình PCA của Pipeline có R² Mean cao nhất
+best_row = df_cv.iloc[0]
+best_model_name = best_row['Model']
+use_pca_best = True if best_row['PCA'] == 'Có (95%)' else False
+
+print(f"\n---> Mô hình tối ưu được chọn dựa trên CV: [{best_model_name}] | PCA: [{best_row['PCA']}]")
+
+# Dựng lại Pipeline xuất sắc nhất
+best_steps = [('scaler', StandardScaler())]
+if use_pca_best:
+    best_steps.append(('pca', PCA(n_components=0.95, random_state=SEED)))
+best_steps.append(('regressor', models[best_model_name]))
+
+best_pipeline = Pipeline(best_steps)
+
+# Train lại mô hình trên TOÀN BỘ 80% tập Train
+best_pipeline.fit(X_train, y_train)
+
+# Dự báo 1 LẦN DUY NHẤT trên tập TEST độc lập (20%)
+y_test_pred = best_pipeline.predict(X_test)
+
+test_mae = mean_absolute_error(y_test, y_test_pred)
+test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+test_r2 = r2_score(y_test, y_test_pred)
+
+print("\n=========================================================================================")
+print("BẢNG 2: KẾT QUẢ KIỂM CHỨNG ĐỘC LẬP TRÊN TẬP TEST (20% CHƯA HỀ NHÌN THẤY)")
+print("=========================================================================================")
+df_test = pd.DataFrame([{
+    'Model': best_model_name,
+    'PCA': best_row['PCA'],
+    'Test MAE': test_mae,
+    'Test RMSE': test_rmse,
+    'Test R²': test_r2
+}])
+print(df_test.to_string(index=False))
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from ucimlrepo import fetch_ucirepo
+from sklearn.model_selection import train_test_split, KFold, cross_validate
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# ==========================================
 # 1. TẢI DỮ LIỆU TỪ UCI (id = 165: Concrete Compressive Strength)
 # ==========================================
 print("Đang tải dữ liệu từ UCI repository...")
