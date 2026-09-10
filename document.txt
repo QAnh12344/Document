@@ -1,3 +1,930 @@
+
+Tôi đã search sâu theo limitation của chính DPF-GFD, rồi đối chiếu với các paper 2026. Kết quả quan trọng là: không nên tiếp tục FGW/Causal OT, hypergraph hay frequency-aware nữa vì các hướng đó đã bị overlap khá rõ.
+
+Kết quả lọc
+❌ Loại 1 — Frequency-aware
+Paper Learning Frequency-aware Graph Fraud Detection 2026 đã trực tiếp dùng frequency-domain + adaptive spectral gating cho fraud. DPF bản thân cũng là graph filtering/frequency-oriented. Nếu lấy hướng này tiếp sẽ rất dễ bị reviewer nói “incremental”. 
+
+❌ Loại 2 — Hypergraph
+2026 đã có:
+
+HGT-FD — hypergraph transformer cho fraud. 
+
+HDN-GFD — hypergraph + dynamic neighborhood cho camouflaged fraud. 
+
+MVHGF — multi-view hypergraph cho Ethereum phishing. 
+
+→ Không nên làm hypergraph extension của DPF.
+
+❌ Loại 3 — Heterophily/neighbor filtering thông thường
+HIGNN 2026 đã trực tiếp xử lý heterophily inconsistency trong fraud; HOT-GNN cũng dùng semantic/structural outlier-aware similarity để xử lý deceptive relations. 
+
+→ Không nên làm thêm một “heterophily-aware similarity module” bình thường.
+
+Còn 3 hướng đáng giữ
+🥇 Hướng 1 — Direction-Preserving Spectral DPF
+Đây là hướng tôi đánh giá cao nhất hiện tại.
+
+Limitation của DPF
+Transaction graph vốn là:
+
+A→B
+nhưng DPF xử lý graph theo dạng bidirectional/undirected để thực hiện spectral filtering.
+
+Điều này có thể làm mất thông tin:
+
+A→B
+
+=B→A
+Trong AML, đây không phải chi tiết nhỏ:
+
+A → B → C
+có ý nghĩa hoàn toàn khác:
+
+C → B → A
+Kỹ thuật 2026
+Paper Anomaly Detection in Directed Dynamic Graphs Using Hermitian Laplacian Spectral Analysis 2026 chỉ ra chính limitation này: conventional Laplacian không biểu diễn tốt directionality, và đề xuất Hermitian Laplacian để giữ thông tin hướng trong spectral representation. Paper còn kiểm nghiệm trên trade network. 
+
+Ý tưởng cho DPF
+Thay:
+
+G 
+o
+​
+ →L→BetaWavelet
+bằng:
+
+G 
+o
+directed
+​
+ →L 
+H
+​
+ →BetaWavelet
+trong đó L 
+H
+​
+  là Hermitian Laplacian.
+
+Tức là:
+
+Original DPF
+
+directed graph
+      ↓
+make bidirected
+      ↓
+Beta-wavelet
+      ↓
+H_o
+thành:
+
+Our method
+
+directed transaction graph
+      ↓
+Hermitian adjacency
+      ↓
+Hermitian Laplacian
+      ↓
+direction-preserving Beta-wavelet
+      ↓
+H_o*
+Contribution rất sạch
+DPF's spectral path discards directional information when transforming the directed transaction graph into an undirected/bidirected representation. We introduce a direction-preserving spectral filtering mechanism based on the Hermitian Laplacian.
+
+Ưu điểm: sửa đúng một limitation rất cụ thể của DPF.
+
+Nhược điểm: Hermitian/magnetic spectral GNN đã có từ trước, ví dụ MagNet 2022. 
+
+→ Vì vậy novelty phải nằm ở direction-preserving Beta-wavelet dual-path fraud detection, chứ không được claim Hermitian Laplacian là mới.
+
+🥈 Hướng 2 — Rayleigh-Quotient Graph Pruning
+Đây là hướng tôi thấy rất đáng thử nếu mục tiêu là AP/Recall@K.
+
+Paper 2026:
+
+RayQ-GAD: Rayleigh Quotient-Driven Graph Pruning for Anomaly Detection
+
+được xuất bản trong Knowledge-Based Systems 2026. Ý tưởng là dùng Rayleigh quotient để đo mức heterogeneity và chủ động prune các edge gây signal dilution. 
+
+Rayleigh quotient:
+
+R(x)= 
+x 
+T
+ x
+x 
+T
+ Lx
+​
+ 
+Paper cho thấy Rayleigh quotient có tương quan với heterogeneity; họ prune edge để giảm quotient và giảm harmful heterophilic propagation. 
+
+Ghép vào DPF như thế nào?
+DPF hiện:
+
+KNN(X)
+   ↓
+Similarity graph
+   ↓
+Low-pass
+Ta làm:
+
+KNN(X)
+   ↓
+Similarity graph
+   ↓
+Rayleigh-based pruning
+   ↓
+Clean similarity graph
+   ↓
+Low-pass
+Nhưng không copy nguyên RayQ-GAD.
+
+Ta biến nó thành:
+
+Fraud-aware Similarity Graph Pruning
+Với mỗi candidate edge:
+
+(i,j)
+đo mức đóng góp của edge vào:
+
+R(H 
+o
+​
+ )
+Nếu edge làm tăng spectral heterogeneity quá mạnh:
+
+ΔR 
+ij
+​
+ >0
+→ giảm weight hoặc remove.
+
+Nếu:
+
+ΔR 
+ij
+​
+ ≤0
+→ giữ.
+
+Tại sao tôi thích hướng này?
+Nó trực tiếp giải quyết:
+
+KNN similarity graph của DPF có thể chứa những edge gây harmful propagation.
+
+Không cần:
+
+OT
+
+causal model
+
+hypergraph
+
+contrastive learning
+
+transformer.
+
+Và mục tiêu rất trực tiếp:
+
+harmful edges↓
+→
+
+signal dilution↓
+→
+
+fraud ranking↑
+→ AP/Recall@K/AUC tăng.
+
+🥉 Hướng 3 — Task-Adaptive Error-Edge Pruning
+Có paper rất mới tháng 8/2026:
+
+Task-adaptive Sparse Graph Structure Learning with Error-edge Pruning and Anti-smoothing Mechanism, Neural Networks. 
+
+Nó đưa ra:
+
+error-edge pruning,
+
+sparse regularization,
+
+constrained neighborhood search,
+
+anti-smoothing.
+
+Đặc biệt paper chỉ ra graph structure cố định có thể không phù hợp với node-variant tasks, và graph learning có thể tạo ra unnecessary connections. 
+
+Áp vào DPF
+Thay vì:
+
+G 
+s
+​
+ =KNN(X)
+ta học:
+
+G 
+s
+∗
+​
+ =G 
+s
+​
+ ⊙M
+với:
+
+M 
+ij
+​
+ =g(x 
+i
+​
+ ,x 
+j
+​
+ ,h 
+i
+​
+ ,h 
+j
+​
+ )
+và sparse regularization buộc các edge không hữu ích bị loại.
+
+Pipeline:
+
+KNN(X)
+   ↓
+Task-adaptive edge gate
+   ↓
+Sparse/error-edge pruning
+   ↓
+G_s*
+   ↓
+DPF low-pass
+Nhưng tôi xếp nó thứ 3
+Vì ASGSL đã là graph structure learning + edge pruning khá tổng quát. Nếu chỉ đem nó sang DPF thì reviewer có thể hỏi:
+
+“Why is this more than applying an existing GSL module?”
+
+Do đó novelty yếu hơn Rayleigh hướng.
+
+So sánh cuối cùng
+Hướng	Limitation DPF	Novelty	Khả năng tăng AP	Overlap	Tôi chọn
+Direction-Preserving Hermitian DPF	Mất hướng giao dịch	⭐⭐⭐⭐	⭐⭐⭐⭐⭐	🟡	🥇
+Rayleigh Similarity Pruning	KNN tạo harmful edges	⭐⭐⭐⭐	⭐⭐⭐⭐⭐	🟡	🥈
+Task-Adaptive Pruning	Similarity graph cố định	⭐⭐⭐	⭐⭐⭐⭐	🟠	🥉
+Causal OT	KNN thiếu causal compatibility	⭐⭐⭐⭐	?	🟠	❌
+FGW	KNN thiếu structural info	⭐⭐⭐	⭐⭐⭐⭐	🟠	❌
+Hypergraph	Thiếu high-order relation	⭐⭐⭐	⭐⭐⭐⭐	🔴	❌
+Frequency-aware	Heterophily/frequency	⭐⭐	⭐⭐⭐⭐	🔴	❌
+Nhưng có một điểm rất đáng chú ý
+Tôi nghĩ 🥇 + 🥈 có thể tạo thành một paper mạnh hơn nếu kết hợp rất tiết chế:
+
+Direction-Preserving DPF+Rayleigh-guided pruning
+​
+ 
+Không phải hai contribution độc lập.
+
+Mà là một câu chuyện duy nhất:
+
+Preserve transaction direction → obtain better spectral signal → prune similarity/transaction edges that cause spectral signal dilution.
+
+Pipeline:
+
+Directed Transaction Graph
+          ↓
+Hermitian Laplacian
+          ↓
+Direction-Preserving Beta Filter
+          ↓
+H_o*
+          ↓
+KNN Similarity Graph
+          ↓
+Rayleigh-guided Edge Pruning
+          ↓
+Clean Similarity Graph
+          ↓
+DPF Low-pass
+          ↓
+H_s*
+          ↓
+XGBoost
+Đây là hướng tôi sẽ tiếp tục đào sâu trước khi cho AI code. Đặc biệt tôi muốn kiểm tra thêm một việc: DPF-GFD chính xác biến directed graph thành bidirected ở đâu, Beta-wavelet hiện tại có thể thay bằng Hermitian operator ở mức code nào, và Rayleigh pruning có thể chạy được trên hàng triệu node hay không. Nếu ba điểm này đều ổn thì mới đáng code.
+
+
+Ok. Bạn đào sâu hướng đó đi
+
+Tôi đã đào sâu hơn, và có một kết luận quan trọng: hướng “Hermitian Laplacian + DPF” không đủ mới nếu đứng một mình. Vì vậy tôi không khuyên bạn code bản đó ngay.
+
+1. Tôi kiểm tra lại limitation thật của DPF
+DPF có hai nhánh:
+
+G 
+o
+​
+  
+Beta-wavelet
+​
+ Z 
+1
+​
+ 
+và
+
+KNN(X) 
+low-pass
+​
+ Z 
+2
+​
+ 
+Trong đó similarity graph được xây chỉ từ khoảng cách giữa node features, không dùng cấu trúc transaction gốc. 
+
+Điểm này thực sự đáng đánh.
+
+Nhưng có hai vấn đề khác nhau:
+
+Vấn đề A — mất direction
+Transaction:
+
+A→B
+có ý nghĩa khác:
+
+B→A.
+Hermitian/magnetic Laplacian đúng là giải quyết được directionality. Paper 2026 về anomaly detection trên directed dynamic graphs cũng sử dụng Hermitian Laplacian và báo cáo hiệu quả trên trade networks. 
+
+Nhưng: ý tưởng dùng Hermitian Laplacian cho directed graph đã có từ trước 2026, thậm chí đã có công trình về graph Fourier/wavelet trên directed graphs. 
+
+→ Vì vậy:
+
+“DPF + Hermitian Laplacian” = chưa đủ contribution Q1.
+
+2. Rayleigh pruning thì thú vị hơn
+Paper RayQ-GAD, Knowledge-Based Systems 2026 có một observation rất đáng lấy:
+
+Rayleigh quotient↑⟺graph heterogeneity↑
+và họ dùng Rayleigh quotient để prune edge gây heterophily/signal dilution. 
+
+Điều này cực kỳ phù hợp với DPF.
+
+DPF nói:
+
+similarity graph giúp giảm ảnh hưởng của relation camouflage và heterophily.
+
+Nhưng DPF hiện tại:
+
+KNN(X)
+không kiểm tra edge nào thực sự tốt cho propagation.
+
+RayQ cho ta một nguyên lý mới:
+
+edge t 
+o
+ˆ
+ 
+ˊ
+ t
+
+=edge feature-similar
+mà:
+
+edge t 
+o
+ˆ
+ 
+ˊ
+ t=edge gi 
+u
+ˊ
+ p giảm harmful spectral heterogeneity.
+3. Nhưng tôi phát hiện một vấn đề với việc copy RayQ-GAD
+RayQ-GAD đã làm graph pruning cho anomaly detection. 
+
+Nếu chúng ta đơn giản làm:
+
+DPF
+  ↓
+Rayleigh pruning
+  ↓
+Low-pass
+reviewer hoàn toàn có thể nói:
+
+“This is essentially applying RayQ-GAD's pruning mechanism to DPF.”
+
+→ Không đủ mới.
+
+Cho nên tôi sẽ không làm như vậy.
+
+4. Ý tưởng mới tôi thấy đáng giữ lại
+Thay vì dùng Rayleigh quotient để prune original graph, chúng ta dùng nó để learn the quality of DPF's feature-similarity edges.
+
+Đây là khác biệt quan trọng.
+
+DPF hiện tại
+A 
+s
+​
+ =KNN(X)
+RayQ-GAD
+A 
+o
+​
+ →Rayleigh pruning
+Chúng ta
+KNN(X)→Edge Spectral Utility→A 
+s
+∗
+​
+ 
+​
+ 
+Tức là không prune transaction graph.
+
+Chúng ta sửa chính auxiliary similarity graph, nơi DPF đang có limitation.
+
+5. Tôi đề xuất đổi tên thành
+Spectral Utility-Guided Similarity Graph
+viết tắt:
+
+SUG-SG
+​
+ 
+hoặc:
+
+Spectral Utility-Guided DPF (SU-DPF)
+Tôi thích tên thứ hai hơn.
+
+6. Ý tưởng cốt lõi
+Với mỗi KNN edge:
+
+(i,j)
+DPF hiện tại chỉ biết:
+
+x 
+i
+​
+ ≈x 
+j
+​
+ .
+Chúng ta hỏi thêm:
+
+Nếu cho edge i−j tồn tại, nó làm tín hiệu fraud tốt hơn hay tệ hơn?
+
+Định lượng bằng thay đổi Rayleigh energy.
+
+7. Định nghĩa edge utility
+Giả sử:
+
+L
+là Laplacian của similarity graph.
+
+Node signal:
+
+h
+có thể lấy từ:
+
+H 
+o
+​
+ 
+hoặc một fraud-aware training signal.
+
+Rayleigh quotient:
+
+R(H)= 
+H 
+T
+ H
+H 
+T
+ LH
+​
+ .
+Với candidate edge e=(i,j):
+
+ΔR 
+e
+​
+ =R(G+e)−R(G).
+Nếu:
+
+ΔR 
+e
+​
+ <0
+edge này làm graph spectrally smoother / less heterogeneous.
+
+Nếu:
+
+ΔR 
+e
+​
+ >0
+edge có khả năng làm tăng heterogeneity.
+
+8. Nhưng chưa đủ: fraud graph không phải pure homophily
+Đây là điểm tôi muốn không copy RayQ.
+
+Fraud graph có heterophily.
+
+Một fraud node đôi khi phải nối với legitimate node.
+
+Nếu cứ:
+
+ΔR<0
+là giữ edge thì có thể xoá mất fraud signal.
+
+Vì vậy chúng ta không tối ưu:
+
+minR
+đơn thuần.
+
+Ta tối ưu:
+
+U 
+ij
+​
+ =S 
+feature
+​
+ (i,j)−λΔR 
+ij
+​
+ +μS 
+fraud
+​
+ (i,j)
+​
+ 
+Trong đó:
+
+S 
+feature
+​
+ : feature similarity.
+
+ΔR: spectral heterogeneity contribution.
+
+S 
+fraud
+​
+ : mức edge hữu ích cho phân biệt fraud.
+
+Sau đó:
+
+A 
+ij
+∗
+​
+ =TopK 
+j
+​
+ (U 
+ij
+​
+ ).
+9. Đây mới là khác biệt với RayQ-GAD
+RayQ-GAD	SU-DPF
+Graph anomaly detection	Financial fraud
+Prune original graph	Refine DPF similarity graph
+Mục tiêu giảm heterophily	Cân bằng similarity + spectral utility + fraud discrimination
+Local graph pruning	KNN candidate refinement
+Không phải dual-path	Specifically modifies DPF's second path
+RayQ-GAD là nguồn cảm hứng về Rayleigh-driven edge quality, chứ không phải phương pháp chúng ta bê nguyên vào. 
+
+10. Tại sao hướng này có khả năng tăng AP hơn Hermitian?
+Vì nó đánh trực tiếp vào ranking quality.
+
+DPF cuối cùng dùng embedding để XGBoost xếp hạng fraud.
+
+Nếu similarity graph chứa:
+
+fraud ↔ misleading legitimate
+thì low-pass làm representation bị kéo sai.
+
+SU-DPF cố loại các edge:
+
+feature-similar but spectrally harmful.
+Do đó kỳ vọng:
+
+False similarity edges↓
+Fraud signal dilution↓
+AP↑
+Recall@K↑
+AUC↑
+Đây là hypothesis có thể kiểm chứng trực tiếp, không phải chỉ nói “representation tốt hơn”.
+
+11. Một thí nghiệm cực kỳ quan trọng
+Không chỉ báo metric.
+
+Phải đo:
+
+Edge retention
+∣E 
+KNN
+​
+ ∣
+∣E 
+s
+∗
+​
+ ∣
+​
+ 
+Spectral heterogeneity
+R(H 
+o
+​
+ )
+Fraud-neighbor purity
+FNP= 
+#retained edges
+#fraud-compatible edges
+​
+ 
+Ranking
+AP
+
+Recall@K
+
+AUC
+
+F1
+
+Nếu kết quả kiểu:
+
+                  DPF       SU-DPF
+
+AP                .782      .82x
+AUC               .923      .94x
+Recall@K          .729      .77x
+
+Rayleigh          high      lower
+harmful edges     high      lower
+thì contribution rất dễ kể.
+
+12. Còn Hermitian thì sao?
+Tôi không vứt hoàn toàn.
+
+Nó có thể trở thành một future extension / optional ablation, không phải contribution chính.
+
+Vì literature đã có:
+
+Hermitian graph signal processing cho directed graph. 
+
+Hermitian fractional Laplacian cho directed graph. 
+
+MagNet dùng magnetic Laplacian cho directed GNN. 
+
+2026 đã có Hermitian spectral anomaly detection trên directed dynamic graphs. 
+
+=> Không đáng lấy nó làm novelty trung tâm.
+
+13. Một điểm nữa tôi tìm được và rất đáng chú ý
+Có paper 2025 về Beta-Wavelet + Mixup chỉ ra Beta-Wavelet có vấn đề under-reaching trong graph anomaly detection. 
+
+Điều này nghĩa là chính Beta-Wavelet của DPF cũng có một limitation tiềm năng.
+
+Nhưng tôi chưa ghép nó vào SU-DPF, vì sẽ thành:
+
+Beta-wavelet fix
++
+Rayleigh pruning
++
+similarity graph
+→ dễ thành module soup.
+
+Kết luận sau vòng đào sâu
+Tôi xếp lại:
+
+❌ Hermitian DPF
+Không chọn làm chính. Quá nhiều prior work.
+
+❌ Causal OT
+Bỏ. Quá phức tạp so với lợi ích.
+
+❌ FGW
+Bỏ. Literature quá rộng.
+
+⚠️ RayQ-GAD copy trực tiếp
+Không được. Quá giống paper 2026.
+
+🟢 Hướng đáng tiếp tục
+KNN similarity graph→spectral utility evaluation→fraud-aware edge refinement→DPF low-pass
+​
+ 
+Tên tạm:
+
+SU-DPF: Spectral-Utility Guided Dual-Path Graph Filtering for Financial Fraud Detection
+Một limitation: DPF xây KNN graph chỉ dựa trên feature distance.
+
+Một ý tưởng: đánh giá utility của từng KNN edge đối với spectral fraud signal.
+
+Một thay đổi: refine similarity graph trước low-pass.
+
+Một cơ chế lý thuyết: Rayleigh quotient.
+
+Một mục tiêu: giảm harmful similarity edges nhưng không ép fraud graph thành homophilic graph.
+
+Đây hiện là hướng tôi đánh giá đáng code nhất, nhưng tôi vẫn chưa gọi nó là “chắc chắn Q1”. Điểm cần kiểm tra tiếp theo là công thức tính ΔR 
+ij
+​
+  có thể rút gọn thành dạng edge-local hay không, vì nếu phải tính lại toàn bộ eigen/Laplacian cho từng edge thì với graph hàng triệu node sẽ không chạy được. Nếu rút được công thức local O(1)/O(d), hướng này mới thực sự khả thi trên dataset của bạn.
+
+
+Thế ý tươbgr của vạn là gì, khắc phục hạn chế nào và bạn cải tiến dụea trên paper nào
+
+Ý tưởng tôi đề xuất
+SU-DPF: Spectral-Utility Guided DPF
+Hạn chế của DPF-GFD:
+
+DPF xây similarity graph bằng KNN trên feature:
+
+X→KNN(X)→G 
+s
+​
+ →LowPass
+Nên một edge được tạo chỉ vì:
+
+x 
+i
+​
+ ≈x 
+j
+​
+ 
+nhưng không biết edge đó có thực sự hữu ích cho fraud detection hay lại làm nhiễu quá trình propagation.
+
+Đây là limitation tôi muốn đánh vào.
+
+Cải tiến
+Không bỏ KNN.
+
+Ta dùng KNN để tạo candidate edges, sau đó đánh giá từng edge bằng spectral utility:
+
+KNN(X)→ 
+Edge Utility
+​
+ →G 
+s
+∗
+​
+ →LowPass
+Với edge i,j, tính:
+
+U 
+ij
+​
+ =S 
+feature
+​
+ (i,j)−λΔR 
+ij
+​
+ +μS 
+fraud
+​
+ (i,j)
+Trong đó:
+
+S 
+feature
+​
+ : hai node có giống nhau không.
+
+ΔR 
+ij
+​
+ : edge này làm tăng hay giảm spectral heterogeneity.
+
+S 
+fraud
+​
+ : edge có hữu ích cho việc phân biệt fraud hay không.
+
+Sau đó giữ Top-K edge có utility cao:
+
+G 
+s
+∗
+​
+ =TopK(U)
+rồi đưa G 
+s
+∗
+​
+  vào DPF low-pass.
+
+Khắc phục limitation nào?
+DPF:
+Feature-similar edge ⇒ giữ lại
+
+SU-DPF:
+Feature-similar edge chưa đủ; phải chứng minh edge đó hữu ích cho graph signal/fraud detection.
+
+Ví dụ:
+
+KNN:
+Fraud A ───── Legit B
+     ↑
+feature rất giống
+Nhưng nếu edge A-B làm fraud signal bị pha loãng:
+
+ΔR 
+AB
+​
+ >0
+thì giảm weight hoặc loại edge.
+
+Ngược lại, nếu edge giúp duy trì fraud signal:
+
+ΔR 
+AB
+​
+ ≤0
+thì giữ.
+
+Mục tiêu:
+
+harmful edges↓
+signal dilution↓
+AP, AUC, Recall@K↑
+Dựa trên paper nào?
+1. Base paper — DPF-GFD 2026
+Graph-Based Fraud Detection with Dual-Path Graph Filtering, Neural Networks, 2026.
+
+DPF cung cấp:
+
+Original graph→Beta filter
+và:
+
+Feature KNN graph→LowPass
+Chúng ta giữ nguyên kiến trúc này và chỉ cải tiến similarity graph.
+
+2. Nguồn ý tưởng chính — RayQ-GAD 2026
+RayQ-GAD: Rayleigh Quotient-Driven Graph Pruning for Anomaly Detection, Knowledge-Based Systems, 2026.
+
+Paper này sử dụng Rayleigh quotient để đánh giá heterogeneity và pruning những edge có khả năng gây signal dilution/harmful propagation.
+
+Ta không copy RayQ-GAD.
+
+Ta lấy nguyên lý:
+
+Rayleigh quotient can quantify graph-signal quality
+​
+ 
+rồi đưa nó vào KNN similarity graph của DPF.
+
+Contribution của bài mới
+Contribution 1
+Phát hiện:
+
+Feature-based KNN trong DPF có thể tạo spectrally harmful similarity edges.
+
+Contribution 2
+Đề xuất:
+
+Spectral-Utility Guided Similarity Graph (SUG-SG) để đánh giá và lọc KNN edges trước DPF low-pass.
+
+Contribution 3
+Chứng minh:
+
+harmful-edge reduction→better propagation→better fraud ranking
+bằng:
+
+AP
+
+Recall@K
+
+AUC
+
+F1
+
+edge-retention / spectral analysis.
+
+Tóm gọn:
+
+DPF hỏi “node nào giống nhau?” → SU-DPF hỏi thêm “edge giữa hai node giống nhau đó có thực sự tốt cho fraud signal không?”
+
+Đây là ý tưởng tôi đang đánh giá đáng giữ nhất sau khi loại Causal OT, FGW và Hermitian.
+
+
+
+
+
+
+
+
+
+
+
+
+
 Đề xuất: Causal-Structure-Constrained DPF
 1. Hạn chế của DPF-GFD
 
