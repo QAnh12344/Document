@@ -1,3 +1,98 @@
+Đề xuất: Causal-Structure-Constrained DPF
+1. Hạn chế của DPF-GFD
+
+DPF xây similarity graph bằng:
+
+X → KNN(X) → Similarity Graph → Low-pass Filter
+
+Vấn đề:
+
+Feature similarity không đồng nghĩa với similarity về hành vi giao dịch.
+
+Fraudster có thể tạo feature giống node legitimate → KNN tạo false similarity edges → low-pass propagation truyền thông tin sai → ảnh hưởng AP, AUC, Recall@K.
+
+2. Phương pháp đề xuất
+
+Giữ nguyên DPF ở gần như toàn bộ kiến trúc.
+
+Chỉ thay:
+
+KNN(X) → Similarity Graph
+
+bằng:
+
+KNN(X)
+   ↓
+Candidate edges
+   ↓
+Causal + Structural Validation
+   ↓
+Causal-Structure-Constrained Similarity Graph
+   ↓
+DPF Low-pass Filter
+
+Với mỗi candidate (i,j):
+
+$$ S_{ij}= \alpha S_{feature} +\beta S_{structure} +\gamma S_{causal} $$
+
+Trong đó:
+
+\(S_{feature}\): similarity của node features.
+\(S_{structure}\): similarity của DPF original embedding \(H_o\).
+\(S_{causal}\): mức tương thích về direction + temporal transaction behavior, tính bằng constrained OT.
+
+Sau đó chỉ giữ các edge có score cao:
+
+$$ G_s^*=\operatorname{TopK}(S) $$
+
+rồi:
+
+$$ G_s^*\rightarrow LowPass\rightarrow H_s $$
+
+Cuối cùng vẫn:
+
+$$ [H_o||H_s]\rightarrow XGBoost $$
+3. Nó khắc phục cái gì?
+DPF-GFD	Đề xuất
+Feature similarity	Feature + structural + causal compatibility
+KNN tạo edge trực tiếp	KNN chỉ tạo candidate
+Có thể có false similarity edges	Validation loại bớt false edges
+Low-pass trên graph chưa kiểm chứng	Low-pass trên graph đã kiểm chứng
+Có thể bị relation camouflage	Giảm tác động của camouflage
+
+Mục tiêu:
+
+$$ False\ Edges\downarrow \Rightarrow Propagation\ Quality\uparrow \Rightarrow AP/AUC/Recall@K\uparrow $$
+4. Dựa trên paper nào?
+
+Base:
+
+DPF-GFD, Neural Networks, 2026 — dual-path graph filtering và feature-based KNN similarity graph.
+
+Ý tưởng lý thuyết mới:
+
+Graph Causal Optimal Transport and Wasserstein Distances, 2026 — phát triển OT với coupling bị ràng buộc bởi cấu trúc directed graph/causal structure.
+
+Không claim: GCOT đã được dùng cho fraud.
+
+Contribution của chúng ta là: đưa nguyên lý causal-constrained transport vào similarity-graph construction của DPF-GFD.
+
+5. Contribution của paper
+Phát hiện limitation: feature-only KNN có thể tạo quan hệ giả trong transaction graph.
+Đề xuất CSCSG: dùng causal + structural validation để xây similarity graph.
+Phân tích cơ chế: chứng minh giảm false similarity edges và cải thiện AP/AUC/Recall@K.
+
+Một ý tưởng chính, một limitation, một module chính — không phải module soup.
+
+
+
+
+
+
+
+
+
+
 import numpy as np
 import pandas as pd
 from ucimlrepo import fetch_ucirepo
