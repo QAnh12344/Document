@@ -1,3 +1,311 @@
+Đúng với mục tiêu của bạn — build trên DPF-GFD và đặc biệt là Elliptic — thì ý tưởng tôi đang đề xuất là:
+
+Coupled Reaction–Cross-Diffusion DPF
+
+Không phải “thêm một module attention” vào DPF, mà thay đổi cách hai nhánh của DPF tương tác với nhau.
+
+1. DPF hiện tại có điểm yếu gì?
+
+DPF có hai nguồn thông tin:
+
+Original transaction graph \(G_o\) → \(H_o\): thông tin quan hệ giao dịch.
+KNN similarity graph \(G_s\) → \(H_s\): các node có đặc trưng giống nhau.
+
+Hiện tại về cơ bản:
+
+$$ G_o \rightarrow H_o $$ $$ G_s \rightarrow H_s $$
+
+sau đó:
+
+$$ H=[H_o||H_s] $$
+
+tức là hai quá trình học gần như độc lập rồi mới fusion ở cuối.
+
+Đây là điểm tôi muốn đánh vào.
+
+Với Elliptic, điều này khá đáng chú ý vì một giao dịch bất hợp pháp có thể:
+
+có quan hệ giao dịch đáng ngờ nhưng feature không giống các node fraud khác;
+có feature giống fraud nhưng quan hệ transaction lại bình thường;
+hoặc hai nguồn bằng chứng chỉ trở nên rõ ràng khi được xem xét đồng thời.
+
+DPF hiện tại không cho \(H_o\) ảnh hưởng trực tiếp đến quá trình lan truyền của \(H_s\), và ngược lại.
+
+2. Ý tưởng lấy từ paper nào?
+
+Có hai nguồn chính, một từ ML/GNN và một từ mathematical biology/physics.
+
+Paper 1 — EpiRDN, UAI 2026
+
+EpiRDN: A Learnable Anisotropic Reaction-Diffusion Network for Epidemic Time Series Prediction
+
+Paper này lấy mô hình reaction–diffusion trong dịch tễ học và biến nó thành graph neural architecture.
+
+Nó tách quá trình thành:
+
+$$ \text{Reaction} + \text{Diffusion} $$
+
+Trong đó reaction mô tả biến đổi cục bộ của trạng thái, còn diffusion mô tả sự lan truyền qua graph. Paper cũng dùng diffusion bất đối xứng để biểu diễn hướng lan truyền.
+
+Đây là paper ML gần nhất để bạn tham khảo cách biến reaction-diffusion thành architecture.
+
+EpiRDN – UAI 2026
+
+Paper 2 — Reaction-cross-diffusion, Journal of Mathematical Biology 2025
+
+Designing reaction-cross-diffusion systems with Turing and wave instabilities
+
+Đây mới là nguồn nguyên lý chính cho phần novelty.
+
+Điểm quan trọng của paper là diffusion không nhất thiết phải là:
+
+$$ D= \begin{bmatrix} d_1&0\\ 0&d_2 \end{bmatrix} $$
+
+mà có thể là non-diagonal diffusion matrix:
+
+$$ D= \begin{bmatrix} d_{11}&d_{12}\\ d_{21}&d_{22} \end{bmatrix} $$
+
+Nghĩa là trạng thái của hệ A có thể ảnh hưởng đến quá trình diffusion của B, và ngược lại. Đây chính là ý tưởng cross-diffusion.
+
+Reaction-cross-diffusion – Journal of Mathematical Biology 2025
+
+3. Chuyển nguyên lý đó sang DPF như thế nào?
+
+Đây mới là contribution của paper bạn.
+
+Ta coi:
+
+$$ H_o $$
+
+là structural state
+
+và:
+
+$$ H_s $$
+
+là behavioral/similarity state.
+
+Thay vì:
+
+$$ H_o \rightarrow \text{independent} $$ $$ H_s \rightarrow \text{independent} $$
+
+ta cho hai state couple với nhau trong quá trình diffusion.
+
+Ví dụ một layer:
+
+$$ H_o^{l+1} = H_o^l+ R_o(H_o^l) + D_{oo}(G_o,H_o^l) + D_{os}(G_o,H_s^l) $$
+
+và:
+
+$$ H_s^{l+1} = H_s^l+ R_s(H_s^l) + D_{ss}(G_s,H_s^l) + D_{so}(G_s,H_o^l) $$
+
+Trong đó:
+
+\(D_{oo}\): structural → structural propagation.
+\(D_{ss}\): similarity → similarity propagation.
+\(D_{os}\): similarity state ảnh hưởng structural diffusion.
+\(D_{so}\): structural state ảnh hưởng similarity diffusion.
+\(R_o,R_s\): reaction, tức biến đổi trạng thái cục bộ.
+
+Điểm quan trọng là:
+
+Hai graph của DPF không còn là hai đường xử lý độc lập nữa. Chúng trở thành một hệ coupled dynamical system.
+
+Đây là khác biệt kiến trúc thực sự.
+
+4. “Reaction” ở Elliptic có nghĩa gì?
+
+Không nên bê nguyên reaction của dịch bệnh sang.
+
+Ta diễn giải nó theo fraud state evolution.
+
+Ví dụ:
+
+$$ R_i^t=f(H_i^t) $$
+
+có thể hiểu là:
+
+trạng thái rủi ro/hành vi của transaction node được biến đổi dựa trên chính trạng thái hiện tại của nó.
+
+Với Elliptic còn có temporal information, nên có thể dùng:
+
+$$ R_i^t=f(H_i^t,H_i^{t-1}) $$
+
+để biểu diễn:
+
+hành vi hiện tại của transaction khác với trạng thái trước đó như thế nào?
+
+Điều này tự nhiên hơn rất nhiều so với việc nhét thêm một attention module.
+
+5. Cross-diffusion giải quyết vấn đề gì?
+
+Đây là phần tôi nghĩ đáng làm nhất.
+
+Giả sử node \(i\):
+
+Trường hợp A
+
+Transaction structure:
+
+$$ H_o(i)=\text{high risk} $$
+
+nhưng feature similarity:
+
+$$ H_s(i)=\text{normal} $$
+
+DPF có thể fusion hai embedding cuối cùng và classifier phải tự quyết định.
+
+Phương pháp mới:
+
+$$ H_o \rightarrow D_{so} \rightarrow H_s $$
+
+cho phép structural evidence điều chỉnh quá trình propagation của similarity branch.
+
+Trường hợp B
+$$ H_o(i)=\text{normal} $$
+
+nhưng:
+
+$$ H_s(i)=\text{high risk} $$
+
+thì:
+
+$$ H_s\rightarrow D_{os}\rightarrow H_o $$
+
+cho behavioral/similarity evidence ảnh hưởng structural propagation.
+
+Trường hợp C — quan trọng nhất
+
+Hai nguồn đều yếu riêng lẻ:
+
+$$ H_o(i)=weak $$ $$ H_s(i)=weak $$
+
+nhưng hàng xóm của \(i\) cho thấy:
+
+$$ H_o(j)=high $$
+
+và:
+
+$$ H_s(k)=high $$
+
+Cross-diffusion có thể giúp hai nguồn evidence khuếch đại lẫn nhau trong representation learning, thay vì đợi đến bước classifier cuối cùng.
+
+Đây là lý do tôi kỳ vọng phương pháp này có khả năng tác động vào AP và Recall@K, chứ không chỉ F1.
+
+6. Tại sao nó hợp với Elliptic hơn một số ý tưởng khác?
+
+Elliptic có:
+
+transaction graph;
+temporal ordering;
+directed financial flows;
+fraud/licit classes cực kỳ mất cân bằng;
+fraud thường bị camouflage;
+node có thể có evidence từ cả transaction relationship và feature similarity.
+
+Trong khi DPF đã có sẵn:
+
+$$ \boxed{\text{transaction graph}} $$
+
+và
+
+$$ \boxed{\text{similarity graph}} $$
+
+nên cross-diffusion có một ý nghĩa rất rõ:
+
+structural evidence và behavioral similarity evidence không nên được xử lý độc lập.
+
+Đây là điểm rất khác với việc đơn giản thêm một graph hoặc thêm attention.
+
+7. Vậy contribution paper có thể viết thành gì?
+
+Tôi sẽ không viết:
+
+“We propose a novel reaction-diffusion GNN.”
+
+Vì reaction-diffusion GNN đã có trước đó. EpiRDN 2026 cũng cho thấy hướng này đang được phát triển mạnh.
+
+Mà nên claim:
+
+We reinterpret the dual paths of DPF-GFD as two coupled latent states and introduce a reaction-cross-diffusion mechanism that allows structural and behavioral evidence to regulate each other's propagation.
+
+Tức là novelty nằm ở:
+
+$$ \boxed{ \text{DPF dual paths} + \text{cross-diffusion coupling} } $$
+
+chứ không phải:
+
+$$ \text{reaction-diffusion} $$
+
+đơn thuần.
+
+8. Kiến trúc cuối cùng tôi khuyên dùng
+
+Tôi sẽ làm rất gọn, không thêm 5–6 module.
+
+                 Elliptic
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+ Original Transaction      Similarity KNN
+     Graph Go                 Graph Gs
+          │                   │
+     DPF filter           DPF filter
+          │                   │
+         Ho  ◄──── Cross ────► Hs
+          │      Diffusion     │
+          └──── Reaction ──────┘
+                    │
+             Coupled embedding
+                    │
+               XGBoost
+                    │
+             Fraud probability
+
+Tên tạm thời:
+
+CRCD-DPF — Coupled Reaction-Cross-Diffusion Dual-Path Graph Filtering
+
+hoặc ngắn hơn:
+
+CD-DPF — Cross-Diffusive Dual-Path Graph Filtering
+
+Tôi nghiêng về CRCD-DPF, vì nó thể hiện rõ nguồn gốc principle.
+
+Quan trọng nhất
+
+Với kết quả hiện tại của bạn trên Elliptic:
+
+$$ AP=0.7819 $$ $$ AUC=0.9230 $$ $$ Rec@K=0.7286 $$
+
+DPF đã đứng đầu cả 4 metric trên Elliptic. Vì vậy paper mới không nên đặt mục tiêu kiểu “thêm module để F1 tăng”.
+
+Mục tiêu hợp lý hơn là:
+
+$$ \boxed{\text{giải quyết limitation: independent dual-path propagation}} $$
+
+→ lấy reaction-cross-diffusion từ mathematical biology/physics
+
+→ biến hai DPF paths thành coupled states
+
+→ kiểm chứng xem có tăng AP + Recall@K + AUC trên Elliptic hay không.
+
+Và phải có ablation:
+
+DPF → DPF + Reaction → DPF + Cross-Diffusion → Full CRCD-DPF
+
+Nếu Cross-Diffusion là thành phần tạo phần lớn improvement, contribution sẽ rất dễ kể và thuyết phục hơn kiểu “DPF + attention + temporal module + loss mới”.
+
+
+
+
+
+
+
+
+
+
+
 
 Tôi đã search sâu theo limitation của chính DPF-GFD, rồi đối chiếu với các paper 2026. Kết quả quan trọng là: không nên tiếp tục FGW/Causal OT, hypergraph hay frequency-aware nữa vì các hướng đó đã bị overlap khá rõ.
 
