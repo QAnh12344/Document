@@ -1,3 +1,310 @@
+Đúng, nếu mục tiêu là +3–5%, thì ý tưởng mình vừa đề xuất cần nói rõ hơn: nó sửa điểm yếu nào của ADC-GNN, dựa trên paper nào, và contribution mới nằm ở đâu.
+
+Mình vừa kiểm tra lại ADC-GNN và literature 2025–2026. Có một điểm rất quan trọng: ADC-GNN đã tự nhận rằng nó gặp “representation dilution” khi fraud bị camouflage; diffusion hiện tại chỉ perturb feature space, còn spectral attention xử lý hop/relation.
+
+1. Ý tưởng mới là gì?
+
+Mình đề xuất:
+
+Camouflage-Aware Directional Diffusion (CADD)
+biến diffusion của ADC-GNN từ isotropic feature noise thành node-adaptive, direction-aware diffusion.
+
+ADC-GNN hiện tại về cơ bản:
+
+$$ x_{i,t} = \sqrt{\bar\alpha_t}x_i+ \sqrt{1-\bar\alpha_t}\epsilon_i $$
+
+Tức là cùng một diffusion schedule cho các node, noise được đưa vào feature space mà không biết node nào đang bị camouflage và camouflage nằm ở hướng feature nào. Paper mô tả diffusion chính xác theo kiểu feature-space denoising augmentation này.
+
+Ý tưởng mới:
+
+$$ x_{i,t} = \sqrt{\bar\alpha_t}x_i+ \sqrt{1-\bar\alpha_t} \underbrace{\Sigma_i^{1/2}}_{\text{camouflage-aware}} \epsilon_i $$
+
+Trong đó:
+
+$$ \Sigma_i=f(x_i,\mathcal N_i,G) $$
+
+Nghĩa là mỗi node có một diffusion geometry riêng.
+
+2. Nó khắc phục điểm yếu nào?
+
+Có 3 điểm yếu liên quan với nhau.
+
+Điểm yếu 1 — ADC-GNN không biết node nào đang bị camouflage
+
+ADC-GNN nói rõ spatial message passing có thể làm camouflaged anomalies bị oversmooth/dilute, còn spectral filtering có thể làm mất tín hiệu mid/high-frequency.
+
+Nhưng diffusion của nó vẫn là:
+
+perturb feature → tạo hai view → contrastive consistency.
+
+Nó chưa có cơ chế:
+
+"Node này đang rất giống benign → hãy xử lý nó khác node bình thường."
+
+Điểm yếu 2 — Feature camouflage thực sự là vấn đề trong GFD
+
+Đây không phải failure mode mình tự nghĩ ra.
+
+Paper GNN-LAARA, Expert Systems with Applications 2025 trực tiếp xác định:
+
+feature camouflage + relation camouflage
+
+là hai chiến thuật làm GNN khó phân biệt fraud. Họ dùng CVAE để tạo representation nhằm expose feature camouflage, đồng thời dùng neighbor selector để xử lý relation camouflage.
+
+Paper Grad, WWW 2025 cũng lấy adaptive camouflage làm motivation: fraudsters làm behavioral features gần benign, khiến fraud signal yếu đi. Grad giải quyết bằng relation diffusion, tức tạo thêm quan hệ homophilic để khuếch đại fraud signal.
+
+Điều này rất quan trọng cho novelty:
+
+Grad: sửa topology/relation.
+
+GNN-LAARA: tạo representation + lọc neighbor.
+
+ADC-GNN: feature diffusion + spectral attention.
+
+CADD: hỏi một câu khác:
+
+Nếu camouflage tồn tại theo một số feature directions cụ thể, liệu diffusion có thể chủ động perturb/denoise theo đúng các directions đó thay vì noise đồng đều?
+
+Đây là khoảng trống mình muốn khai thác.
+
+3. "Direction" ở đây nghĩa là gì?
+
+Ví dụ một fraud node:
+
+Feature space
+
+                 fraud thật
+                    ●
+                   /
+                  /
+        benign ● ● ●
+               ↑
+        camouflage direction
+
+Nó có thể có:
+
+feature 1 → giống benign
+feature 2 → giống benign
+feature 3 → khác benign
+feature 4 → rất khác benign
+...
+
+Diffusion thông thường:
+
+feature 1 ── noise giống nhau
+feature 2 ── noise giống nhau
+feature 3 ── noise giống nhau
+feature 4 ── noise giống nhau
+
+CADD muốn:
+
+feature/subspace liên quan camouflage
+             ↓
+      perturbation mạnh / adaptive
+
+feature/subspace ổn định
+             ↓
+      perturbation nhẹ
+
+Tức là diffusion không còn isotropic.
+
+4. Direction được tìm bằng gì?
+
+Đây mới là phần architecture.
+
+Đối với node \(i\):
+
+$$ h_i=W x_i $$
+
+Tạo neighborhood prototype:
+
+$$ p_i=\operatorname{Agg}_{j\in N(i)}h_j $$
+
+Sau đó:
+
+$$ d_i=h_i-p_i $$
+
+\(d_i\) biểu diễn:
+
+node này khác neighborhood ở những feature directions nào.
+
+Nhưng chỉ dùng \(d_i\) thì chưa đủ, vì một benign node cũng có thể khác neighborhood.
+
+Do đó thêm structural context:
+
+$$ s_i= [ d_i,\, \text{degree}_i,\, \text{neighbor similarity}_i,\, \text{local spectral statistics}_i ] $$
+
+Sau đó:
+
+$$ z_i=\operatorname{MLP}(s_i) $$
+
+và:
+
+$$ \Sigma_i = U_i \operatorname{diag}(1+\gamma z_i) U_i^T $$
+
+Đây chính là directional diffusion.
+
+5. Tại sao không đơn giản gọi nó là adaptive diffusion?
+
+Vì như vậy contribution khá yếu.
+
+Điểm mình muốn làm khác là:
+
+Diffusion direction được suy ra từ discrepancy giữa node và neighborhood
+
+chứ không phải:
+
+$$ \beta_i=MLP(x_i) $$
+
+đơn giản.
+
+Ta có:
+
+$$ \boxed{ \text{Node feature} - \text{Neighborhood prototype} = \text{candidate camouflage directions} } $$
+
+Sau đó structural context quyết định direction nào thực sự đáng nghi.
+
+6. Nó khác Grad như thế nào?
+
+Đây là điểm phải cực kỳ cẩn thận.
+
+Grad 2025 đã dùng relation diffusion để tạo auxiliary relations và tăng weak fraud signals.
+
+Nếu mình làm:
+
+"ADC-GNN + diffusion topology"
+
+thì rất dễ bị xem là biến thể của Grad.
+
+Nhưng:
+
+Grad
+$$ G \rightarrow G' $$
+
+Diffusion trên relation/topology.
+
+CADD
+$$ G,X \rightarrow \text{camouflage direction} \rightarrow X' $$
+
+Topology chỉ được dùng để xác định cách diffusion feature space.
+
+Không tạo edge mới.
+
+Không generate relation.
+
+Không dùng relation diffusion.
+
+7. Vì sao không đơn giản dùng spectral filter?
+
+Bởi vì cái này cũng đã rất đông.
+
+Ví dụ F-GNN 2026 đã trực tiếp xử lý heterophily bằng frequency-domain decomposition và node-adaptive spectral gating, nhằm giữ lại high-frequency fraud signals.
+
+Vì vậy nếu paper của mình chỉ là:
+
+ADC-GNN + adaptive high-frequency filter
+
+thì contribution sẽ yếu.
+
+CADD nằm trước spectral GNN:
+
+             ADC-GNN
+                │
+       ┌────────▼────────┐
+       │ Camouflage      │
+       │ Direction       │
+       │ Estimator       │
+       └────────┬────────┘
+                ↓
+       Directional Diffusion
+                ↓
+        Two noisy views
+                ↓
+     Spectral + Relation GNN
+                ↓
+          Contrastive
+                ↓
+           Classifier
+8. Nhưng +3–5% có chắc không?
+
+Không.
+
+Và mình không muốn nói với bạn là "làm cái này chắc +5%" vì không có cơ sở.
+
+Nhưng mình đánh giá hướng này có cơ sở để target 3–5% hơn Hodge-conditioned diffusion vì nó đánh trực tiếp vào failure mode mà ADC-GNN đã nêu: camouflaged fraud → representation dilution.
+
+Quan trọng hơn, có thể thiết kế experiment để chứng minh contribution.
+
+Nếu đúng:
+Model	Camouflaged fraud	Normal fraud
+ADC-GNN	thấp	cao
+CADD	tăng mạnh	tương đương
+
+Khi đó paper có câu chuyện rất rõ:
+
+ADC-GNN improves few-shot fraud detection through diffusion augmentation, but its diffusion is unaware of the direction in which fraudulent representations are camouflaged. We introduce camouflage-aware directional diffusion...
+
+9. Nhưng tôi sẽ thay đổi một điểm so với đề xuất trước
+
+Không dùng Hodge làm trung tâm.
+
+Sau khi kiểm tra literature mới, Hodge/simplicial/frequency/heterophily đều đang khá đông. F-GNN 2026 đã xử lý frequency-adaptive fraud detection, Grad đã xử lý relation diffusion, GNN-LAARA đã xử lý feature/relation camouflage.
+
+Cho nên hướng mình thấy đáng thử nhất hiện tại là:
+
+$$ \boxed{ \textbf{Camouflage-aware directional feature diffusion} } $$
+
+với contribution chính:
+
+Camouflage estimator
+Directional/subspace diffusion
+Camouflage-aware contrastive objective
+Giữ ADC-GNN spectral backbone làm nền.
+10. Paper nền mình sẽ dựa vào
+
+Không phải chỉ một paper:
+
+Base:
+
+Liu et al., Beyond Sparse Supervision: Diffusion-Guided Learning for Few-Shot Graph Fraud Detection, 2026 — ADC-GNN.
+
+Failure mode:
+
+Mengzhe et al., Fraud detection based on GNNs with local augmentation and adaptive relation aggregation, Expert Systems with Applications, 2025 — feature camouflage + relation camouflage.
+
+Independent evidence for camouflage:
+
+Yang et al., Grad: Guided Relation Diffusion Generation for Graph Augmentation in Graph Fraud Detection, WWW 2025 — adaptive camouflage và weak fraud signals.
+
+Để tránh đụng hướng:
+
+Zhao & Chen, Learning frequency-aware graph fraud detection, Neural Networks, 2026 — frequency/high-frequency heterophily.
+
+Điểm mới nằm ở giao nhau:
+$$ \boxed{ \text{Few-shot diffusion} + \text{camouflage} + \text{directional feature geometry} } $$
+
+chứ không phải:
+
+$$ \text{ADC-GNN}+\text{Hodge} $$
+
+Nếu làm theo hướng này, bước quan trọng nhất trước khi code là kiểm tra ADC-GNN thực sự fail ở “camouflage directions” hay không. Nếu error analysis xác nhận điều đó, lúc ấy mới đáng đầu tư architecture để nhắm mức +3–5% AP/AUC, thay vì chỉ thêm một module để hy vọng tăng điểm.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 10. Vậy tôi sẽ dựa vào paper nào để code?
 
 Tôi sẽ dùng 4 paper làm nền, mỗi paper một phần:
