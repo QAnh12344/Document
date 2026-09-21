@@ -1,3 +1,71 @@
+10. Vậy tôi sẽ dựa vào paper nào để code?
+
+Tôi sẽ dùng 4 paper làm nền, mỗi paper một phần:
+
+① ADC-GNN — backbone
+
+Dùng:
+
+diffusion implementation;
+contrastive objective;
+spectral/branch attention;
+training protocol;
+Amazon/YelpChi/T-Finance.
+
+Đây là base chính.
+
+② HLSAD — cách xây higher-order/Hodge representation
+
+Dùng:
+
+simplicial lifting;
+Hodge Laplacian;
+up/down operators;
+spectral structural descriptors.
+
+Không copy anomaly detector của HLSAD.
+
+③ HL-HGAT — mathematical formulation của Hodge filtering
+
+Dùng để kiểm tra cách định nghĩa Hodge operators và polynomial/localized computation, tránh tự chế công thức sai.
+
+④ Grad — đối chứng về topology/relation diffusion
+
+Dùng để đảm bảo contribution của chúng ta không biến thành một bản sao của relation diffusion.
+
+HPGNN cũng phải đưa vào related work/ablation vì nó đã dùng higher-order topology cho heterophily.
+
+Chốt lại
+
+Base:
+
+$$ \boxed{\text{ADC-GNN}} $$
+
+Hạn chế nhắm tới:
+
+$$ \boxed{\text{feature diffusion chưa được điều kiện hóa bởi cấu trúc của node}} $$
+
+Failure case:
+
+$$ \boxed{\text{fraud feature camouflage nhưng structural/higher-order inconsistency}} $$
+
+Cải tiến:
+
+$$ \boxed{ \text{Hodge/higher-order topology} \rightarrow \text{adaptive diffusion} } $$
+
+và phiên bản mạnh:
+
+$$ \boxed{ \text{Hodge topology} \rightarrow \text{anisotropic noise covariance} \rightarrow \text{diffusion views} } $$
+
+Paper nền để code: ADC-GNN + HLSAD + HL-HGAT, đồng thời kiểm tra Grad/HPGNN để tránh overlap.
+
+
+
+
+
+
+
+
 Đúng với mục tiêu của bạn — build trên DPF-GFD và đặc biệt là Elliptic — thì ý tưởng tôi đang đề xuất là:
 
 Coupled Reaction–Cross-Diffusion DPF
