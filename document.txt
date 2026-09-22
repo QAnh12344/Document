@@ -1,3 +1,2555 @@
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+# ============================================================
+# Beta schedule
+# ============================================================
+
+def make_beta_schedule(
+    schedule,
+    n_timestep,
+    linear_start=1e-4,
+    linear_end=2e-2,
+    cosine_s=8e-3
+):
+    if schedule == "quad":
+        betas = (
+            torch.linspace(
+                linear_start ** 0.5,
+                linear_end ** 0.5,
+                n_timestep,
+                dtype=torch.float64
+            ) ** 2
+        )
+
+    elif schedule == "linear":
+        betas = torch.linspace(
+            linear_start,
+            linear_end,
+            n_timestep,
+            dtype=torch.float64
+        )
+
+    elif schedule == "cosine":
+        timesteps = (
+            torch.arange(n_timestep + 1, dtype=torch.float64)
+            / n_timestep
+            + cosine_s
+        )
+
+        alphas = (
+            timesteps
+            / (1 + cosine_s)
+            * math.pi
+            / 2
+        )
+
+        alphas = torch.cos(alphas).pow(2)
+        alphas = alphas / alphas[0]
+
+        betas = 1 - alphas[1:] / alphas[:-1]
+        betas = betas.clamp(max=0.999)
+
+    else:
+        raise ValueError(
+            f"Unknown beta schedule: {schedule}"
+        )
+
+    return betas
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def extract(input, t, shape):
+    """
+    Extract values from a timestep-dependent vector.
+
+    input: [T]
+    t:     [N]
+    output: [N, 1, ..., 1]
+    """
+    out = torch.gather(input, 0, t)
+
+    reshape = [shape[0]] + [1] * (len(shape) - 1)
+
+    out = out.reshape(*reshape)
+
+    return out
+
+
+def noise_like(
+    shape,
+    noise_fn,
+    device,
+    repeat=False
+):
+    if repeat:
+        resid = [1] * (len(shape) - 1)
+
+        shape_one = (1, *shape[1:])
+
+        return noise_fn(
+            *shape_one,
+            device=device
+        ).repeat(
+            shape[0],
+            *resid
+        )
+
+    return noise_fn(
+        *shape,
+        device=device
+    )
+
+
+# ============================================================
+# Sampled InfoNCE
+# ============================================================
+
+def info_nce_loss(
+    feat1,
+    feat2,
+    temperature=0.1
+):
+    """
+    Memory-safe InfoNCE.
+
+    IMPORTANT:
+    Original implementation creates an N x N matrix.
+
+    That is impossible for large graphs such as Amazon.
+
+    This function should therefore only receive a sampled
+    subset of nodes.
+    """
+
+    if feat1.size(0) == 0:
+        return feat1.new_tensor(0.0)
+
+    feat1 = F.normalize(
+        feat1,
+        dim=1
+    )
+
+    feat2 = F.normalize(
+        feat2,
+        dim=1
+    )
+
+    logits = torch.matmul(
+        feat1,
+        feat2.T
+    ) / temperature
+
+    labels = torch.arange(
+        feat1.size(0),
+        device=feat1.device
+    )
+
+    loss = F.cross_entropy(
+        logits,
+        labels
+    )
+
+    return loss
+
+
+# ============================================================
+# Failure-conditioned noise controller
+# ============================================================
+
+class FailureConditionedNoise(nn.Module):
+    """
+    Predict node-adaptive diffusion noise scale.
+
+    sigma_i = Softplus(MLP(F_i))
+
+    F_i contains:
+        gate_hidden
+        gate_dilute
+        C_hide
+        C_dilute
+        high_energy
+        discrepancy
+        structural_features
+
+    Dimension:
+        h_feats + 6
+
+    Output:
+        sigma_i: [N, 1]
+    """
+
+    def __init__(
+        self,
+        failure_dim,
+        hidden_dim=64,
+        min_sigma=0.1,
+        max_sigma=3.0
+    ):
+        super().__init__()
+
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                failure_dim,
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim,
+                1
+            )
+        )
+
+        # Start near sigma ~= 1
+        #
+        # softplus(0) ~= 0.693
+        #
+        # The normalization in forward() will further
+        # stabilize the initial scale.
+        nn.init.zeros_(
+            self.mlp[-1].weight
+        )
+
+        nn.init.zeros_(
+            self.mlp[-1].bias
+        )
+
+    def forward(self, failure_condition):
+        """
+        failure_condition: [N, failure_dim]
+
+        return:
+            sigma: [N, 1]
+        """
+
+        raw_sigma = self.mlp(
+            failure_condition
+        )
+
+        sigma = F.softplus(
+            raw_sigma
+        ) + 1e-4
+
+        # Normalize around mean ~= 1.
+        #
+        # detach() prevents the normalization statistic
+        # itself from becoming an optimization path.
+        mean_sigma = sigma.mean().detach().clamp_min(
+            1e-4
+        )
+
+        sigma = sigma / mean_sigma
+
+        sigma = sigma.clamp(
+            min=self.min_sigma,
+            max=self.max_sigma
+        )
+
+        return sigma
+
+
+# ============================================================
+# Gaussian Diffusion
+# ============================================================
+
+class GaussianDiffusion(nn.Module):
+
+    def __init__(
+        self,
+        betas,
+        failure_dim=None,
+        failure_noise_hidden=64,
+        min_sigma=0.1,
+        max_sigma=3.0
+    ):
+        super().__init__()
+
+        betas = betas.type(torch.float64)
+
+        timesteps = betas.shape[0]
+
+        self.num_timesteps = int(
+            timesteps
+        )
+
+        # ----------------------------------------------------
+        # Diffusion coefficients
+        # ----------------------------------------------------
+
+        alphas = 1 - betas
+
+        alphas_cumprod = torch.cumprod(
+            alphas,
+            0
+        )
+
+        alphas_cumprod_prev = torch.cat(
+            (
+                torch.tensor(
+                    [1],
+                    dtype=torch.float64
+                ),
+                alphas_cumprod[:-1]
+            ),
+            0
+        )
+
+        posterior_variance = (
+            betas
+            * (1 - alphas_cumprod_prev)
+            / (1 - alphas_cumprod)
+        )
+
+        self.register(
+            "betas",
+            betas
+        )
+
+        self.register(
+            "alphas_cumprod",
+            alphas_cumprod
+        )
+
+        self.register(
+            "alphas_cumprod_prev",
+            alphas_cumprod_prev
+        )
+
+        self.register(
+            "sqrt_alphas_cumprod",
+            torch.sqrt(
+                alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "log_one_minus_alphas_cumprod",
+            torch.log(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recip_alphas_cumprod",
+            torch.rsqrt(
+                alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recipm1_alphas_cumprod",
+            torch.sqrt(
+                1 / alphas_cumprod - 1
+            )
+        )
+
+        self.register(
+            "posterior_variance",
+            posterior_variance
+        )
+
+        self.register(
+            "posterior_log_variance_clipped",
+            torch.log(
+                posterior_variance.clamp(
+                    min=1e-20
+                )
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef1",
+            (
+                betas
+                * torch.sqrt(
+                    alphas_cumprod_prev
+                )
+                / (1 - alphas_cumprod)
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef2",
+            (
+                (1 - alphas_cumprod_prev)
+                * torch.sqrt(alphas)
+                / (1 - alphas_cumprod)
+            )
+        )
+
+        # ----------------------------------------------------
+        # Failure-conditioned noise controller
+        # ----------------------------------------------------
+
+        self.failure_noise = None
+
+        if failure_dim is not None:
+
+            self.failure_noise = FailureConditionedNoise(
+                failure_dim=failure_dim,
+                hidden_dim=failure_noise_hidden,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma
+            )
+
+    # ========================================================
+    # Register buffer
+    # ========================================================
+
+    def register(self, name, tensor):
+
+        self.register_buffer(
+            name,
+            tensor.type(torch.float32)
+        )
+
+    # ========================================================
+    # Standard q(x_t | x_0)
+    # ========================================================
+
+    def q_sample(
+        self,
+        x_
+
+
+
+
+
+
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+# ============================================================
+# Beta schedule
+# ============================================================
+
+def make_beta_schedule(
+    schedule,
+    n_timestep,
+    linear_start=1e-4,
+    linear_end=2e-2,
+    cosine_s=8e-3
+):
+    if schedule == "quad":
+        betas = (
+            torch.linspace(
+                linear_start ** 0.5,
+                linear_end ** 0.5,
+                n_timestep,
+                dtype=torch.float64
+            ) ** 2
+        )
+
+    elif schedule == "linear":
+        betas = torch.linspace(
+            linear_start,
+            linear_end,
+            n_timestep,
+            dtype=torch.float64
+        )
+
+    elif schedule == "cosine":
+        timesteps = (
+            torch.arange(n_timestep + 1, dtype=torch.float64)
+            / n_timestep
+            + cosine_s
+        )
+
+        alphas = (
+            timesteps
+            / (1 + cosine_s)
+            * math.pi
+            / 2
+        )
+
+        alphas = torch.cos(alphas).pow(2)
+        alphas = alphas / alphas[0]
+
+        betas = 1 - alphas[1:] / alphas[:-1]
+        betas = betas.clamp(max=0.999)
+
+    else:
+        raise ValueError(
+            f"Unknown beta schedule: {schedule}"
+        )
+
+    return betas
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def extract(input, t, shape):
+    """
+    Extract timestep-dependent values and reshape them
+    for broadcasting to x.
+    """
+    out = torch.gather(input, 0, t)
+
+    reshape = [shape[0]] + [1] * (len(shape) - 1)
+
+    out = out.reshape(*reshape)
+
+    return out
+
+
+def noise_like(
+    shape,
+    noise_fn,
+    device,
+    repeat=False
+):
+    if repeat:
+        resid = [1] * (len(shape) - 1)
+        shape_one = (1, *shape[1:])
+
+        return noise_fn(
+            *shape_one,
+            device=device
+        ).repeat(
+            shape[0],
+            *resid
+        )
+
+    else:
+        return noise_fn(
+            *shape,
+            device=device
+        )
+
+
+# ============================================================
+# Sampled contrastive loss
+# ============================================================
+
+def info_nce_loss(
+    feat1,
+    feat2,
+    temperature=0.1
+):
+    """
+    Memory-safe InfoNCE.
+
+    IMPORTANT:
+    Do NOT call this on the entire Amazon graph.
+
+    Complexity:
+        O(B^2)
+
+    where B is the sampled contrastive batch.
+    """
+
+    feat1 = F.normalize(
+        feat1,
+        dim=1
+    )
+
+    feat2 = F.normalize(
+        feat2,
+        dim=1
+    )
+
+    logits = torch.matmul(
+        feat1,
+        feat2.T
+    ) / temperature
+
+    labels = torch.arange(
+        feat1.size(0),
+        device=feat1.device
+    )
+
+    loss = F.cross_entropy(
+        logits,
+        labels
+    )
+
+    return loss
+
+
+# ============================================================
+# Failure-conditioned noise controller
+# ============================================================
+
+class FailureConditionedNoise(nn.Module):
+    """
+    Predict node-adaptive diffusion noise scale:
+
+        sigma_i = Softplus(MLP(F_i))
+
+    F_i contains failure characterization information:
+
+        [gate,
+         C_hide,
+         C_dilute,
+         high_energy,
+         discrepancy,
+         z_struct]
+
+    Dimension:
+
+        failure_dim = h_feats + 6
+    """
+
+    def __init__(
+        self,
+        failure_dim,
+        hidden_dim=64,
+        min_sigma=0.10,
+        max_sigma=3.00
+    ):
+        super().__init__()
+
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                failure_dim,
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim,
+                1
+            )
+        )
+
+    def forward(self, failure_condition):
+        """
+        Args:
+            failure_condition:
+                [N, failure_dim]
+
+        Returns:
+            sigma:
+                [N, 1]
+        """
+
+        raw_sigma = self.mlp(
+            failure_condition
+        )
+
+        sigma = F.softplus(
+            raw_sigma
+        ) + 1e-4
+
+        # Normalize around 1 so the controller learns
+        # relative noise strength rather than simply
+        # increasing the global diffusion magnitude.
+        mean_sigma = sigma.mean().detach()
+
+        sigma = sigma / mean_sigma.clamp_min(1e-4)
+
+        sigma = sigma.clamp(
+            min=self.min_sigma,
+            max=self.max_sigma
+        )
+
+        return sigma
+
+
+# ============================================================
+# Gaussian Diffusion
+# ============================================================
+
+class GaussianDiffusion(nn.Module):
+
+    def __init__(
+        self,
+        betas,
+        failure_dim=None,
+        failure_noise_hidden=64
+    ):
+        super().__init__()
+
+        betas = betas.type(torch.float64)
+
+        timesteps = betas.shape[0]
+
+        self.num_timesteps = int(timesteps)
+
+        # ----------------------------------------------------
+        # Standard diffusion quantities
+        # ----------------------------------------------------
+
+        alphas = 1 - betas
+
+        alphas_cumprod = torch.cumprod(
+            alphas,
+            0
+        )
+
+        alphas_cumprod_prev = torch.cat(
+            (
+                torch.tensor(
+                    [1],
+                    dtype=torch.float64
+                ),
+
+                alphas_cumprod[:-1]
+            ),
+            0
+        )
+
+        posterior_variance = (
+            betas
+            * (1 - alphas_cumprod_prev)
+            / (1 - alphas_cumprod)
+        )
+
+        self.register(
+            "betas",
+            betas
+        )
+
+        self.register(
+            "alphas_cumprod",
+            alphas_cumprod
+        )
+
+        self.register(
+            "alphas_cumprod_prev",
+            alphas_cumprod_prev
+        )
+
+        self.register(
+            "sqrt_alphas_cumprod",
+            torch.sqrt(alphas_cumprod)
+        )
+
+        self.register(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "log_one_minus_alphas_cumprod",
+            torch.log(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recip_alphas_cumprod",
+            torch.rsqrt(
+                alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recipm1_alphas_cumprod",
+            torch.sqrt(
+                1 / alphas_cumprod - 1
+            )
+        )
+
+        self.register(
+            "posterior_variance",
+            posterior_variance
+        )
+
+        self.register(
+            "posterior_log_variance_clipped",
+            torch.log(
+                posterior_variance.clamp(
+                    min=1e-20
+                )
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef1",
+            (
+                betas
+                * torch.sqrt(
+                    alphas_cumprod_prev
+                )
+                / (1 - alphas_cumprod)
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef2",
+            (
+                (1 - alphas_cumprod_prev)
+                * torch.sqrt(alphas)
+                / (1 - alphas_cumprod)
+            )
+        )
+
+        # ----------------------------------------------------
+        # Failure-conditioned noise controller
+        # ----------------------------------------------------
+
+        self.failure_noise = None
+
+        if failure_dim is not None:
+
+            self.failure_noise = FailureConditionedNoise(
+                failure_dim=failure_dim,
+                hidden_dim=failure_noise_hidden
+            )
+
+
+    # ========================================================
+    # Register buffer
+    # ========================================================
+
+    def register(self, name, tensor):
+
+        self.register_buffer(
+            name,
+            tensor.type(torch.float32)
+        )
+
+
+    # ========================================================
+    # Standard q(x_t | x_0)
+    # ========================================================
+
+    def q_sample(
+        self,
+        x_0,
+        t,
+        noise=None
+    ):
+
+        if noise is None:
+            noise = torch.randn_like(
+                x_0
+            )
+
+        return (
+            extract(
+                self.sqrt_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * x_0
+
+            +
+
+            extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * noise
+        )
+
+
+    # ========================================================
+    # Failure-conditioned q(x_t | x_0, F_i)
+    # ========================================================
+
+    def q_sample_failure_conditioned(
+        self,
+        x_0,
+        t,
+        failure_condition
+    ):
+        """
+        Failure-conditioned forward diffusion:
+
+        x_i,t =
+            sqrt(alpha_bar_t) x_i
+            +
+            sqrt(1-alpha_bar_t) sigma_i epsilon_i
+
+        where
+
+            sigma_i = FailureNoise(F_i)
+        """
+
+        if self.failure_noise is None:
+            raise RuntimeError(
+                "failure_noise is not initialized. "
+                "Create GaussianDiffusion with failure_dim."
+            )
+
+        # ----------------------------------------------------
+        # Node-adaptive noise scale
+        # ----------------------------------------------------
+
+        sigma = self.failure_noise(
+            failure_condition
+        )
+
+        # sigma:
+        # [N, 1]
+
+        # ----------------------------------------------------
+        # Random Gaussian noise
+        # ----------------------------------------------------
+
+        epsilon = torch.randn_like(
+            x_0
+        )
+
+        # ----------------------------------------------------
+        # Actual injected noise
+        # ----------------------------------------------------
+
+        adaptive_noise = (
+            sigma * epsilon
+        )
+
+        # ----------------------------------------------------
+        # Forward diffusion
+        # ----------------------------------------------------
+
+        x_t = (
+            extract(
+                self.sqrt_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * x_0
+
+            +
+
+            extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * adaptive_noise
+        )
+
+        return (
+            x_t,
+            adaptive_noise,
+            sigma
+        )
+
+
+    # ========================================================
+    # Failure-conditioned diffusion loss
+    # ========================================================
+
+    def p_loss_failure_conditioned(
+        self,
+        model,
+        x_0,
+        t,
+        failure_condition,
+        lambda_contrast=0.0,
+        temperature=0.1,
+        max_contrastive_samples=1024
+    ):
+        """
+        Train the denoiser with failure-conditioned noise.
+
+        The target is the ACTUAL noise injected:
+
+            sigma_i * epsilon_i
+
+        rather than epsilon_i alone.
+        """
+
+        # ----------------------------------------------------
+        # First noisy view
+        # ----------------------------------------------------
+
+        x_noisy1, noise_target1, sigma = (
+            self.q_sample_failure_conditioned(
+                x_0=x_0,
+                t=t,
+                failure_condition=failure_condition
+            )
+        )
+
+        # ----------------------------------------------------
+        # Denoising prediction
+        # ----------------------------------------------------
+
+        noise_pred1, feat1 = model(
+            x_noisy1,
+            t
+        )
+
+        mse_loss = F.mse_loss(
+            noise_pred1,
+            noise_target1
+        )
+
+        # ----------------------------------------------------
+        # Contrastive loss
+        # ----------------------------------------------------
+
+        contrast_loss = torch.zeros(
+            (),
+            device=x_0.device,
+            dtype=x_0.dtype
+        )
+
+        if (
+            lambda_contrast > 0.0
+            and max_contrastive_samples > 0
+        ):
+
+            # Second independent noisy view
+            x_noisy2, _, _ = (
+                self.q_sample_failure_conditioned(
+                    x_0=x_0,
+                    t=t,
+                    failure_condition=failure_condition
+                )
+            )
+
+            _, feat2 = model(
+                x_noisy2,
+                t
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Never compute N x N InfoNCE on the full graph.
+            # ------------------------------------------------
+
+            num_nodes = feat1.size(0)
+
+            sample_size = min(
+                max_contrastive_samples,
+                num_nodes
+            )
+
+            if sample_size < num_nodes:
+
+                idx = torch.randperm(
+                    num_nodes,
+                    device=x_0.device
+                )[:sample_size]
+
+                feat1_sample = feat1[
+                    idx
+                ]
+
+                feat2_sample = feat2[
+                    idx
+                ]
+
+            else:
+
+                feat1_sample = feat1
+                feat2_sample = feat2
+
+            contrast_loss = info_nce_loss(
+                feat1_sample,
+                feat2_sample,
+                temperature=temperature
+            )
+
+        # ----------------------------------------------------
+        # Final diffusion objective
+        # ----------------------------------------------------
+
+        total_loss = (
+            mse_loss
+            +
+            lambda_contrast
+            * contrast_loss
+        )
+
+        return total_loss
+
+
+    # ========================================================
+    # Original contrastive diffusion loss
+    # ========================================================
+
+    def p_loss_contrastive(
+        self,
+        model,
+        x_0,
+        t,
+        temperature=0.1,
+        lambda_contrast=1.0,
+        noise=None
+    ):
+
+        if noise is None:
+            noise = torch.randn_like(
+                x_0
+            )
+
+        noise1 = noise
+
+        noise2 = torch.randn_like(
+            x_0
+        )
+
+        x_noisy1 = self.q_sample(
+            x_0,
+            t,
+            noise1
+        )
+
+        x_noisy2 = self.q_sample(
+            x_0,
+            t,
+            noise2
+        )
+
+        noise_pred1, feat1 = model(
+            x_noisy1,
+            t
+        )
+
+        noise_pred2, feat2 = model(
+            x_noisy2,
+            t
+        )
+
+        mse_loss = F.mse_loss(
+            noise_pred1,
+            noise1
+        )
+
+        # ----------------------------------------------------
+        # Memory-safe sampled contrastive loss
+        # ----------------------------------------------------
+
+        sample_size = min(
+            1024,
+            feat1.size(0)
+        )
+
+        if sample_size < feat1.size(0):
+
+            idx = torch.randperm(
+                feat1.size(0),
+                device=feat1.device
+            )[:sample_size]
+
+            feat1 = feat1[
+                idx
+            ]
+
+            feat2 = feat2[
+                idx
+            ]
+
+        contrast_loss = info_nce_loss(
+            feat1,
+            feat2,
+            temperature
+        )
+
+        return (
+            mse_loss
+            +
+            lambda_contrast
+            * contrast_loss
+        )
+
+
+    # ========================================================
+    # x_0 prediction from predicted noise
+    # ========================================================
+
+    def predict_start_from_noise(
+        self,
+        x_t,
+        t,
+        noise
+    ):
+
+        return (
+            extract(
+                self.sqrt_recip_alphas_cumprod,
+                t,
+                x_t.shape
+            )
+            * x_t
+
+            -
+
+            extract(
+                self.sqrt_recipm1_alphas_cumprod,
+                t,
+                x_t.shape
+            )
+            * noise
+        )
+
+
+    # ========================================================
+    # Posterior
+    # ========================================================
+
+    def q_posterior(
+        self,
+        x_0,
+        x_t,
+        t
+    ):
+
+        mean = (
+            extract(
+                self.posterior_mean_coef1,
+                t,
+                x_t.shape
+            )
+            * x_0
+
+            +
+
+            extract(
+                self.posterior_mean_coef2,
+                t,
+                x_t.shape
+            )
+            * x_t
+        )
+
+        var = extract(
+            self.posterior_variance,
+            t,
+            x_t.shape
+        )
+
+        log_var_clipped = extract(
+            self.posterior_log_variance_clipped,
+            t,
+            x_t.shape
+        )
+
+        return (
+            mean,
+            var,
+            log_var_clipped
+        )
+
+
+    # ========================================================
+    # Reverse diffusion
+    # ========================================================
+
+    def p_mean_variance(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised
+    ):
+
+        model_output = model(
+            x,
+            t
+        )
+
+        noise_pred = model_output[0]
+
+        x_recon = (
+            self.predict_start_from_noise(
+                x,
+                t,
+                noise_pred
+            )
+        )
+
+        if clip_denoised:
+
+            x_recon = x_recon.clamp(
+                min=-1,
+                max=1
+            )
+
+        mean, var, log_var = (
+            self.q_posterior(
+                x_recon,
+                x,
+                t
+            )
+        )
+
+        return (
+            mean,
+            var,
+            log_var
+        )
+
+
+    # ========================================================
+    # Reverse diffusion sample
+    # ========================================================
+
+    def p_sample(
+        self,
+        model,
+        x,
+        t,
+        noise_fn,
+        clip_denoised=True,
+        repeat_noise=False
+    ):
+
+        mean, _, log_var = (
+            self.p_mean_variance(
+                model,
+                x,
+                t,
+                clip_denoised
+            )
+        )
+
+        noise = noise_like(
+            x.shape,
+            noise_fn,
+            x.device,
+            repeat_noise
+        )
+
+        shape = [
+            x.shape[0]
+        ] + [
+            1
+        ] * (
+            x.ndim - 1
+        )
+
+        nonzero_mask = (
+            1
+            -
+            (
+                t == 0
+            ).type(torch.float32)
+        ).view(
+            *shape
+        )
+
+        return (
+            mean
+            +
+            nonzero_mask
+            * torch.exp(
+                0.5 * log_var
+            )
+            * noise
+        )
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ADCGNN import PolyConv, PolyConvBatch, calculate_theta2
+
+
+# ============================================================
+# Structural Encoder
+# ============================================================
+
+class StructuralEncoder(nn.Module):
+
+    def __init__(
+        self,
+        struct_dim,
+        hidden_dim,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(
+                struct_dim,
+                hidden_dim
+            ),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.ReLU()
+        )
+
+    def forward(self, struct_feat):
+
+        z = self.encoder(
+            struct_feat
+        )
+
+        return z
+
+
+# ============================================================
+# Orthogonal Signal Preservation
+# ============================================================
+
+class OrthogonalSignalPreservation(nn.Module):
+
+    def __init__(
+        self,
+        eps=1e-8
+    ):
+        super().__init__()
+
+        self.eps = eps
+
+    def forward(
+        self,
+        h_self,
+        h_graph
+    ):
+
+        # ----------------------------------------------------
+        # Projection of self representation onto graph signal
+        # ----------------------------------------------------
+
+        numerator = (
+            h_self * h_graph
+        ).sum(
+            dim=-1,
+            keepdim=True
+        )
+
+        denominator = (
+            h_graph.pow(2)
+            .sum(
+                dim=-1,
+                keepdim=True
+            )
+            + self.eps
+        )
+
+        projection = (
+            numerator /
+            denominator
+        ) * h_graph
+
+        # ----------------------------------------------------
+        # Orthogonal component
+        # ----------------------------------------------------
+
+        h_perp = (
+            h_self -
+            projection
+        )
+
+        # ----------------------------------------------------
+        # Learnable preservation strength
+        # ----------------------------------------------------
+
+        return h_perp
+
+
+# ============================================================
+# Failure Characterizer
+# ============================================================
+
+class FailureCharacterizer(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim,
+        struct_dim,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        # Inputs:
+        #
+        # C_hide evidence
+        # C_dilute evidence
+        # high-order response
+        # discrepancy
+        # preserve norm
+        # structural embedding
+        #
+        # = 5 scalar values + hidden structural embedding
+
+        input_dim = (
+            hidden_dim + 5
+        )
+
+        self.encoder = nn.Sequential(
+
+            nn.Linear(
+                input_dim,
+                hidden_dim
+            ),
+
+            nn.LayerNorm(
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+
+            nn.ReLU()
+        )
+
+        self.hide_head = nn.Sequential(
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim // 2
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim // 2,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+        self.dilute_head = nn.Sequential(
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim // 2
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dim // 2,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        h_self,
+        h_graph,
+        h_preserve,
+        z_struct,
+        high_energy
+    ):
+
+        # ----------------------------------------------------
+        # Representation discrepancy
+        # ----------------------------------------------------
+
+        discrepancy = torch.norm(
+            h_self - h_graph,
+            p=2,
+            dim=1,
+            keepdim=True
+        )
+
+        # ----------------------------------------------------
+        # Preserved signal magnitude
+        # ----------------------------------------------------
+
+        preserve_norm = torch.norm(
+            h_preserve,
+            p=2,
+            dim=1,
+            keepdim=True
+        )
+
+        # ----------------------------------------------------
+        # Normalize scalar quantities
+        # ----------------------------------------------------
+
+        discrepancy = torch.log1p(
+            discrepancy
+        )
+
+        preserve_norm = torch.log1p(
+            preserve_norm
+        )
+
+        high_energy = torch.log1p(
+            high_energy
+        )
+
+        # ----------------------------------------------------
+        # Characterization input
+        # ----------------------------------------------------
+
+        char_input = torch.cat(
+            [
+                discrepancy,
+                preserve_norm,
+                high_energy,
+                torch.abs(
+                    discrepancy -
+                    preserve_norm
+                ),
+                torch.ones_like(
+                    discrepancy
+                ),
+                z_struct
+            ],
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # Shared characterization
+        # ----------------------------------------------------
+
+        z_failure = self.encoder(
+            char_input
+        )
+
+        C_hide = self.hide_head(
+            z_failure
+        )
+
+        C_dilute = self.dilute_head(
+            z_failure
+        )
+
+        return (
+            z_failure,
+            C_hide,
+            C_dilute,
+            discrepancy
+        )
+
+
+# ============================================================
+# Structural Role Recovery
+# ============================================================
+
+class StructuralRoleRecovery(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.recovery = nn.Sequential(
+
+            nn.Linear(
+                hidden_dim * 2,
+                hidden_dim
+            ),
+
+            nn.LayerNorm(
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            )
+        )
+
+    def forward(
+        self,
+        h_preserve,
+        z_struct
+    ):
+
+        x = torch.cat(
+            [
+                h_preserve,
+                z_struct
+            ],
+            dim=1
+        )
+
+        return self.recovery(
+            x
+        )
+
+
+# ============================================================
+# Failure-conditioned Gate
+# ============================================================
+
+class FailureConditionedGate(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        # h_struct
+        # h_preserve
+        # C_hide
+        # C_dilute
+        # high_energy
+        # discrepancy
+
+        input_dim = (
+            2 * hidden_dim + 4
+        )
+
+        self.gate = nn.Sequential(
+
+            nn.Linear(
+                input_dim,
+                hidden_dim
+            ),
+
+            nn.LayerNorm(
+                hidden_dim
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                hidden_dim,
+                2
+            ),
+
+            nn.Softmax(
+                dim=1
+            )
+        )
+
+    def forward(
+        self,
+        h_struct,
+        h_preserve,
+        C_hide,
+        C_dilute,
+        high_energy,
+        discrepancy
+    ):
+
+        x = torch.cat(
+            [
+                h_struct,
+                h_preserve,
+                C_hide,
+                C_dilute,
+                high_energy,
+                discrepancy
+            ],
+            dim=1
+        )
+
+        gate = self.gate(
+            x
+        )
+
+        return gate
+
+
+# ============================================================
+# FCR-GNN Amazon
+# ============================================================
+
+class FCRGNN_amazon(nn.Module):
+
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        d=2,
+        batch=False,
+        dropout=0.2,
+        struct_dim=4
+    ):
+
+        super().__init__()
+
+        self.g = graph
+        self.d = d
+        self.h_feats = h_feats
+        self.struct_dim = struct_dim
+
+        # ====================================================
+        # ADC-GNN encoder
+        # ====================================================
+
+        self.thetas = calculate_theta2(
+            d=d
+        )
+
+        self.num_branches = len(
+            self.thetas
+        )
+
+        self.conv = nn.ModuleList()
+
+        for theta in self.thetas:
+
+            if not batch:
+
+                self.conv.append(
+                    PolyConv(
+                        h_feats,
+                        h_feats,
+                        theta,
+                        lin=False
+                    )
+                )
+
+            else:
+
+                self.conv.append(
+                    PolyConvBatch(
+                        h_feats,
+                        h_feats,
+                        theta,
+                        lin=False
+                    )
+                )
+
+        # ====================================================
+        # Input projection
+        # ====================================================
+
+        self.linear = nn.Linear(
+            in_feats,
+            h_feats
+        )
+
+        self.linear2 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.act = nn.ReLU()
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+        # ====================================================
+        # ADC branch attention
+        # ====================================================
+
+        self.attention_fc = nn.Linear(
+            h_feats,
+            1
+        )
+
+        self.fusion_mlp = nn.Sequential(
+
+            nn.Linear(
+                2 * h_feats,
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                h_feats,
+                1
+            ),
+
+            nn.Sigmoid()
+        )
+
+        # ====================================================
+        # Original ADC layers
+        # ====================================================
+
+        self.linear3 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.linear4 = nn.Linear(
+            h_feats,
+            num_classes
+        )
+
+        self.residual_fc = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        # ====================================================
+        # FCR modules
+        # ====================================================
+
+        self.struct_encoder = (
+            StructuralEncoder(
+                struct_dim=struct_dim,
+                hidden_dim=h_feats,
+                dropout=dropout
+            )
+        )
+
+        self.osp = (
+            OrthogonalSignalPreservation()
+        )
+
+        self.failure_characterizer = (
+            FailureCharacterizer(
+                hidden_dim=h_feats,
+                struct_dim=struct_dim,
+                dropout=dropout
+            )
+        )
+
+        self.struct_recovery = (
+            StructuralRoleRecovery(
+                hidden_dim=h_feats,
+                dropout=dropout
+            )
+        )
+
+        self.failure_gate = (
+            FailureConditionedGate(
+                hidden_dim=h_feats,
+                dropout=dropout
+            )
+        )
+
+        # ----------------------------------------------------
+        # Final recovery projection
+        # ----------------------------------------------------
+
+        self.recovery_fusion = nn.Sequential(
+
+            nn.Linear(
+                3 * h_feats,
+                h_feats
+            ),
+
+            nn.LayerNorm(
+                h_feats
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                dropout
+            ),
+
+            nn.Linear(
+                h_feats,
+                h_feats
+            )
+        )
+
+    # ========================================================
+    # ADC encoder
+    # ========================================================
+
+    def encode_adc(
+        self,
+        in_feat
+    ):
+
+        device = in_feat.device
+
+        # ----------------------------------------------------
+        # Self representation
+        # ----------------------------------------------------
+
+        h_pre = self.linear(
+            in_feat
+        )
+
+        h_pre = self.act(
+            h_pre
+        )
+
+        h_pre = self.linear2(
+            h_pre
+        )
+
+        h_pre = self.act(
+            h_pre
+        )
+
+        h_pre = self.dropout(
+            h_pre
+        )
+
+        h_self = h_pre
+
+        # ----------------------------------------------------
+        # ADC residual
+        # ----------------------------------------------------
+
+        res = self.residual_fc(
+            h_pre
+        )
+
+        # ----------------------------------------------------
+        # Polynomial branches
+        # ----------------------------------------------------
+
+        branch_outputs = []
+
+        for conv in self.conv:
+
+            h0 = conv(
+                self.g,
+                h_pre
+            )
+
+            h0 = h0.to(
+                device
+            )
+
+            branch_outputs.append(
+                h0
+            )
+
+        h_stack = torch.stack(
+            branch_outputs,
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # Attention
+        # ----------------------------------------------------
+
+        N, B, F_dim = (
+            h_stack.shape
+        )
+
+        h_flat = h_stack.reshape(
+            -1,
+            F_dim
+        )
+
+        attn_scores = (
+            self.attention_fc(
+                h_flat
+            )
+        )
+
+        attn_scores = (
+            attn_scores.reshape(
+                N,
+                B
+            )
+        )
+
+        attn_weights = F.softmax(
+            attn_scores,
+            dim=1
+        )
+
+        attn_weights = (
+            attn_weights.unsqueeze(-1)
+        )
+
+        attn_fused = torch.sum(
+            h_stack *
+            attn_weights,
+            dim=1
+        )
+
+        mean_fused = torch.mean(
+            h_stack,
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # ADC fusion
+        # ----------------------------------------------------
+
+        fusion_input = torch.cat(
+            [
+                attn_fused,
+                mean_fused
+            ],
+            dim=-1
+        )
+
+        fusion_weight = (
+            self.fusion_mlp(
+                fusion_input
+            )
+        )
+
+        h_graph = (
+            0.1 *
+            fusion_weight *
+            attn_fused
+            +
+            (
+                1.0 -
+                fusion_weight
+            ) *
+            mean_fused
+        )
+
+        # ----------------------------------------------------
+        # Original ADC residual
+        # ----------------------------------------------------
+
+        h_adc = (
+            h_graph +
+            0.8 * res
+        )
+
+        h_adc = self.linear3(
+            h_adc
+        )
+
+        h_adc = self.act(
+            h_adc
+        )
+
+        h_adc = self.dropout(
+            h_adc
+        )
+
+        return (
+            h_self,
+            h_stack,
+            h_graph,
+            h_adc,
+            attn_weights
+        )
+
+    # ========================================================
+    # High-order polynomial response
+    # ========================================================
+
+    def compute_high_frequency_energy(
+        self,
+        h_stack,
+        h_self
+    ):
+
+        # ----------------------------------------------------
+        # Highest polynomial-order response
+        #
+        # This is a high-order spectral response proxy.
+        # It is NOT an exact graph Fourier energy.
+        # ----------------------------------------------------
+
+        h_high = h_stack[
+            :,
+            -1,
+            :
+        ]
+
+        high_norm = torch.norm(
+            h_high,
+            p=2,
+            dim=1
+        )
+
+        self_norm = torch.norm(
+            h_self,
+            p=2,
+            dim=1
+        )
+
+        high_energy = (
+            high_norm /
+            (
+                self_norm +
+                1e-8
+            )
+        )
+
+        return high_energy.unsqueeze(
+            -1
+        )
+
+    # ========================================================
+    # Main feature forward
+    # ========================================================
+
+    def forward_features(
+        self,
+        in_feat,
+        struct_feat
+    ):
+
+        # ====================================================
+        # ADC
+        # ====================================================
+
+        (
+            h_self,
+            h_stack,
+            h_graph,
+            h_adc,
+            attn_weights
+        ) = self.encode_adc(
+            in_feat
+        )
+
+        # ====================================================
+        # OSP
+        # ====================================================
+
+        h_perp = self.osp(
+            h_self,
+            h_graph
+        )
+
+        # ====================================================
+        # Structural representation
+        # ====================================================
+
+        z_struct = (
+            self.struct_encoder(
+                struct_feat
+            )
+        )
+
+        # ====================================================
+        # High-order response
+        # ====================================================
+
+        high_energy = (
+            self.compute_high_frequency_energy(
+                h_stack,
+                h_self
+            )
+        )
+
+        # ====================================================
+        # Failure characterization
+        # ====================================================
+
+        (
+            z_failure,
+            C_hide,
+            C_dilute,
+            discrepancy
+        ) = self.failure_characterizer(
+            h_self=h_self,
+            h_graph=h_graph,
+            h_preserve=h_perp,
+            z_struct=z_struct,
+            high_energy=high_energy
+        )
+
+        # ====================================================
+        # Structural role recovery
+        # ====================================================
+
+        h_struct = (
+            self.struct_recovery(
+                h_perp,
+                z_struct
+            )
+        )
+
+        # ====================================================
+        # Failure conditioned gate
+        # ====================================================
+
+        gate = self.failure_gate(
+            h_struct=h_struct,
+            h_preserve=h_perp,
+            C_hide=C_hide,
+            C_dilute=C_dilute,
+            high_energy=high_energy,
+            discrepancy=discrepancy
+        )
+
+        # ====================================================
+        # Recovery paths
+        # ====================================================
+
+        # ----------------------------------------------------
+        # Hidden-signal recovery
+        # ----------------------------------------------------
+
+        h_hidden = (
+            h_perp +
+            C_hide *
+            h_struct
+        )
+
+        # ----------------------------------------------------
+        # Dilution recovery
+        # ----------------------------------------------------
+
+        h_diluted = (
+            0.5 * h_adc +
+            0.5 * h_perp
+        )
+
+        # ----------------------------------------------------
+        # Gate selects recovery direction
+        # ----------------------------------------------------
+
+        gate_hidden = gate[
+            :,
+            0:1
+        ]
+
+        gate_diluted = gate[
+            :,
+            1:2
+        ]
+
+        h_recover = (
+            gate_hidden *
+            h_hidden
+            +
+            gate_diluted *
+            h_diluted
+        )
+
+        # ====================================================
+        # Final fusion
+        # ====================================================
+
+        fusion = torch.cat(
+            [
+                h_recover,
+                h_struct,
+                h_adc
+            ],
+            dim=1
+        )
+
+        h_recover = (
+            self.recovery_fusion(
+                fusion
+            )
+        )
+
+        # ====================================================
+        # Return
+        # ====================================================
+
+        aux = {
+
+            'h_self':
+                h_self,
+
+            'h_stack':
+                h_stack,
+
+            'h_graph':
+                h_graph,
+
+            'h_adc':
+                h_adc,
+
+            'h_perp':
+                h_perp,
+
+            'h_preserve':
+                h_perp,
+
+            'z_struct':
+                z_struct,
+
+            'z_failure':
+                z_failure,
+
+            'h_struct':
+                h_struct,
+
+            'C_hide':
+                C_hide,
+
+            'C_dilute':
+                C_dilute,
+
+            'hide_score':
+                C_hide,
+
+            'dilute_score':
+                C_dilute,
+
+            'high_energy':
+                high_energy,
+
+            'discrepancy':
+                discrepancy,
+
+            'gate':
+                gate,
+
+            'h_hidden':
+                h_hidden,
+
+            'h_diluted':
+                h_diluted,
+
+            'h_recover':
+                h_recover,
+
+            'attn_weights':
+                attn_weights
+        }
+
+        return (
+            h_recover,
+            aux
+        )
+
+    # ========================================================
+    # Build diffusion failure condition
+    # ========================================================
+
+    def build_failure_condition(
+        self,
+        aux
+    ):
+
+        # ----------------------------------------------------
+        # F_i =
+        #
+        # [gate,
+        #  C_hide,
+        #  C_dilute,
+        #  high_energy,
+        #  discrepancy,
+        #  z_struct]
+        #
+        # ----------------------------------------------------
+
+        condition = torch.cat(
+            [
+                aux['gate'],
+                aux['C_hide'],
+                aux['C_dilute'],
+                aux['high_energy'],
+                aux['discrepancy'],
+                aux['z_struct']
+            ],
+            dim=1
+        )
+
+        return condition
+
+    # ========================================================
+    # Forward
+    # ========================================================
+
+    def forward(
+        self,
+        in_feat,
+        return_aux=False
+    ):
+
+        # ----------------------------------------------------
+        # Structural features must be available.
+        # ----------------------------------------------------
+
+        if 'struct_feat' not in self.g.ndata:
+
+            raise RuntimeError(
+                "g.ndata['struct_feat'] "
+                "is required by FCR-GNN."
+            )
+
+        struct_feat = (
+            self.g.ndata[
+                'struct_feat'
+            ].float()
+        )
+
+        # ----------------------------------------------------
+        # Feature recovery
+        # ----------------------------------------------------
+
+        (
+            h_recover,
+            aux
+        ) = self.forward_features(
+            in_feat,
+            struct_feat
+        )
+
+        # ----------------------------------------------------
+        # Classifier
+        # ----------------------------------------------------
+
+        logits = self.linear4(
+            h_recover
+        )
+
+        if return_aux:
+
+            return (
+                logits,
+                h_recover,
+                aux
+            )
+
+        return logits
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn.functional as F
 import argparse
