@@ -1,4 +1,2085 @@
 import torch
+import torch.nn.functional as F
+import argparse
+import time
+import pickle as pkl
+import numpy as np
+
+from dataset import Dataset
+from FCRGNN import FCRGNN_amazon
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    f1_score,
+    recall_score,
+    precision_score,
+    roc_auc_score,
+    average_precision_score
+)
+
+from diffusion import (
+    GaussianDiffusion,
+    make_beta_schedule
+)
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def compute_gmean(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    TP = np.sum((y_true == 1) & (y_pred == 1))
+    TN = np.sum((y_true == 0) & (y_pred == 0))
+    FP = np.sum((y_true == 0) & (y_pred == 1))
+    FN = np.sum((y_true == 1) & (y_pred == 0))
+
+    recall_pos = (
+        TP / (TP + FN)
+        if (TP + FN) > 0
+        else 0.0
+    )
+
+    recall_neg = (
+        TN / (TN + FP)
+        if (TN + FP) > 0
+        else 0.0
+    )
+
+    return np.sqrt(
+        recall_pos * recall_neg
+    )
+
+
+def recall_at_k(y_true, probs):
+    """
+    Recall@K for fraud detection.
+
+    K = number of positive/fraud samples in the test set.
+    """
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+
+    k = int(y_true.sum())
+
+    if k <= 0:
+        return 0.0
+
+    top_k_idx = np.argsort(-probs)[:k]
+
+    detected = y_true[top_k_idx].sum()
+
+    return detected / k
+
+
+def get_best_f1(labels, probs):
+    """
+    Find threshold on validation set using Macro-F1.
+    """
+
+    if torch.is_tensor(labels):
+        labels = labels.detach().cpu().numpy()
+
+    if torch.is_tensor(probs):
+        probs = probs.detach().cpu().numpy()
+
+    best_f1 = 0.0
+    best_thre = 0.5
+
+    for threshold in np.linspace(
+        0.05,
+        0.95,
+        19
+    ):
+
+        preds = (
+            probs[:, 1] > threshold
+        ).astype(np.int64)
+
+        mf1 = f1_score(
+            labels,
+            preds,
+            average='macro',
+            zero_division=0
+        )
+
+        if mf1 > best_f1:
+            best_f1 = mf1
+            best_thre = threshold
+
+    return best_f1, best_thre
+
+
+# ============================================================
+# Structural features
+# ============================================================
+
+def build_structural_features(g):
+    """
+    Build unsupervised structural features.
+
+    IMPORTANT:
+    These features do NOT use labels.
+
+    Output:
+        [degree,
+         in_degree,
+         out_degree,
+         local_density]
+    """
+
+    device = g.device
+    num_nodes = g.num_nodes()
+
+    # --------------------------------------------------------
+    # Degree
+    # --------------------------------------------------------
+
+    try:
+        degree = g.in_degrees().float()
+    except Exception:
+        degree = torch.zeros(
+            num_nodes,
+            device=device
+        )
+
+    try:
+        out_degree = g.out_degrees().float()
+    except Exception:
+        out_degree = degree.clone()
+
+    # --------------------------------------------------------
+    # Local density approximation
+    # --------------------------------------------------------
+
+    # For large graphs we avoid expensive NetworkX operations.
+    #
+    # Approximation:
+    #
+    # density_i = number of neighbors /
+    #             max possible local neighbors
+    #
+    # Since exact local triangle density is expensive,
+    # we use degree-normalized structural connectivity.
+
+    total_nodes = float(max(num_nodes - 1, 1))
+
+    density = (
+        degree / total_nodes
+    )
+
+    density = density.clamp(
+        min=0.0,
+        max=1.0
+    )
+
+    # --------------------------------------------------------
+    # Log transformed degree
+    # --------------------------------------------------------
+
+    log_degree = torch.log1p(
+        degree
+    )
+
+    log_out_degree = torch.log1p(
+        out_degree
+    )
+
+    struct_feat = torch.stack(
+        [
+            log_degree,
+            log_out_degree,
+            density,
+            degree / (
+                out_degree + 1.0
+            )
+        ],
+        dim=1
+    )
+
+    # Numerical safety
+    struct_feat = torch.nan_to_num(
+        struct_feat,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    return struct_feat.to(device)
+
+
+def prepare_structural_features(g):
+    """
+    Use existing structural features if Dataset already
+    provides them. Otherwise create them.
+    """
+
+    if 'struct_feat' in g.ndata:
+
+        struct_feat = g.ndata['struct_feat'].float()
+
+        print(
+            "Using existing structural features:",
+            struct_feat.shape
+        )
+
+    else:
+
+        print(
+            "g.ndata['struct_feat'] not found."
+        )
+
+        print(
+            "Building unsupervised structural features..."
+        )
+
+        struct_feat = build_structural_features(g)
+
+        g.ndata['struct_feat'] = struct_feat
+
+        print(
+            "Generated struct_feat:",
+            struct_feat.shape
+        )
+
+    return g
+
+
+# ============================================================
+# Model Wrapper
+# ============================================================
+
+class ModelWrapper(torch.nn.Module):
+
+    def __init__(
+        self,
+        base_model,
+        in_feats,
+        h_feats
+    ):
+        super().__init__()
+
+        self.base_model = base_model
+
+        # ----------------------------------------------------
+        # Diffusion noise prediction head
+        # ----------------------------------------------------
+
+        self.noise_head = torch.nn.Sequential(
+
+            torch.nn.Linear(
+                h_feats,
+                h_feats
+            ),
+
+            torch.nn.ReLU(),
+
+            torch.nn.Linear(
+                h_feats,
+                in_feats
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        t=None,
+        return_aux=False
+    ):
+
+        logits, h_recover, aux = (
+            self.base_model(
+                x,
+                return_aux=True
+            )
+        )
+
+        noise_pred = self.noise_head(
+            h_recover
+        )
+
+        if return_aux:
+
+            return (
+                noise_pred,
+                h_recover,
+                logits,
+                aux
+            )
+
+        return (
+            noise_pred,
+            h_recover
+        )
+
+
+# ============================================================
+# Training
+# ============================================================
+
+def train(
+    model,
+    g,
+    args
+):
+
+    features = g.ndata['feature']
+    labels = g.ndata['label'].long()
+
+    device = features.device
+
+    in_feats = features.shape[1]
+
+    print()
+    print(
+        "=================================================="
+    )
+    print(
+        "Training FCR-GNN"
+    )
+    print(
+        "=================================================="
+    )
+
+    print(
+        "in_feats:",
+        in_feats
+    )
+
+    print(
+        "feature shape:",
+        features.shape
+    )
+
+    # ========================================================
+    # Structural features
+    # ========================================================
+
+    g = prepare_structural_features(g)
+
+    struct_feat = g.ndata['struct_feat']
+
+    print(
+        "struct_feat:",
+        struct_feat.shape
+    )
+
+    # ========================================================
+    # Masks
+    # ========================================================
+
+    if (
+        'train_mask' not in g.ndata
+        or 'val_mask' not in g.ndata
+        or 'test_mask' not in g.ndata
+    ):
+
+        print(
+            "Masks not found. Creating train/val/test split..."
+        )
+
+        num_nodes = labels.shape[0]
+
+        train_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        val_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        test_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        indices = np.arange(
+            num_nodes
+        )
+
+        labels_np = labels.cpu().numpy()
+
+        train_idx, rest_idx = train_test_split(
+            indices,
+            train_size=args.train_ratio,
+            stratify=labels_np,
+            random_state=2
+        )
+
+        val_idx, test_idx = train_test_split(
+            rest_idx,
+            test_size=0.67,
+            stratify=labels_np[rest_idx],
+            random_state=2
+        )
+
+        train_mask[
+            torch.as_tensor(
+                train_idx,
+                device=device
+            )
+        ] = True
+
+        val_mask[
+            torch.as_tensor(
+                val_idx,
+                device=device
+            )
+        ] = True
+
+        test_mask[
+            torch.as_tensor(
+                test_idx,
+                device=device
+            )
+        ] = True
+
+    else:
+
+        train_mask = g.ndata['train_mask']
+        val_mask = g.ndata['val_mask']
+        test_mask = g.ndata['test_mask']
+
+        train_mask = train_mask.to(device)
+        val_mask = val_mask.to(device)
+        test_mask = test_mask.to(device)
+
+    print(
+        "train/dev/test samples:",
+        train_mask.sum().item(),
+        val_mask.sum().item(),
+        test_mask.sum().item()
+    )
+
+    # ========================================================
+    # Class weight
+    # ========================================================
+
+    train_labels = labels[
+        train_mask
+    ]
+
+    n_pos = (
+        train_labels == 1
+    ).sum().item()
+
+    n_neg = (
+        train_labels == 0
+    ).sum().item()
+
+    weight_val = (
+        n_neg / max(n_pos, 1)
+    )
+
+    weight_tensor = torch.tensor(
+        [
+            1.0,
+            weight_val
+        ],
+        dtype=torch.float32,
+        device=device
+    )
+
+    print(
+        "cross entropy weight:",
+        weight_tensor
+    )
+
+    # ========================================================
+    # Diffusion
+    # ========================================================
+
+    betas = make_beta_schedule(
+        schedule="cosine",
+        n_timestep=1500,
+        cosine_s=12e-3
+    )
+
+    diffusion = GaussianDiffusion(
+        betas
+    ).to(device)
+
+    print(
+        "Diffusion timesteps:",
+        diffusion.num_timesteps
+    )
+
+    # ========================================================
+    # Optimizer
+    # ========================================================
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+
+    # ========================================================
+    # Best checkpoint
+    # ========================================================
+
+    best_val_ap = -1.0
+    best_epoch = 0
+
+    final_trec = 0.0
+    final_tpre = 0.0
+    final_mf1 = 0.0
+    final_auc = 0.0
+    final_ap = 0.0
+    final_recall_k = 0.0
+    final_gmean = 0.0
+
+    best_threshold = 0.5
+
+    pred_y = None
+
+    # ========================================================
+    # Training loop
+    # ========================================================
+
+    time_start = time.time()
+
+    for e in range(
+        1,
+        args.epoch + 1
+    ):
+
+        model.train()
+
+        # ----------------------------------------------------
+        # FCR-GNN forward
+        # ----------------------------------------------------
+
+        (
+            _,
+            h_recover,
+            logits,
+            aux
+        ) = model(
+            features,
+            return_aux=True
+        )
+
+        # ----------------------------------------------------
+        # Classification loss
+        # ----------------------------------------------------
+
+        loss_cls = F.cross_entropy(
+            logits[train_mask],
+            labels[train_mask],
+            weight=weight_tensor
+        )
+
+        # ----------------------------------------------------
+        # Failure condition
+        # ----------------------------------------------------
+
+        failure_condition = (
+            model.base_model
+            .build_failure_condition(
+                aux
+            )
+        )
+
+        # ----------------------------------------------------
+        # Diffusion
+        # ----------------------------------------------------
+
+        batch_size = features.shape[0]
+
+        t = torch.randint(
+            low=0,
+            high=diffusion.num_timesteps,
+            size=(batch_size,),
+            device=device
+        )
+
+        loss_diff = (
+            diffusion
+            .p_loss_failure_conditioned(
+                model=model,
+                x_0=features,
+                t=t,
+                failure_condition=failure_condition,
+                lambda_contrast=args.lambda_contrast
+            )
+        )
+
+        # ----------------------------------------------------
+        # OSP regularization
+        # ----------------------------------------------------
+
+        cosine_preserve = (
+            F.cosine_similarity(
+                aux['h_preserve'],
+                aux['h_self'],
+                dim=1
+            )
+        )
+
+        loss_osp = (
+            1.0 -
+            cosine_preserve.mean()
+        )
+
+        # ----------------------------------------------------
+        # Recovery consistency
+        # ----------------------------------------------------
+
+        # Keep recovered representation numerically stable.
+        loss_recovery = (
+            torch.norm(
+                h_recover,
+                dim=1
+            ).mean()
+        )
+
+        # Normalize the auxiliary term.
+        loss_recovery = (
+            loss_recovery * 1e-4
+        )
+
+        # ----------------------------------------------------
+        # Total loss
+        # ----------------------------------------------------
+
+        total_loss = (
+            loss_cls
+            + args.lambda_diff * loss_diff
+            + args.lambda_osp * loss_osp
+            + loss_recovery
+        )
+
+        # ----------------------------------------------------
+        # Backprop
+        # ----------------------------------------------------
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=5.0
+        )
+
+        optimizer.step()
+
+        # ====================================================
+        # Evaluation
+        # ====================================================
+
+        model.eval()
+
+        with torch.no_grad():
+
+            (
+                _,
+                _,
+                logits_eval,
+                aux_eval
+            ) = model(
+                features,
+                return_aux=True
+            )
+
+            probs = F.softmax(
+                logits_eval,
+                dim=1
+            )
+
+            # ------------------------------------------------
+            # Validation AP
+            # ------------------------------------------------
+
+            val_labels_np = (
+                labels[val_mask]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            val_probs_np = (
+                probs[val_mask, 1]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            val_ap = average_precision_score(
+                val_labels_np,
+                val_probs_np
+            )
+
+            # ------------------------------------------------
+            # Validation threshold
+            # ------------------------------------------------
+
+            val_f1, threshold = (
+                get_best_f1(
+                    labels[val_mask],
+                    probs[val_mask]
+                )
+            )
+
+            # ------------------------------------------------
+            # Test
+            # ------------------------------------------------
+
+            y_true = (
+                labels[test_mask]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            y_score = (
+                probs[test_mask, 1]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            y_pred = (
+                y_score > threshold
+            ).astype(np.int64)
+
+            # ------------------------------------------------
+            # Threshold metrics
+            # ------------------------------------------------
+
+            trec = recall_score(
+                y_true,
+                y_pred,
+                zero_division=0
+            )
+
+            tpre = precision_score(
+                y_true,
+                y_pred,
+                zero_division=0
+            )
+
+            tmf1 = f1_score(
+                y_true,
+                y_pred,
+                average='macro',
+                zero_division=0
+            )
+
+            tgmean = compute_gmean(
+                y_true,
+                y_pred
+            )
+
+            # ------------------------------------------------
+            # Ranking metrics
+            # ------------------------------------------------
+
+            tauc = roc_auc_score(
+                y_true,
+                y_score
+            )
+
+            tap = average_precision_score(
+                y_true,
+                y_score
+            )
+
+            trecall_k = recall_at_k(
+                y_true,
+                y_score
+            )
+
+        # ====================================================
+        # Checkpoint
+        # ====================================================
+
+        if val_ap > best_val_ap:
+
+            best_val_ap = val_ap
+
+            best_epoch = e
+
+            best_threshold = threshold
+
+            final_trec = trec
+            final_tpre = tpre
+            final_mf1 = tmf1
+            final_auc = tauc
+            final_ap = tap
+            final_recall_k = trecall_k
+            final_gmean = tgmean
+
+            pred_y = (
+                probs
+                .detach()
+                .cpu()
+            )
+
+            # Save model checkpoint
+            torch.save(
+                {
+                    'epoch': e,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_ap': best_val_ap,
+                    'threshold': best_threshold
+                },
+                f'best_FCRGNN_{args.dataset}.pt'
+            )
+
+        # ====================================================
+        # Print
+        # ====================================================
+
+        print(
+            "Epoch {:03d} | "
+            "Loss {:.4f} | "
+            "Cls {:.4f} | "
+            "Diff {:.4f} | "
+            "Val AP {:.4f} | "
+            "Test AP {:.4f} | "
+            "AUC {:.4f} | "
+            "MF1 {:.4f} | "
+            "R@K {:.4f}".format(
+                e,
+                total_loss.item(),
+                loss_cls.item(),
+                loss_diff.item(),
+                val_ap,
+                tap,
+                tauc,
+                tmf1,
+                trecall_k
+            )
+        )
+
+        # ----------------------------------------------------
+        # Save predictions periodically
+        # ----------------------------------------------------
+
+        if (
+            args.del_ratio == 0
+            and e % 20 == 0
+            and pred_y is not None
+        ):
+
+            with open(
+                f'probs_{args.dataset}_FCRGNN',
+                'wb'
+            ) as f:
+
+                pkl.dump(
+                    pred_y.numpy(),
+                    f
+                )
+
+    # ========================================================
+    # Training finished
+    # ========================================================
+
+    time_end = time.time()
+
+    print()
+    print(
+        "=================================================="
+    )
+    print(
+        "Training finished"
+    )
+   
+
+
+
+
+
+
+
+
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+# ============================================================
+# Beta schedule
+# ============================================================
+
+def make_beta_schedule(
+    schedule,
+    n_timestep,
+    linear_start=1e-4,
+    linear_end=2e-2,
+    cosine_s=8e-3
+):
+
+    if schedule == "quad":
+
+        betas = (
+            torch.linspace(
+                linear_start ** 0.5,
+                linear_end ** 0.5,
+                n_timestep,
+                dtype=torch.float64
+            ) ** 2
+        )
+
+    elif schedule == "linear":
+
+        betas = torch.linspace(
+            linear_start,
+            linear_end,
+            n_timestep,
+            dtype=torch.float64
+        )
+
+    elif schedule == "cosine":
+
+        timesteps = (
+            torch.arange(
+                n_timestep + 1,
+                dtype=torch.float64
+            ) / n_timestep
+            + cosine_s
+        )
+
+        alphas = (
+            timesteps
+            / (1 + cosine_s)
+            * math.pi
+            / 2
+        )
+
+        alphas = torch.cos(alphas).pow(2)
+
+        alphas = (
+            alphas
+            / alphas[0]
+        )
+
+        betas = (
+            1
+            - alphas[1:]
+            / alphas[:-1]
+        )
+
+        betas = betas.clamp(
+            max=0.999
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unknown beta schedule: {schedule}"
+        )
+
+    return betas
+
+
+# ============================================================
+# Extract timestep coefficients
+# ============================================================
+
+def extract(
+    input,
+    t,
+    shape
+):
+
+    out = torch.gather(
+        input,
+        0,
+        t
+    )
+
+    reshape = (
+        [shape[0]]
+        + [1] * (len(shape) - 1)
+    )
+
+    out = out.reshape(
+        *reshape
+    )
+
+    return out
+
+
+# ============================================================
+# Noise
+# ============================================================
+
+def noise_like(
+    shape,
+    noise_fn,
+    device,
+    repeat=False
+):
+
+    if repeat:
+
+        resid = [
+            1
+        ] * (len(shape) - 1)
+
+        shape_one = (
+            1,
+            *shape[1:]
+        )
+
+        return noise_fn(
+            *shape_one,
+            device=device
+        ).repeat(
+            shape[0],
+            *resid
+        )
+
+    else:
+
+        return noise_fn(
+            *shape,
+            device=device
+        )
+
+
+# ============================================================
+# InfoNCE
+# ============================================================
+
+def info_nce_loss(
+    feat1,
+    feat2,
+    temperature=0.1
+):
+
+    feat1 = F.normalize(
+        feat1,
+        dim=1
+    )
+
+    feat2 = F.normalize(
+        feat2,
+        dim=1
+    )
+
+    logits = (
+        torch.matmul(
+            feat1,
+            feat2.T
+        )
+        / temperature
+    )
+
+    labels = torch.arange(
+        feat1.size(0),
+        device=feat1.device
+    )
+
+    return F.cross_entropy(
+        logits,
+        labels
+    )
+
+
+# ============================================================
+# Failure-conditioned noise controller
+# ============================================================
+
+class FailureConditionedNoise(nn.Module):
+    """
+    Learns node-adaptive diffusion noise.
+
+    F_i contains failure characterization:
+
+        gate
+        C_hide
+        C_dilute
+        high_energy
+        discrepancy
+        structural embedding
+
+    sigma_i = softplus(MLP(F_i)) + minimum_sigma
+
+    The output is a scalar per node.
+    """
+
+    def __init__(
+        self,
+        failure_dim,
+        hidden_dim=64,
+        min_sigma=0.05
+    ):
+        super().__init__()
+
+        self.min_sigma = min_sigma
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                failure_dim,
+                hidden_dim
+            ),
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                1
+            )
+        )
+
+    def forward(
+        self,
+        failure_features
+    ):
+
+        sigma = self.mlp(
+            failure_features
+        )
+
+        sigma = F.softplus(
+            sigma
+        )
+
+        sigma = (
+            self.min_sigma
+            + sigma
+        )
+
+        return sigma
+
+
+# ============================================================
+# Failure-conditioned denoiser
+# ============================================================
+
+class FailureConditionedDenoiser(nn.Module):
+    """
+    Predicts diffusion noise using:
+
+        x_t
+        timestep t
+        failure characterization F
+
+    The timestep is represented using sinusoidal embeddings.
+    """
+
+    def __init__(
+        self,
+        x_dim,
+        failure_dim,
+        hidden_dim=128,
+        time_dim=64,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.x_dim = x_dim
+        self.failure_dim = failure_dim
+        self.time_dim = time_dim
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(
+                time_dim,
+                hidden_dim
+            ),
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            )
+        )
+
+        self.failure_mlp = nn.Sequential(
+            nn.Linear(
+                failure_dim,
+                hidden_dim
+            ),
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            )
+        )
+
+        self.input_mlp = nn.Sequential(
+            nn.Linear(
+                x_dim,
+                hidden_dim
+            ),
+            nn.SiLU()
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Linear(
+                3 * hidden_dim,
+                hidden_dim
+            ),
+            nn.SiLU(),
+
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.SiLU()
+        )
+
+        self.output = nn.Linear(
+            hidden_dim,
+            x_dim
+        )
+
+    # --------------------------------------------------------
+    # Sinusoidal timestep embedding
+    # --------------------------------------------------------
+
+    def timestep_embedding(
+        self,
+        t
+    ):
+
+        half_dim = self.time_dim // 2
+
+        exponent = -math.log(
+            10000
+        ) * torch.arange(
+            half_dim,
+            device=t.device,
+            dtype=torch.float32
+        ) / max(
+            half_dim - 1,
+            1
+        )
+
+        emb = (
+            t.float().unsqueeze(1)
+            * torch.exp(exponent).unsqueeze(0)
+        )
+
+        emb = torch.cat(
+            [
+                torch.sin(emb),
+                torch.cos(emb)
+            ],
+            dim=1
+        )
+
+        if self.time_dim % 2 == 1:
+
+            emb = F.pad(
+                emb,
+                (0, 1)
+            )
+
+        return emb
+
+    # --------------------------------------------------------
+    # Forward
+    # --------------------------------------------------------
+
+    def forward(
+        self,
+        x_t,
+        t,
+        failure_features
+    ):
+
+        x_emb = self.input_mlp(
+            x_t
+        )
+
+        t_emb = self.timestep_embedding(
+            t
+        )
+
+        t_emb = self.time_mlp(
+            t_emb
+        )
+
+        f_emb = self.failure_mlp(
+            failure_features
+        )
+
+        hidden = torch.cat(
+            [
+                x_emb,
+                t_emb,
+                f_emb
+            ],
+            dim=-1
+        )
+
+        hidden = self.fusion(
+            hidden
+        )
+
+        return self.output(
+            hidden
+        )
+
+
+# ============================================================
+# Gaussian Diffusion
+# ============================================================
+
+class GaussianDiffusion(nn.Module):
+
+    def __init__(
+        self,
+        betas
+    ):
+
+        super().__init__()
+
+        betas = betas.type(
+            torch.float64
+        )
+
+        timesteps = betas.shape[0]
+
+        self.num_timesteps = int(
+            timesteps
+        )
+
+        alphas = (
+            1 - betas
+        )
+
+        alphas_cumprod = torch.cumprod(
+            alphas,
+            0
+        )
+
+        alphas_cumprod_prev = torch.cat(
+            (
+                torch.tensor(
+                    [1],
+                    dtype=torch.float64
+                ),
+                alphas_cumprod[:-1]
+            ),
+            0
+        )
+
+        posterior_variance = (
+            betas
+            * (
+                1
+                - alphas_cumprod_prev
+            )
+            / (
+                1
+                - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "betas",
+            betas
+        )
+
+        self.register(
+            "alphas_cumprod",
+            alphas_cumprod
+        )
+
+        self.register(
+            "alphas_cumprod_prev",
+            alphas_cumprod_prev
+        )
+
+        self.register(
+            "sqrt_alphas_cumprod",
+            torch.sqrt(
+                alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "log_one_minus_alphas_cumprod",
+            torch.log(
+                1 - alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recip_alphas_cumprod",
+            torch.rsqrt(
+                alphas_cumprod
+            )
+        )
+
+        self.register(
+            "sqrt_recipm1_alphas_cumprod",
+            torch.sqrt(
+                1 / alphas_cumprod - 1
+            )
+        )
+
+        self.register(
+            "posterior_variance",
+            posterior_variance
+        )
+
+        self.register(
+            "posterior_log_variance_clipped",
+            torch.log(
+                posterior_variance.clamp(
+                    min=1e-20
+                )
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef1",
+            (
+                betas
+                * torch.sqrt(
+                    alphas_cumprod_prev
+                )
+                / (
+                    1
+                    - alphas_cumprod
+                )
+            )
+        )
+
+        self.register(
+            "posterior_mean_coef2",
+            (
+                (
+                    1
+                    - alphas_cumprod_prev
+                )
+                * torch.sqrt(alphas)
+                / (
+                    1
+                    - alphas_cumprod
+                )
+            )
+        )
+
+    # ========================================================
+    # Register buffer
+    # ========================================================
+
+    def register(
+        self,
+        name,
+        tensor
+    ):
+
+        self.register_buffer(
+            name,
+            tensor.type(torch.float32)
+        )
+
+    # ========================================================
+    # Original q(x_t | x_0)
+    # ========================================================
+
+    def q_sample(
+        self,
+        x_0,
+        t,
+        noise=None
+    ):
+
+        if noise is None:
+
+            noise = torch.randn_like(
+                x_0
+            )
+
+        return (
+            extract(
+                self.sqrt_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * x_0
+            +
+            extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * noise
+        )
+
+    # ========================================================
+    # Failure-conditioned q(x_t | x_0, F)
+    # ========================================================
+
+    def q_sample_failure_conditioned(
+        self,
+        x_0,
+        t,
+        failure_features,
+        noise_controller,
+        noise=None
+    ):
+
+        if noise is None:
+
+            noise = torch.randn_like(
+                x_0
+            )
+
+        sigma = noise_controller(
+            failure_features
+        )
+
+        # ----------------------------------------------------
+        # Normalize sigma around 1.
+        #
+        # This prevents the new module from immediately
+        # dominating the original diffusion process.
+        # ----------------------------------------------------
+
+        sigma = sigma / (
+            sigma.detach().mean()
+            + 1e-8
+        )
+
+        # ----------------------------------------------------
+        # Expand scalar node noise to feature dimensions
+        # ----------------------------------------------------
+
+        while sigma.ndim < x_0.ndim:
+
+            sigma = sigma.unsqueeze(-1)
+
+        adaptive_noise = (
+            sigma
+            * noise
+        )
+
+        x_t = (
+            extract(
+                self.sqrt_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * x_0
+            +
+            extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                t,
+                x_0.shape
+            )
+            * adaptive_noise
+        )
+
+        return (
+            x_t,
+            adaptive_noise,
+            sigma
+        )
+
+    # ========================================================
+    # Failure-conditioned contrastive diffusion loss
+    # ========================================================
+
+    def p_loss_failure_conditioned(
+        self,
+        model,
+        x_0,
+        t,
+        failure_features,
+        noise_controller,
+        temperature=0.1,
+        lambda_contrast=1.0,
+        lambda_sigma=0.01
+    ):
+
+        # ----------------------------------------------------
+        # Two independent noises
+        # ----------------------------------------------------
+
+        noise1 = torch.randn_like(
+            x_0
+        )
+
+        noise2 = torch.randn_like(
+            x_0
+        )
+
+        # ----------------------------------------------------
+        # Failure-conditioned corruption
+        # ----------------------------------------------------
+
+        (
+            x_noisy1,
+            target_noise1,
+            sigma1
+        ) = self.q_sample_failure_conditioned(
+            x_0,
+            t,
+            failure_features,
+            noise_controller,
+            noise1
+        )
+
+        (
+            x_noisy2,
+            target_noise2,
+            sigma2
+        ) = self.q_sample_failure_conditioned(
+            x_0,
+            t,
+            failure_features,
+            noise_controller,
+            noise2
+        )
+
+        # ----------------------------------------------------
+        # Failure-conditioned denoising
+        # ----------------------------------------------------
+
+        noise_pred1, feat1 = model(
+            x_noisy1,
+            t,
+            failure_features
+        )
+
+        noise_pred2, feat2 = model(
+            x_noisy2,
+            t,
+            failure_features
+        )
+
+        # ----------------------------------------------------
+        # Diffusion reconstruction
+        # ----------------------------------------------------
+
+        mse_loss = (
+            F.mse_loss(
+                noise_pred1,
+                target_noise1
+            )
+            +
+            F.mse_loss(
+                noise_pred2,
+                target_noise2
+            )
+        ) / 2.0
+
+        # ----------------------------------------------------
+        # Contrastive consistency
+        # ----------------------------------------------------
+
+        contrast_loss = info_nce_loss(
+            feat1,
+            feat2,
+            temperature
+        )
+
+        # ----------------------------------------------------
+        # Keep adaptive noise from becoming extreme
+        # ----------------------------------------------------
+
+        sigma_regularization = (
+            (
+                sigma1 - 1.0
+            ).pow(2).mean()
+            +
+            (
+                sigma2 - 1.0
+            ).pow(2).mean()
+        ) / 2.0
+
+        loss = (
+            mse_loss
+            +
+            lambda_contrast
+            * contrast_loss
+            +
+            lambda_sigma
+            * sigma_regularization
+        )
+
+        return {
+            "loss": loss,
+            "mse_loss": mse_loss,
+            "contrast_loss": contrast_loss,
+            "sigma_loss": sigma_regularization,
+            "sigma": (
+                sigma1
+                + sigma2
+            ) / 2.0
+        }
+
+    # ========================================================
+    # Original loss kept for compatibility
+    # ========================================================
+
+    def p_loss_contrastive(
+        self,
+        model,
+        x_0,
+        t,
+        temperature=0.1,
+        lambda_contrast=1.0,
+        noise=None
+    ):
+
+        if noise is None:
+
+            noise = torch.randn_like(
+                x_0
+            )
+
+        noise1 = noise
+
+        noise2 = torch.randn_like(
+            x_0
+        )
+
+        x_noisy1 = self.q_sample(
+            x_0,
+            t,
+            noise1
+        )
+
+        x_noisy2 = self.q_sample(
+            x_0,
+            t,
+            noise2
+        )
+
+        noise_pred1, feat1 = model(
+            x_noisy1,
+            t
+        )
+
+        noise_pred2, feat2 = model(
+            x_noisy2,
+            t
+        )
+
+        mse_loss = F.mse_loss(
+            noise_pred1,
+            noise1
+        )
+
+        contrast_loss = info_nce_loss(
+            feat1,
+            feat2,
+            temperature
+        )
+
+        return (
+            mse_loss
+            +
+            lambda_contrast
+            * contrast_loss
+        )
+
+    # ========================================================
+    # x_0 prediction
+    # ========================================================
+
+    def predict_start_from_noise(
+        self,
+        x_t,
+        t,
+        noise
+    ):
+
+        return (
+            extract(
+                self.sqrt_recip_alphas_cumprod,
+                t,
+                x_t.shape
+            )
+            * x_t
+            -
+            extract(
+                self.sqrt_recipm1_alphas_cumprod,
+                t,
+                x_t.shape
+            )
+            * noise
+        )
+
+    # ========================================================
+    # Posterior
+    # ========================================================
+
+    def q_posterior(
+        self,
+        x_0,
+        x_t,
+        t
+    ):
+
+        mean = (
+            extract(
+                self.posterior_mean_coef1,
+                t,
+                x_t.shape
+            )
+            * x_0
+            +
+            extract(
+                self.posterior_mean_coef2,
+                t,
+                x_t.shape
+            )
+            * x_t
+        )
+
+        var = extract(
+            self.posterior_variance,
+            t,
+            x_t.shape
+        )
+
+        log_var_clipped = extract(
+            self.posterior_log_variance_clipped,
+            t,
+            x_t.shape
+        )
+
+        return (
+            mean,
+            var,
+            log_var_clipped
+        )
+
+    # ========================================================
+    # Failure-conditioned p(x_{t-1} | x_t)
+    # ========================================================
+
+    def p_mean_variance_failure_conditioned(
+        self,
+        model,
+        x,
+        t,
+        failure_features,
+        clip_denoised=True
+    ):
+
+        noise_pred, _ = model(
+            x,
+            t,
+            failure_features
+        )
+
+        x_recon = (
+            self.predict_start_from_noise(
+                x,
+                t,
+                noise_pred
+            )
+        )
+
+        if clip_denoised:
+
+            x_recon = x_recon.clamp(
+                min=-1,
+                max=1
+            )
+
+        mean, var, log_var = (
+            self.q_posterior(
+                x_recon,
+                x,
+                t
+            )
+        )
+
+        return (
+            mean,
+            var,
+            log_var
+        )
+
+    # ========================================================
+    # Failure-conditioned sampling
+    # ========================================================
+
+    def p_sample_failure_conditioned(
+        self,
+        model,
+        x,
+        t,
+        failure_features,
+        noise_fn,
+        clip_denoised=True,
+        repeat_noise=False
+    ):
+
+        (
+            mean,
+            _,
+            log_var
+        ) = self.p_mean_variance_failure_conditioned(
+            model,
+            x,
+            t,
+            failure_features,
+            clip_denoised
+        )
+
+        noise = noise_like(
+            x.shape,
+            noise_fn,
+            x.device,
+            repeat_noise
+        )
+
+        shape = (
+            [x.shape[0]]
+            + [1] * (x.ndim - 1)
+        )
+
+        nonzero_mask = (
+            1
+            - (
+                t == 0
+            ).type(torch.float32)
+        ).view(
+            *shape
+        )
+
+        return (
+            mean
+            +
+            nonzero_mask
+            * torch.exp(
+                0.5 * log_var
+            )
+            * noise
+        )
+
+    # ========================================================
+    # Original sampling kept
+    # ========================================================
+
+    def p_mean_variance(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised
+    ):
+
+        x_recon = (
+            self.predict_start_from_noise(
+                x,
+                t,
+                noise=model(x, t)[0]
+            )
+        )
+
+        if clip_denoised:
+
+            x_recon = x_recon.clamp(
+                min=-1,
+                max=1
+            )
+
+        mean, var, log_var = (
+            self.q_posterior(
+                x_recon,
+                x,
+                t
+            )
+        )
+
+        return (
+            mean,
+            var,
+            log_var
+        )
+
+    def p_sample(
+        self,
+        model,
+        x,
+        t,
+        noise_fn,
+        clip_denoised=True,
+        repeat_noise=False
+    ):
+
+        mean, _, log_var = (
+            self.p_mean_variance(
+                model,
+                x,
+                t,
+                clip_denoised
+            )
+        )
+
+        noise = noise_like(
+            x.shape,
+            noise_fn,
+            x.device,
+            repeat_noise
+        )
+
+        shape = (
+            [x.shape[0]]
+            + [1] * (x.ndim - 1)
+        )
+
+        nonzero_mask = (
+            1
+            - (
+                t == 0
+            ).type(torch.float32)
+        ).view(
+            *shape
+        )
+
+        return (
+            mean
+            +
+            nonzero_mask
+            * torch.exp(
+                0.5 * log_var
+            )
+            * noise
+        )
+
+
+
+
+
+
+
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
