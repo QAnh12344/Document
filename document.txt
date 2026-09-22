@@ -1,3 +1,1071 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import sympy
+import scipy
+from torch.nn import init
+
+
+# ============================================================
+# Polynomial Graph Convolution
+# ============================================================
+
+class PolyConv(nn.Module):
+    def __init__(
+        self,
+        in_feats,
+        out_feats,
+        theta,
+        activation=F.leaky_relu,
+        lin=False,
+        bias=False
+    ):
+        super().__init__()
+
+        self._theta = theta
+        self._k = len(theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+        self.linear = nn.Linear(in_feats, out_feats, bias=bias)
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+
+        def unnLaplacian(feat, D_invsqrt, graph):
+
+            graph.ndata["h"] = feat * D_invsqrt
+
+            graph.update_all(
+                fn.copy_u("h", "m"),
+                fn.sum("m", "h")
+            )
+
+            return (
+                feat
+                - graph.ndata.pop("h") * D_invsqrt
+            )
+
+        with graph.local_scope():
+
+            D_invsqrt = torch.pow(
+                graph.in_degrees()
+                .float()
+                .clamp(min=1),
+                -0.5
+            ).unsqueeze(-1).to(feat.device)
+
+            h = self._theta[0] * feat
+
+            current = feat
+
+            for k in range(1, self._k):
+
+                current = unnLaplacian(
+                    current,
+                    D_invsqrt,
+                    graph
+                )
+
+                h = h + self._theta[k] * current
+
+        if self.lin:
+
+            h = self.linear(h)
+            h = self.activation(h)
+
+        return h
+
+
+# ============================================================
+# Theta
+# ============================================================
+
+def calculate_theta2(d):
+
+    thetas = []
+
+    x = sympy.symbols("x")
+
+    for i in range(d + 1):
+
+        f = sympy.poly(
+            (x / 2) ** i
+            * (1 - x / 2) ** (d - i)
+            / scipy.special.beta(i + 1, d + 1 - i)
+        )
+
+        coeff = f.all_coeffs()
+
+        inv_coeff = []
+
+        for j in range(d + 1):
+            inv_coeff.append(
+                float(coeff[d - j])
+            )
+
+        thetas.append(inv_coeff)
+
+    return thetas
+
+
+# ============================================================
+# Structural Encoder
+# ============================================================
+
+class StructuralEncoder(nn.Module):
+    """
+    Encodes pre-computed structural graph statistics.
+
+    Input:
+        [N, struct_dim]
+
+    Output:
+        [N, h_feats]
+    """
+
+    def __init__(
+        self,
+        struct_dim,
+        h_feats,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(struct_dim, h_feats),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_feats, h_feats),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+
+        # Normalization per feature.
+        # Statistics themselves should ideally be normalized
+        # before entering the model.
+        return self.encoder(x)
+
+
+# ============================================================
+# Orthogonal Signal Preservation
+# ============================================================
+
+class OrthogonalSignalPreservation(nn.Module):
+    """
+    Removes the component of h_self aligned with h_graph.
+
+        h_perp =
+            h_self -
+            proj(h_self, h_graph)
+
+    This is NOT a conventional residual connection.
+    """
+
+    def __init__(
+        self,
+        h_feats,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.refine = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_feats, h_feats)
+        )
+
+    def forward(
+        self,
+        h_self,
+        h_graph
+    ):
+
+        eps = 1e-8
+
+        # ----------------------------------------------------
+        # Projection coefficient
+        # ----------------------------------------------------
+
+        numerator = (
+            h_self * h_graph
+        ).sum(dim=-1, keepdim=True)
+
+        denominator = (
+            h_graph.pow(2)
+            .sum(dim=-1, keepdim=True)
+            + eps
+        )
+
+        coeff = numerator / denominator
+
+        # ----------------------------------------------------
+        # Orthogonal component
+        # ----------------------------------------------------
+
+        h_proj = coeff * h_graph
+
+        h_perp = h_self - h_proj
+
+        # ----------------------------------------------------
+        # Refine using original + orthogonal signal
+        # ----------------------------------------------------
+
+        h_preserve = self.refine(
+            torch.cat(
+                [h_self, h_perp],
+                dim=-1
+            )
+        )
+
+        return h_perp, h_preserve
+
+
+# ============================================================
+# Failure Characterizer
+# ============================================================
+
+class FailureCharacterizer(nn.Module):
+    """
+    Estimates two types of representation failure:
+
+        C_hide
+        C_dilute
+
+    C_hide:
+        self representation and graph representation
+        become strongly aligned.
+
+    C_dilute:
+        graph propagation changes / suppresses
+        node-specific information.
+    """
+
+    def __init__(
+        self,
+        h_feats,
+        struct_dim,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        # ----------------------------------------------------
+        # Input:
+        #
+        # C_hide
+        # C_dilute
+        # high_energy
+        # degree
+        # density
+        # ||h_preserve||
+        # structural embedding
+        #
+        # ----------------------------------------------------
+
+        self.input_dim = (
+            5 + h_feats
+        )
+
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim, h_feats),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_feats, h_feats),
+            nn.ReLU()
+        )
+
+        self.hide_head = nn.Sequential(
+            nn.Linear(h_feats, h_feats // 2),
+            nn.ReLU(),
+            nn.Linear(h_feats // 2, 1),
+            nn.Sigmoid()
+        )
+
+        self.dilute_head = nn.Sequential(
+            nn.Linear(h_feats, h_feats // 2),
+            nn.ReLU(),
+            nn.Linear(h_feats // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        h_self,
+        h_graph,
+        h_preserve,
+        high_energy,
+        degree,
+        density,
+        z_struct
+    ):
+
+        eps = 1e-8
+
+        # ----------------------------------------------------
+        # C_hide
+        # ----------------------------------------------------
+
+        cosine = F.cosine_similarity(
+            h_self,
+            h_graph,
+            dim=-1
+        ).unsqueeze(-1)
+
+        C_hide = 1.0 - cosine
+
+        # ----------------------------------------------------
+        # Graph propagation discrepancy
+        # ----------------------------------------------------
+
+        discrepancy = (
+            h_self - h_graph
+        ).norm(
+            dim=-1,
+            keepdim=True
+        ) / (
+            h_self.norm(
+                dim=-1,
+                keepdim=True
+            ) + eps
+        )
+
+        # ----------------------------------------------------
+        # Preserved signal magnitude
+        # ----------------------------------------------------
+
+        preserve_norm = (
+            h_preserve.norm(
+                dim=-1,
+                keepdim=True
+            )
+        )
+
+        # ----------------------------------------------------
+        # Normalize scalar structural quantities
+        # ----------------------------------------------------
+
+        degree = torch.log1p(
+            degree
+        ).unsqueeze(-1)
+
+        density = density.unsqueeze(-1)
+
+        high_energy = high_energy.unsqueeze(-1)
+
+        # ----------------------------------------------------
+        # Failure characterization input
+        # ----------------------------------------------------
+
+        failure_input = torch.cat(
+            [
+                C_hide,
+                discrepancy,
+                high_energy,
+                degree,
+                density,
+                preserve_norm,
+                z_struct
+            ],
+            dim=-1
+        )
+
+        z_failure = self.encoder(
+            failure_input
+        )
+
+        hide_score = self.hide_head(
+            z_failure
+        )
+
+        dilute_score = self.dilute_head(
+            z_failure
+        )
+
+        return (
+            z_failure,
+            hide_score,
+            dilute_score,
+            C_hide,
+            discrepancy
+        )
+
+
+# ============================================================
+# Structural Role Recovery
+# ============================================================
+
+class StructuralRoleRecovery(nn.Module):
+    """
+    Converts structural representation into a
+    node-role recovery signal.
+    """
+
+    def __init__(
+        self,
+        h_feats,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.recovery = nn.Sequential(
+            nn.Linear(h_feats, h_feats),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_feats, h_feats)
+        )
+
+    def forward(self, z_struct):
+
+        return self.recovery(
+            z_struct
+        )
+
+
+# ============================================================
+# Failure-conditioned Gate
+# ============================================================
+
+class FailureConditionedGate(nn.Module):
+
+    def __init__(
+        self,
+        h_feats,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.gate = nn.Sequential(
+            nn.Linear(
+                2 * h_feats + 4,
+                h_feats
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        h_adc,
+        h_struct,
+        h_preserve,
+        C_hide,
+        C_dilute,
+        high_energy,
+        discrepancy
+    ):
+
+        gate_input = torch.cat(
+            [
+                h_struct,
+                h_preserve,
+                C_hide,
+                C_dilute,
+                high_energy.unsqueeze(-1),
+                discrepancy
+            ],
+            dim=-1
+        )
+
+        return self.gate(
+            gate_input
+        )
+
+
+# ============================================================
+# FCR-GNN for Amazon / T-Finance
+# ============================================================
+
+class FCRGNN_amazon(nn.Module):
+
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        struct_dim,
+        d=2,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.g = graph
+        self.h_feats = h_feats
+        self.d = d
+
+        # ====================================================
+        # 1. Original ADC-GNN encoder
+        # ====================================================
+
+        self.thetas = calculate_theta2(d)
+
+        self.num_branches = len(
+            self.thetas
+        )
+
+        self.conv = nn.ModuleList()
+
+        for theta in self.thetas:
+
+            self.conv.append(
+                PolyConv(
+                    h_feats,
+                    h_feats,
+                    theta,
+                    lin=False
+                )
+            )
+
+        self.linear = nn.Linear(
+            in_feats,
+            h_feats
+        )
+
+        self.linear2 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.act = nn.ReLU()
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+        # Original ADC attention
+        self.attention_fc = nn.Linear(
+            h_feats,
+            1
+        )
+
+        # Original ADC fusion
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(
+                2 * h_feats,
+                h_feats
+            ),
+            nn.ReLU(),
+            nn.Linear(
+                h_feats,
+                1
+            ),
+            nn.Sigmoid()
+        )
+
+        # Original residual
+        self.residual_fc = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        self.linear3 = nn.Linear(
+            h_feats,
+            h_feats
+        )
+
+        # ====================================================
+        # 2. New structural branch
+        # ====================================================
+
+        self.struct_encoder = StructuralEncoder(
+            struct_dim,
+            h_feats,
+            dropout
+        )
+
+        # ====================================================
+        # 3. Orthogonal Signal Preservation
+        # ====================================================
+
+        self.orthogonal = OrthogonalSignalPreservation(
+            h_feats,
+            dropout
+        )
+
+        # ====================================================
+        # 4. Failure Characterizer
+        # ====================================================
+
+        self.failure_characterizer = FailureCharacterizer(
+            h_feats,
+            struct_dim,
+            dropout
+        )
+
+        # ====================================================
+        # 5. Structural Role Recovery
+        # ====================================================
+
+        self.struct_recovery = StructuralRoleRecovery(
+            h_feats,
+            dropout
+        )
+
+        # ====================================================
+        # 6. Failure-conditioned Gate
+        # ====================================================
+
+        self.failure_gate = FailureConditionedGate(
+            h_feats,
+            dropout
+        )
+
+        # ====================================================
+        # 7. Final classifier
+        # ====================================================
+
+        self.classifier = nn.Sequential(
+            nn.Linear(
+                h_feats,
+                h_feats
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                h_feats,
+                num_classes
+            )
+        )
+
+    # ========================================================
+    # ADC encoder
+    # ========================================================
+
+    def encode_adc(self, in_feat):
+
+        device = in_feat.device
+
+        # ----------------------------------------------------
+        # h_self = h_pre
+        # ----------------------------------------------------
+
+        h_self = self.linear(
+            in_feat
+        )
+
+        h_self = self.act(
+            h_self
+        )
+
+        h_self = self.linear2(
+            h_self
+        )
+
+        h_self = self.act(
+            h_self
+        )
+
+        h_self = self.dropout(
+            h_self
+        )
+
+        # ----------------------------------------------------
+        # Original residual
+        # ----------------------------------------------------
+
+        res = self.residual_fc(
+            h_self
+        )
+
+        # ----------------------------------------------------
+        # Polynomial branches
+        # ----------------------------------------------------
+
+        branch_outputs = []
+
+        for conv in self.conv:
+
+            h_branch = conv(
+                self.g,
+                h_self
+            )
+
+            branch_outputs.append(
+                h_branch.to(device)
+            )
+
+        h_stack = torch.stack(
+            branch_outputs,
+            dim=1
+        )
+
+        N, B, D = h_stack.shape
+
+        # ----------------------------------------------------
+        # ADC attention
+        # ----------------------------------------------------
+
+        h_flat = h_stack.reshape(
+            -1,
+            D
+        )
+
+        attn_scores = self.attention_fc(
+            h_flat
+        )
+
+        attn_scores = attn_scores.reshape(
+            N,
+            B
+        )
+
+        attn_weights = F.softmax(
+            attn_scores,
+            dim=1
+        )
+
+        attn_weights_expanded = (
+            attn_weights
+            .unsqueeze(-1)
+        )
+
+        attn_fused = torch.sum(
+            h_stack *
+            attn_weights_expanded,
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # Mean fusion
+        # ----------------------------------------------------
+
+        mean_fused = torch.mean(
+            h_stack,
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # Original ADC fusion
+        # ----------------------------------------------------
+
+        fusion_input = torch.cat(
+            [
+                attn_fused,
+                mean_fused
+            ],
+            dim=-1
+        )
+
+        fusion_weight = self.fusion_mlp(
+            fusion_input
+        )
+
+        h_graph = (
+            0.1
+            * fusion_weight
+            * attn_fused
+            +
+            (1.0 - fusion_weight)
+            * mean_fused
+        )
+
+        # ----------------------------------------------------
+        # Preserve original ADC residual
+        # ----------------------------------------------------
+
+        h_adc = h_graph + 0.8 * res
+
+        h_adc = self.linear3(
+            h_adc
+        )
+
+        h_adc = self.act(
+            h_adc
+        )
+
+        h_adc = self.dropout(
+            h_adc
+        )
+
+        return {
+            "h_self": h_self,
+            "h_stack": h_stack,
+            "h_graph": h_graph,
+            "h_adc": h_adc,
+            "attn_weights": attn_weights
+        }
+
+    # ========================================================
+    # High-frequency proxy
+    # ========================================================
+
+    def compute_high_frequency_energy(
+        self,
+        h_self,
+        h_stack
+    ):
+
+        eps = 1e-8
+
+        # The highest-order polynomial branch is used as
+        # a spectral high-frequency proxy.
+        #
+        # We normalize it by the intrinsic signal magnitude.
+
+        h_high = h_stack[:, -1, :]
+
+        high_energy = (
+            h_high.norm(
+                dim=-1
+            )
+            /
+            (
+                h_self.norm(
+                    dim=-1
+                )
+                + eps
+            )
+        )
+
+        return high_energy
+
+    # ========================================================
+    # Forward with auxiliary outputs
+    # ========================================================
+
+    def forward_features(
+        self,
+        in_feat,
+        struct_feat
+    ):
+
+        # ====================================================
+        # ADC
+        # ====================================================
+
+        adc = self.encode_adc(
+            in_feat
+        )
+
+        h_self = adc["h_self"]
+        h_stack = adc["h_stack"]
+        h_graph = adc["h_graph"]
+        h_adc = adc["h_adc"]
+
+        # ====================================================
+        # Structural branch
+        # ====================================================
+
+        z_struct = self.struct_encoder(
+            struct_feat
+        )
+
+        # ====================================================
+        # Orthogonal preservation
+        # ====================================================
+
+        h_perp, h_preserve = self.orthogonal(
+            h_self,
+            h_graph
+        )
+
+        # ====================================================
+        # Structural recovery
+        # ====================================================
+
+        h_struct = self.struct_recovery(
+            z_struct
+        )
+
+        # ====================================================
+        # Spectral evidence
+        # ====================================================
+
+        high_energy = self.compute_high_frequency_energy(
+            h_self,
+            h_stack
+        )
+
+        # ====================================================
+        # Degree / density
+        #
+        # These are graph statistics supplied from preprocessing.
+        # The first two structural dimensions are expected to be:
+        #
+        # struct_feat[:, 0] = degree
+        # struct_feat[:, 1] = density
+        #
+        # We use the raw precomputed values here.
+        # ====================================================
+
+        degree = struct_feat[:, 0]
+
+        density = struct_feat[:, 1]
+
+        # ====================================================
+        # Failure characterization
+        # ====================================================
+
+        (
+            z_failure,
+            hide_score,
+            dilute_score,
+            C_hide,
+            discrepancy
+        ) = self.failure_characterizer(
+            h_self=h_self,
+            h_graph=h_graph,
+            h_preserve=h_preserve,
+            high_energy=high_energy,
+            degree=degree,
+            density=density,
+            z_struct=z_struct
+        )
+
+        # ====================================================
+        # Failure-conditioned gate
+        # ====================================================
+
+        gate = self.failure_gate(
+            h_adc=h_adc,
+            h_struct=h_struct,
+            h_preserve=h_preserve,
+            C_hide=hide_score,
+            C_dilute=dilute_score,
+            high_energy=high_energy,
+            discrepancy=discrepancy
+        )
+
+        # ====================================================
+        # Hidden-signal recovery
+        #
+        # Structural role information is injected here.
+        # ====================================================
+
+        h_hidden = (
+            h_adc
+            +
+            h_struct
+        )
+
+        # ====================================================
+        # Dilution recovery
+        #
+        # Combine original ADC representation with
+        # orthogonally preserved node-specific signal.
+        # ====================================================
+
+        dilution_input = torch.cat(
+            [
+                h_adc,
+                h_preserve
+            ],
+            dim=-1
+        )
+
+        # Lightweight fusion
+        h_diluted = (
+            0.5 * h_adc
+            +
+            0.5 * h_preserve
+        )
+
+        # ====================================================
+        # Failure-conditioned recovery
+        #
+        # gate ~= 1:
+        #       structural / hidden recovery
+        #
+        # gate ~= 0:
+        #       dilution / orthogonal recovery
+        # ====================================================
+
+        h_recover = (
+            gate * h_hidden
+            +
+            (1.0 - gate)
+            * h_diluted
+        )
+
+        return {
+            "h_self": h_self,
+            "h_graph": h_graph,
+            "h_adc": h_adc,
+
+            "h_perp": h_perp,
+            "h_preserve": h_preserve,
+
+            "z_struct": z_struct,
+            "h_struct": h_struct,
+
+            "z_failure": z_failure,
+
+            "C_hide": C_hide,
+            "C_dilute": dilute_score,
+
+            "hide_score": hide_score,
+            "dilute_score": dilute_score,
+
+            "high_energy": high_energy,
+            "discrepancy": discrepancy,
+
+            "gate": gate,
+
+            "h_hidden": h_hidden,
+            "h_diluted": h_diluted,
+            "h_recover": h_recover,
+
+            "attn_weights": adc["attn_weights"]
+        }
+
+    # ========================================================
+    # Standard forward
+    # ========================================================
+
+    def forward(
+        self,
+        in_feat,
+        struct_feat,
+        return_aux=False
+    ):
+
+        features = self.forward_features(
+            in_feat,
+            struct_feat
+        )
+
+        h_recover = features[
+            "h_recover"
+        ]
+
+        logits = self.classifier(
+            h_recover
+        )
+
+        if return_aux:
+
+            features["logits"] = logits
+
+            return features
+
+        return logits
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Đúng, với error analysis thực tế của bạn thì bây giờ mình có thể đề xuất một hướng cụ thể hơn nhiều. Mình đã search lại các công trình 2025–2026, đặc biệt những paper rất mới về camouflage, spectral fraud detection, diffusion, orthogonal disentanglement và dynamic aggregation. Kết luận của mình là:
 
 Không nên làm “ADC-GNN + Hodge”, cũng không nên làm CADD đơn thuần.
