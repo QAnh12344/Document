@@ -1,3 +1,354 @@
+Được. Nếu mục tiêu của bạn là tìm một hướng có xác suất đạt +3–5% cao nhất, thì mình sẽ làm theo kiểu failure-driven research, không code CADD ngay.
+
+ADC-GNN hiện xác định hai vấn đề chính là sparse supervision và representation dilution do camouflaged anomalies, nhưng bản thân diffusion của nó vẫn là feature-space augmentation; paper không chứng minh rằng các FN thực sự tập trung ở một kiểu camouflage cụ thể.
+
+1. Ta sẽ "mổ" ADC-GNN trước
+
+Dùng đúng 3 dataset công khai mà paper dùng làm benchmark chính:
+
+Amazon
+YelpChi
+T-Finance
+
+Không dùng CM vì đó là dataset proprietary.
+
+Mỗi dataset chạy ADC-GNN nguyên bản, giữ nguyên protocol 1% label.
+
+Sau khi train, lấy:
+
+Test nodes
+    │
+    ├── TP: fraud → dự đoán fraud
+    ├── FN: fraud → dự đoán benign   ← QUAN TRỌNG NHẤT
+    ├── TN
+    └── FP
+
+Chúng ta đặc biệt nghiên cứu FN.
+
+2. Với mỗi node, thu 5 nhóm thông tin
+A. Feature camouflage
+
+Tính khoảng cách giữa node và neighborhood:
+
+$$ C^{feat}_i = d(h_i,\operatorname{Agg}_{j\in N(i)}h_j) $$
+
+Có thể dùng cosine distance + Euclidean distance.
+
+Nếu FN có pattern khác TP:
+
+$$ C^{feat}_{FN}\neq C^{feat}_{TP} $$
+
+thì có bằng chứng ADC-GNN đang gặp feature camouflage.
+
+B. Context / relation camouflage
+
+Đo neighborhood của node:
+
+$$ P_i = \frac{\#\text{benign neighbors}} {\#\text{all neighbors}} $$
+
+Ví dụ:
+
+Fraud TP:
+fraud node → 70% fraud neighbors
+
+Fraud FN:
+fraud node → 95% benign neighbors
+
+Nếu FN tập trung ở nhóm thứ hai → context camouflage rất đáng chú ý.
+
+Điều này phù hợp với literature: GNN-LAARA mô tả feature camouflage và relation camouflage là hai nguyên nhân làm neighborhood aggregation làm loãng tín hiệu fraud.
+
+C. Feature–structure inconsistency
+
+Không chỉ hỏi:
+
+node giống hàng xóm bao nhiêu?
+
+Mà hỏi:
+
+feature nói một chuyện, structure nói chuyện khác thế nào?
+
+Ví dụ:
+
+$$ I_i= d( \phi_{feature}(i), \phi_{structure}(i) ) $$
+
+Trong đó structural features có thể gồm:
+
+degree
+local clustering
+neighbor similarity
+k-hop density
+spectral energy
+D. Frequency signature
+
+ADC-GNN đã có spectral branch, nên ta cần kiểm tra:
+
+$$ E_{low},E_{mid},E_{high} $$
+
+của FN so với TP.
+
+Nếu FN đặc biệt tập trung ở high-frequency/mid-frequency region, thì failure mode có thể là:
+
+ADC-GNN vẫn chưa bảo toàn đúng loại irregularity đó.
+
+Khi ấy hướng CADD có thể không phải hướng tốt nhất; ta sẽ thiết kế một hướng spectral khác.
+
+E. Diffusion sensitivity
+
+Đây là test quan trọng nhất cho ý tưởng CADD.
+
+Lấy cùng node:
+
+$$ x_i \rightarrow x_{i,t} $$
+
+với nhiều noise level \(t\).
+
+Đo:
+
+$$ D_i(t)= d( f(x_i), f(x_{i,t}) ) $$
+
+Sau đó so sánh:
+
+TP fraud
+FN fraud
+benign
+
+Nếu FN bị diffusion phá representation mạnh hơn TP:
+
+$$ D_{FN}(t)>D_{TP}(t) $$
+
+thì đây là bằng chứng rất mạnh rằng diffusion hiện tại chưa phù hợp với các fraud node khó.
+
+3. Sau đó chúng ta clustering các FN
+
+Đây mới là phần thú vị.
+
+Thay vì nói chung chung:
+
+"ADC-GNN không tốt ở camouflage."
+
+Ta tạo vector:
+
+$$ z_i= [ C^{feat}_i, P_i, I_i, E^{low}_i, E^{mid}_i, E^{high}_i, D_i(t_1), D_i(t_2),... ] $$
+
+cho tất cả FN fraud.
+
+Sau đó clustering:
+
+                 FN fraud
+                    │
+       ┌────────────┼────────────┐
+       ↓            ↓            ↓
+   Cluster A    Cluster B    Cluster C
+   feature      structural   diffusion
+   camouflage   camouflage   unstable
+
+Ví dụ chúng ta có thể phát hiện:
+
+43% FN = fraud có feature gần benign nhưng structural signature khác biệt.
+
+Đây mới là research finding.
+
+4. Sau đó mới quyết định architecture
+
+Có 3 khả năng.
+
+Case 1 — FN chủ yếu là feature camouflage
+
+→ CADD rất hợp.
+
+Ta làm:
+
+$$ \boxed{ \text{Camouflage-aware directional diffusion} } $$
+
+tức:
+
+$$ \Sigma_i=f( h_i-\operatorname{Agg}(h_{N(i)}) ) $$
+
+và diffusion chỉ thay đổi theo những directions có dấu hiệu camouflage.
+
+Case 2 — FN chủ yếu là relation/context camouflage
+
+Thì không nên làm CADD.
+
+Bởi literature đã có rất nhiều hướng neighbor selection/adaptive aggregation cho vấn đề này. CACO-GNN, CLFS-GNN, GNN-LAARA... đều đã trực tiếp xử lý neighbor/context camouflage.
+
+Khi đó ta tìm một failure mode khác của ADC-GNN.
+
+Case 3 — FN chủ yếu do diffusion phá representation
+
+Đây mới cực kỳ thú vị.
+
+Nếu:
+
+$$ D_{FN}\gg D_{TP} $$
+
+thì câu hỏi nghiên cứu trở thành:
+
+How can diffusion augmentation preserve fraud-discriminative directions while perturbing nuisance directions?
+
+Lúc đó CADD sẽ có cơ sở mạnh hơn rất nhiều.
+
+5. Tôi đặc biệt muốn kiểm tra Case 3
+
+Vì nó gắn trực tiếp với ADC-GNN, thay vì chỉ lấy một vấn đề chung của fraud detection.
+
+Hiện ADC-GNN dùng diffusion để tạo hai noisy views và dùng contrastive learning để ép representation ổn định giữa các perturbations.
+
+Nhưng có một nghịch lý:
+
+$$ \text{Diffusion mạnh} \rightarrow \text{augmentation tốt} $$
+
+nhưng:
+
+$$ \text{Diffusion quá mạnh} \rightarrow \text{fraud signal bị phá} $$
+
+Vậy có thể ADC-GNN đang có:
+
+augmentation–discrimination conflict
+
+đối với một subset fraud khó.
+
+Nếu data analysis chứng minh được điều này, CADD trở nên rất hợp lý:
+
+ADC-GNN
+   │
+   │ isotropic diffusion
+   ↓
+một số fraud signal bị phá
+
+→ chúng ta thay bằng:
+
+Node
+ │
+ ├── discriminative directions
+ │       ↓
+ │   preserve
+ │
+ └── nuisance/camouflage directions
+         ↓
+      perturb
+
+Đây là câu chuyện paper mạnh hơn nhiều so với "thêm topology".
+
+6. Quan trọng: không đặt mục tiêu +3–5% ngay
+
+Mình sẽ đặt go/no-go criteria.
+
+Giai đoạn 1 — baseline
+
+Chạy ADC-GNN:
+
+Amazon
+YelpChi
+T-Finance
+
+ghi:
+
+AUC
+AP
+F1
+Recall
+Giai đoạn 2 — error analysis
+
+Nếu thấy:
+
+$$ \boxed{ \text{FN có một pattern rõ ràng} } $$
+
+→ tiếp tục.
+
+Nếu:
+
+$$ \boxed{ FN không có pattern } $$
+
+→ bỏ CADD.
+
+Giai đoạn 3 — prototype cực nhỏ
+
+Chỉ thêm:
+
+camouflage score
+      ↓
+diffusion gate
+
+chưa làm full anisotropic covariance.
+
+Nếu:
+
+ADC-GNN      AP = X
+ADC+CADD     AP = X + 2~3%
+
+→ mới phát triển thành directional/subspace diffusion.
+
+Nếu:
+
+ADC-GNN      X
+ADC+CADD     X - 1%
+
+→ xem error analysis tại sao fail; nếu không cứu được thì bỏ.
+
+7. Có một lý do mình thích quy trình này
+
+Literature 2025–2026 hiện đã có rất nhiều công trình trực tiếp xử lý camouflage: neighbor selection, adaptive aggregation, feature augmentation, relation aggregation, orthogonal disentanglement...
+
+Vì vậy nếu chúng ta bắt đầu bằng:
+
+"Tôi sẽ làm một model chống camouflage"
+
+thì rất dễ rơi vào incremental work.
+
+Nhưng nếu bắt đầu bằng:
+
+"ADC-GNN thất bại ở đâu? Tại sao? Những FN nào tạo ra failure đó? Diffusion có phải một phần nguyên nhân không?"
+
+rồi mới phát hiện:
+
+"ADC-GNN's isotropic diffusion destroys a particular discriminative subspace in hard fraud nodes."
+
+thì architecture sau đó được sinh ra từ evidence, và câu chuyện novelty sẽ thuyết phục hơn.
+
+Tôi đề xuất chúng ta làm đúng thứ tự này
+                 ADC-GNN BASE
+                      │
+             Amazon/YelpChi/T-Finance
+                      │
+                      ↓
+                Error Analysis
+                      │
+          ┌───────────┼───────────┐
+          ↓           ↓           ↓
+      Feature      Structure    Diffusion
+      failure       failure      failure
+          │           │           │
+          └───────────┴───────────┘
+                      ↓
+              Chọn failure lớn nhất
+                      ↓
+              Thiết kế module mới
+                      ↓
+             Prototype experiment
+                      ↓
+                +3~5% ?
+                 /       \
+               YES        NO
+                │          │
+             full paper   bỏ/sửa
+
+Đây là hướng mình khuyên bạn làm. Không cần commit CADD ngay.
+
+Nếu bạn đã có code ADC-GNN + dữ liệu Amazon/YelpChi/T-Finance, bước tiếp theo mình có thể đi thẳng vào thiết kế script error_analysis.py: chạy sau checkpoint ADC-GNN, tự động tách TP/FN/TN/FP và xuất ra bảng khoảng 15–20 đặc trưng để chúng ta nhìn xem ADC-GNN thực sự fail ở đâu.
+
+
+
+
+
+
+
+
+
+
+
+
 Đúng, nếu mục tiêu là +3–5%, thì ý tưởng mình vừa đề xuất cần nói rõ hơn: nó sửa điểm yếu nào của ADC-GNN, dựa trên paper nào, và contribution mới nằm ở đâu.
 
 Mình vừa kiểm tra lại ADC-GNN và literature 2025–2026. Có một điểm rất quan trọng: ADC-GNN đã tự nhận rằng nó gặp “representation dilution” khi fraud bị camouflage; diffusion hiện tại chỉ perturb feature space, còn spectral attention xử lý hop/relation.
