@@ -24,6 +24,1717 @@ from diffusion import (
 
 
 # ============================================================
+# GMean
+# ============================================================
+
+def compute_gmean(y_true, y_pred):
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    TP = np.sum(
+        (y_true == 1) &
+        (y_pred == 1)
+    )
+
+    TN = np.sum(
+        (y_true == 0) &
+        (y_pred == 0)
+    )
+
+    FP = np.sum(
+        (y_true == 0) &
+        (y_pred == 1)
+    )
+
+    FN = np.sum(
+        (y_true == 1) &
+        (y_pred == 0)
+    )
+
+    recall_pos = (
+        TP / (TP + FN)
+        if (TP + FN) > 0
+        else 0.0
+    )
+
+    recall_neg = (
+        TN / (TN + FP)
+        if (TN + FP) > 0
+        else 0.0
+    )
+
+    return np.sqrt(
+        recall_pos * recall_neg
+    )
+
+
+# ============================================================
+# Recall@K
+# ============================================================
+
+def recall_at_k(y_true, probs):
+
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+
+    # K = number of fraud nodes
+    k = int(
+        np.sum(y_true)
+    )
+
+    if k <= 0:
+        return 0.0
+
+    # Highest predicted fraud probabilities
+    top_k_idx = np.argsort(
+        -probs
+    )[:k]
+
+    detected = np.sum(
+        y_true[top_k_idx]
+    )
+
+    return detected / k
+
+
+# ============================================================
+# Find best validation threshold
+# ============================================================
+
+def get_best_f1(labels, probs):
+
+    if torch.is_tensor(labels):
+        labels = (
+            labels
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    if torch.is_tensor(probs):
+        probs = (
+            probs
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    best_f1 = 0.0
+    best_threshold = 0.5
+
+    for threshold in np.linspace(
+        0.05,
+        0.95,
+        19
+    ):
+
+        preds = (
+            probs[:, 1] > threshold
+        ).astype(np.int64)
+
+        mf1 = f1_score(
+            labels,
+            preds,
+            average='macro',
+            zero_division=0
+        )
+
+        if mf1 > best_f1:
+
+            best_f1 = mf1
+            best_threshold = threshold
+
+    return (
+        best_f1,
+        best_threshold
+    )
+
+
+# ============================================================
+# Build unsupervised structural features
+# ============================================================
+
+def build_structural_features(g):
+
+    device = g.device
+
+    num_nodes = g.num_nodes()
+
+    # --------------------------------------------------------
+    # Degree
+    # --------------------------------------------------------
+
+    try:
+
+        in_degree = (
+            g.in_degrees()
+            .float()
+            .to(device)
+        )
+
+    except Exception:
+
+        in_degree = torch.zeros(
+            num_nodes,
+            device=device
+        )
+
+    try:
+
+        out_degree = (
+            g.out_degrees()
+            .float()
+            .to(device)
+        )
+
+    except Exception:
+
+        out_degree = (
+            in_degree.clone()
+        )
+
+    # --------------------------------------------------------
+    # Log degree
+    # --------------------------------------------------------
+
+    log_in_degree = torch.log1p(
+        in_degree
+    )
+
+    log_out_degree = torch.log1p(
+        out_degree
+    )
+
+    # --------------------------------------------------------
+    # Degree ratio
+    # --------------------------------------------------------
+
+    degree_ratio = (
+        in_degree /
+        (
+            out_degree + 1.0
+        )
+    )
+
+    # --------------------------------------------------------
+    # Degree density
+    # --------------------------------------------------------
+
+    density = (
+        in_degree /
+        max(
+            float(num_nodes - 1),
+            1.0
+        )
+    )
+
+    density = density.clamp(
+        0.0,
+        1.0
+    )
+
+    # --------------------------------------------------------
+    # Structural feature matrix
+    # --------------------------------------------------------
+
+    struct_feat = torch.stack(
+        [
+            log_in_degree,
+            log_out_degree,
+            density,
+            degree_ratio
+        ],
+        dim=1
+    )
+
+    struct_feat = torch.nan_to_num(
+        struct_feat,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    return struct_feat
+
+
+# ============================================================
+# Prepare structural features
+# ============================================================
+
+def prepare_structural_features(g):
+
+    if 'struct_feat' in g.ndata:
+
+        struct_feat = (
+            g.ndata[
+                'struct_feat'
+            ].float()
+        )
+
+        print(
+            "Using existing structural features:",
+            struct_feat.shape
+        )
+
+    else:
+
+        print(
+            "No struct_feat found."
+        )
+
+        print(
+            "Building structural features..."
+        )
+
+        struct_feat = (
+            build_structural_features(
+                g
+            )
+        )
+
+        g.ndata[
+            'struct_feat'
+        ] = struct_feat
+
+        print(
+            "Generated struct_feat:",
+            struct_feat.shape
+        )
+
+    return g
+
+
+# ============================================================
+# Model Wrapper
+# ============================================================
+
+class ModelWrapper(
+    torch.nn.Module
+):
+
+    def __init__(
+        self,
+        base_model,
+        in_feats,
+        h_feats
+    ):
+
+        super().__init__()
+
+        self.base_model = (
+            base_model
+        )
+
+        # ----------------------------------------------------
+        # Diffusion noise prediction head
+        # ----------------------------------------------------
+
+        self.noise_head = (
+            torch.nn.Sequential(
+
+                torch.nn.Linear(
+                    h_feats,
+                    h_feats
+                ),
+
+                torch.nn.ReLU(),
+
+                torch.nn.Linear(
+                    h_feats,
+                    in_feats
+                )
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        t=None,
+        return_aux=False
+    ):
+
+        logits, h_recover, aux = (
+            self.base_model(
+                x,
+                return_aux=True
+            )
+        )
+
+        # ----------------------------------------------------
+        # Predict diffusion noise
+        # ----------------------------------------------------
+
+        noise_pred = (
+            self.noise_head(
+                h_recover
+            )
+        )
+
+        if return_aux:
+
+            return (
+                noise_pred,
+                h_recover,
+                logits,
+                aux
+            )
+
+        return (
+            noise_pred,
+            h_recover
+        )
+
+
+# ============================================================
+# Training
+# ============================================================
+
+def train(
+    model,
+    g,
+    args
+):
+
+    features = (
+        g.ndata['feature']
+    )
+
+    labels = (
+        g.ndata['label']
+        .long()
+    )
+
+    device = (
+        features.device
+    )
+
+    in_feats = (
+        features.shape[1]
+    )
+
+    print()
+    print(
+        "======================================================"
+    )
+    print(
+        "FCR-GNN TRAINING"
+    )
+    print(
+        "======================================================"
+    )
+
+    print(
+        "Input feature dimension:",
+        in_feats
+    )
+
+    print(
+        "Feature shape:",
+        features.shape
+    )
+
+    # ========================================================
+    # Structural features
+    # ========================================================
+
+    g = prepare_structural_features(
+        g
+    )
+
+    print(
+        "Structural feature shape:",
+        g.ndata['struct_feat'].shape
+    )
+
+    # ========================================================
+    # Train / validation / test mask
+    # ========================================================
+
+    if (
+        'train_mask' not in g.ndata
+        or
+        'val_mask' not in g.ndata
+        or
+        'test_mask' not in g.ndata
+    ):
+
+        print(
+            "Masks not found."
+        )
+
+        print(
+            "Creating train/validation/test split..."
+        )
+
+        num_nodes = (
+            labels.shape[0]
+        )
+
+        train_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        val_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        test_mask = torch.zeros(
+            num_nodes,
+            dtype=torch.bool,
+            device=device
+        )
+
+        indices = np.arange(
+            num_nodes
+        )
+
+        labels_np = (
+            labels
+            .cpu()
+            .numpy()
+        )
+
+        # ----------------------------------------------------
+        # Train split
+        # ----------------------------------------------------
+
+        train_idx, rest_idx = (
+            train_test_split(
+                indices,
+                train_size=args.train_ratio,
+                stratify=labels_np,
+                random_state=2
+            )
+        )
+
+        # ----------------------------------------------------
+        # Validation / test split
+        # ----------------------------------------------------
+
+        val_idx, test_idx = (
+            train_test_split(
+                rest_idx,
+                test_size=0.67,
+                stratify=labels_np[
+                    rest_idx
+                ],
+                random_state=2
+            )
+        )
+
+        train_mask[
+            torch.as_tensor(
+                train_idx,
+                device=device
+            )
+        ] = True
+
+        val_mask[
+            torch.as_tensor(
+                val_idx,
+                device=device
+            )
+        ] = True
+
+        test_mask[
+            torch.as_tensor(
+                test_idx,
+                device=device
+            )
+        ] = True
+
+    else:
+
+        train_mask = (
+            g.ndata['train_mask']
+            .to(device)
+        )
+
+        val_mask = (
+            g.ndata['val_mask']
+            .to(device)
+        )
+
+        test_mask = (
+            g.ndata['test_mask']
+            .to(device)
+        )
+
+    print(
+        "Train:",
+        train_mask.sum().item()
+    )
+
+    print(
+        "Validation:",
+        val_mask.sum().item()
+    )
+
+    print(
+        "Test:",
+        test_mask.sum().item()
+    )
+
+    # ========================================================
+    # Class imbalance
+    # ========================================================
+
+    train_labels = (
+        labels[train_mask]
+    )
+
+    n_positive = (
+        (train_labels == 1)
+        .sum()
+        .item()
+    )
+
+    n_negative = (
+        (train_labels == 0)
+        .sum()
+        .item()
+    )
+
+    weight_val = (
+        n_negative /
+        max(n_positive, 1)
+    )
+
+    weight_tensor = torch.tensor(
+        [
+            1.0,
+            weight_val
+        ],
+        dtype=torch.float32,
+        device=device
+    )
+
+    print(
+        "Class weights:",
+        weight_tensor
+    )
+
+    # ========================================================
+    # Diffusion
+    # ========================================================
+
+    betas = make_beta_schedule(
+        schedule="cosine",
+        n_timestep=1500,
+        cosine_s=12e-3
+    )
+
+    diffusion = (
+        GaussianDiffusion(
+            betas
+        )
+        .to(device)
+    )
+
+    print(
+        "Diffusion timesteps:",
+        diffusion.num_timesteps
+    )
+
+    # ========================================================
+    # Optimizer
+    # ========================================================
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+
+    # ========================================================
+    # Best result
+    # ========================================================
+
+    best_val_ap = -1.0
+
+    best_epoch = 0
+
+    best_threshold = 0.5
+
+    final_rec = 0.0
+    final_pre = 0.0
+    final_mf1 = 0.0
+    final_auc = 0.0
+    final_ap = 0.0
+    final_recall_k = 0.0
+    final_gmean = 0.0
+
+    best_pred = None
+
+    # ========================================================
+    # Training
+    # ========================================================
+
+    time_start = time.time()
+
+    for epoch in range(
+        1,
+        args.epoch + 1
+    ):
+
+        model.train()
+
+        # ====================================================
+        # Forward
+        # ====================================================
+
+        (
+            _,
+            h_recover,
+            logits,
+            aux
+        ) = model(
+            features,
+            return_aux=True
+        )
+
+        # ====================================================
+        # Classification loss
+        # ====================================================
+
+        loss_cls = F.cross_entropy(
+            logits[train_mask],
+            labels[train_mask],
+            weight=weight_tensor
+        )
+
+        # ====================================================
+        # Failure condition
+        # ====================================================
+
+        failure_condition = (
+            model.base_model
+            .build_failure_condition(
+                aux
+            )
+        )
+
+        # ====================================================
+        # Diffusion timestep
+        # ====================================================
+
+        num_nodes = (
+            features.shape[0]
+        )
+
+        t = torch.randint(
+            0,
+            diffusion.num_timesteps,
+            (
+                num_nodes,
+            ),
+            device=device
+        )
+
+        # ====================================================
+        # Failure-conditioned diffusion
+        # ====================================================
+
+        loss_diff = (
+            diffusion
+            .p_loss_failure_conditioned(
+                model=model,
+                x_0=features,
+                t=t,
+                failure_condition=failure_condition,
+                lambda_contrast=args.lambda_contrast
+            )
+        )
+
+        # ====================================================
+        # OSP regularization
+        # ====================================================
+
+        cosine_similarity = (
+            F.cosine_similarity(
+                aux['h_preserve'],
+                aux['h_self'],
+                dim=1
+            )
+        )
+
+        loss_osp = (
+            1.0 -
+            cosine_similarity.mean()
+        )
+
+        # ====================================================
+        # Total loss
+        # ====================================================
+
+        total_loss = (
+            loss_cls
+            +
+            args.lambda_diff *
+            loss_diff
+            +
+            args.lambda_osp *
+            loss_osp
+        )
+
+        # ====================================================
+        # Backpropagation
+        # ====================================================
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=5.0
+        )
+
+        optimizer.step()
+
+        # ====================================================
+        # Evaluation
+        # ====================================================
+
+        model.eval()
+
+        with torch.no_grad():
+
+            (
+                _,
+                _,
+                logits_eval,
+                aux_eval
+            ) = model(
+                features,
+                return_aux=True
+            )
+
+            probs = F.softmax(
+                logits_eval,
+                dim=1
+            )
+
+            # =================================================
+            # Validation AP
+            # =================================================
+
+            val_labels = (
+                labels[val_mask]
+                .cpu()
+                .numpy()
+            )
+
+            val_scores = (
+                probs[val_mask, 1]
+                .cpu()
+                .numpy()
+            )
+
+            val_ap = (
+                average_precision_score(
+                    val_labels,
+                    val_scores
+                )
+            )
+
+            # =================================================
+            # Validation threshold
+            # =================================================
+
+            val_f1, threshold = (
+                get_best_f1(
+                    labels[val_mask],
+                    probs[val_mask]
+                )
+            )
+
+            # =================================================
+            # Test
+            # =================================================
+
+            y_true = (
+                labels[test_mask]
+                .cpu()
+                .numpy()
+            )
+
+            y_score = (
+                probs[test_mask, 1]
+                .cpu()
+                .numpy()
+            )
+
+            y_pred = (
+                y_score > threshold
+            ).astype(
+                np.int64
+            )
+
+            # =================================================
+            # Threshold metrics
+            # =================================================
+
+            test_recall = (
+                recall_score(
+                    y_true,
+                    y_pred,
+                    zero_division=0
+                )
+            )
+
+            test_precision = (
+                precision_score(
+                    y_true,
+                    y_pred,
+                    zero_division=0
+                )
+            )
+
+            test_mf1 = (
+                f1_score(
+                    y_true,
+                    y_pred,
+                    average='macro',
+                    zero_division=0
+                )
+            )
+
+            test_gmean = (
+                compute_gmean(
+                    y_true,
+                    y_pred
+                )
+            )
+
+            # =================================================
+            # Ranking metrics
+            # =================================================
+
+            test_auc = (
+                roc_auc_score(
+                    y_true,
+                    y_score
+                )
+            )
+
+            test_ap = (
+                average_precision_score(
+                    y_true,
+                    y_score
+                )
+            )
+
+            test_recall_k = (
+                recall_at_k(
+                    y_true,
+                    y_score
+                )
+            )
+
+        # ====================================================
+        # Checkpoint based on validation AP
+        # ====================================================
+
+        if val_ap > best_val_ap:
+
+            best_val_ap = val_ap
+
+            best_epoch = epoch
+
+            best_threshold = threshold
+
+            final_rec = test_recall
+            final_pre = test_precision
+            final_mf1 = test_mf1
+            final_auc = test_auc
+            final_ap = test_ap
+            final_recall_k = test_recall_k
+            final_gmean = test_gmean
+
+            best_pred = (
+                probs
+                .detach()
+                .cpu()
+            )
+
+            # ------------------------------------------------
+            # Save best model
+            # ------------------------------------------------
+
+            torch.save(
+                {
+                    'epoch': epoch,
+                    'model_state_dict':
+                        model.state_dict(),
+                    'optimizer_state_dict':
+                        optimizer.state_dict(),
+                    'val_ap':
+                        best_val_ap,
+                    'threshold':
+                        best_threshold
+                },
+                f'best_FCRGNN_{args.dataset}.pt'
+            )
+
+        # ====================================================
+        # Log
+        # ====================================================
+
+        print(
+            "Epoch {:03d} | "
+            "Loss {:.4f} | "
+            "Cls {:.4f} | "
+            "Diff {:.4f} | "
+            "ValAP {:.4f} | "
+            "TestAP {:.4f} | "
+            "AUC {:.4f} | "
+            "MF1 {:.4f} | "
+            "R@K {:.4f}".format(
+                epoch,
+                total_loss.item(),
+                loss_cls.item(),
+                loss_diff.item(),
+                val_ap,
+                test_ap,
+                test_auc,
+                test_mf1,
+                test_recall_k
+            )
+        )
+
+        # ====================================================
+        # Save predictions
+        # ====================================================
+
+        if (
+            args.del_ratio == 0
+            and epoch % 20 == 0
+            and best_pred is not None
+        ):
+
+            with open(
+                f'probs_{args.dataset}_FCRGNN',
+                'wb'
+            ) as f:
+
+                pkl.dump(
+                    best_pred.numpy(),
+                    f
+                )
+
+    # ========================================================
+    # Training finished
+    # ========================================================
+
+    time_end = time.time()
+
+    print()
+    print(
+        "======================================================"
+    )
+    print(
+        "TRAINING FINISHED"
+    )
+    print(
+        "======================================================"
+    )
+
+    print(
+        "Time:",
+        time_end - time_start,
+        "seconds"
+    )
+
+    print(
+        "Best epoch:",
+        best_epoch
+    )
+
+    print(
+        "Best validation AP:",
+        best_val_ap
+    )
+
+    print(
+        "Threshold:",
+        best_threshold
+    )
+
+    # ========================================================
+    # Final result
+    # ========================================================
+
+    result = (
+        "REC {:.2f} "
+        "PRE {:.2f} "
+        "MF1 {:.2f} "
+        "AUC {:.2f} "
+        "AP {:.2f} "
+        "Recall@K {:.2f} "
+        "GMean {:.2f}"
+    ).format(
+        final_rec * 100,
+        final_pre * 100,
+        final_mf1 * 100,
+        final_auc * 100,
+        final_ap * 100,
+        final_recall_k * 100,
+        final_gmean * 100
+    )
+
+    print()
+    print(
+        result
+    )
+
+    # ========================================================
+    # Save result
+    # ========================================================
+
+    with open(
+        'result.txt',
+        'a+'
+    ) as f:
+
+        f.write(
+            '{} FCR-GNN | {}\n'.format(
+                args.dataset,
+                result
+            )
+        )
+
+    return (
+        final_mf1,
+        final_auc,
+        final_ap,
+        final_recall_k,
+        final_gmean
+    )
+
+
+# ============================================================
+# Random seed
+# ============================================================
+
+def set_random_seed(seed):
+
+    torch.manual_seed(
+        seed
+    )
+
+    if torch.cuda.is_available():
+
+        torch.cuda.manual_seed(
+            seed
+        )
+
+        torch.cuda.manual_seed_all(
+            seed
+        )
+
+    np.random.seed(
+        seed
+    )
+
+    print(
+        "seed:",
+        seed
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(
+        description='FCR-GNN'
+    )
+
+    # --------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="amazon",
+        help="Dataset name"
+    )
+
+    parser.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.01,
+        help="Training ratio"
+    )
+
+    parser.add_argument(
+        "--hid_dim",
+        type=int,
+        default=64,
+        help="Hidden dimension"
+    )
+
+    parser.add_argument(
+        "--order",
+        type=int,
+        default=2,
+        help="Polynomial order"
+    )
+
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=100,
+        help="Number of epochs"
+    )
+
+    parser.add_argument(
+        "--run",
+        type=int,
+        default=1,
+        help="Number of independent runs"
+    )
+
+    parser.add_argument(
+        "--del_ratio",
+        type=float,
+        default=0.0,
+        help="Deletion ratio"
+    )
+
+    parser.add_argument(
+        "--adj_type",
+        type=str,
+        default="sym",
+        help="Adjacency type"
+    )
+
+    parser.add_argument(
+        "--load_epoch",
+        type=int,
+        default=100,
+        help="Dataset loading epoch"
+    )
+
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="./data",
+        help="Dataset path"
+    )
+
+    # --------------------------------------------------------
+    # Optimization
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.01,
+        help="Learning rate"
+    )
+
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-5,
+        help="Weight decay"
+    )
+
+    # --------------------------------------------------------
+    # FCR-GNN
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--lambda_diff",
+        type=float,
+        default=0.1,
+        help="Diffusion loss weight"
+    )
+
+    parser.add_argument(
+        "--lambda_contrast",
+        type=float,
+        default=0.0,
+        help="Contrastive loss weight"
+    )
+
+    parser.add_argument(
+        "--lambda_osp",
+        type=float,
+        default=0.01,
+        help="OSP regularization weight"
+    )
+
+    # --------------------------------------------------------
+    # Seed
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=72,
+        help="Random seed"
+    )
+
+    args = parser.parse_args()
+
+    # ========================================================
+    # Print configuration
+    # ========================================================
+
+    print()
+    print(
+        "======================================================"
+    )
+
+    print(
+        "FCR-GNN CONFIGURATION"
+    )
+
+    print(
+        "======================================================"
+    )
+
+    print(
+        "Dataset        :",
+        args.dataset
+    )
+
+    print(
+        "Train ratio    :",
+        args.train_ratio
+    )
+
+    print(
+        "Hidden dim     :",
+        args.hid_dim
+    )
+
+    print(
+        "Order          :",
+        args.order
+    )
+
+    print(
+        "Epoch          :",
+        args.epoch
+    )
+
+    print(
+        "Runs           :",
+        args.run
+    )
+
+    print(
+        "Learning rate  :",
+        args.lr
+    )
+
+    print(
+        "Lambda diff    :",
+        args.lambda_diff
+    )
+
+    print(
+        "Lambda OSP     :",
+        args.lambda_osp
+    )
+
+    print(
+        "Seed           :",
+        args.seed
+    )
+
+    # ========================================================
+    # Device
+    # ========================================================
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(
+        "Device:",
+        device
+    )
+
+    # ========================================================
+    # Dataset type
+    # ========================================================
+
+    dataset_name = (
+        args.dataset
+    )
+
+    del_ratio = (
+        args.del_ratio
+    )
+
+    if args.dataset == 'yelp':
+
+        homo = 0
+
+    else:
+
+        homo = args.dataset
+
+    # ========================================================
+    # Load graph
+    # ========================================================
+
+    graph = Dataset(
+        args.load_epoch,
+        dataset_name,
+        del_ratio,
+        homo,
+        args.data_path,
+        adj_type=args.adj_type
+    ).graph
+
+    graph = graph.to(
+        device
+    )
+
+    # ========================================================
+    # Graph information
+    # ========================================================
+
+    print()
+    print(
+        "======================================================"
+    )
+
+    print(
+        "GRAPH INFORMATION"
+    )
+
+    print(
+        "======================================================"
+    )
+
+    print(
+        graph
+    )
+
+    print(
+        "Nodes:",
+        graph.num_nodes()
+    )
+
+    print(
+        "Edges:",
+        graph.num_edges()
+    )
+
+    print(
+        "Feature:",
+        graph.ndata[
+            'feature'
+        ].shape
+    )
+
+    print(
+        "Label:",
+        graph.ndata[
+            'label'
+        ].shape
+    )
+
+    # ========================================================
+    # Feature dimensions
+    # ========================================================
+
+    in_feats = (
+        graph
+        .ndata['feature']
+        .shape[1]
+    )
+
+    num_classes = 2
+
+    h_feats = (
+        args.hid_dim
+    )
+
+    print(
+        "Input dimension:",
+        in_feats
+    )
+
+    print(
+        "Hidden dimension:",
+        h_feats
+    )
+
+    # ========================================================
+    # Check dataset
+    # ========================================================
+
+    if args.dataset != 'amazon':
+
+        raise NotImplementedError(
+            "Current FCR-GNN implementation "
+            "is configured for Amazon."
+        )
+
+    # ========================================================
+    # Prepare structural features
+    # ========================================================
+
+    graph = prepare_structural_features(
+        graph
+    )
+
+    # ========================================================
+    # Multiple runs
+    # ========================================================
+
+    final_mf1s = []
+    final_aucs = []
+    final_aps = []
+    final_recall_ks = []
+    final_gmeans = []
+
+    for run_id in range(
+        args.run
+    ):
+
+        print()
+        print(
+            "======================================================"
+        )
+
+        print(
+            "RUN {}/{}".format(
+                run_id + 1,
+                args.run
+            )
+        )
+
+        print(
+            "======================================================"
+        )
+
+        # ----------------------------------------------------
+        # Seed
+        # ----------------------------------------------------
+
+        if args.run == 1:
+
+            current_seed = (
+                args.seed
+            )
+
+        else:
+
+            current_seed = (
+                args.seed +
+                run_id
+            )
+
+        set_random_seed(
+            current_seed
+        )
+
+        # ----------------------------------------------------
+        # FCR-GNN model
+        # ----------------------------------------------------
+
+        base_model = FCRGNN_amazon(
+            in_feats=in_feats,
+            h_feats=h_feats,
+            num_classes=num_classes,
+            graph=graph,
+            d=args.order,
+            dropout=0.2,
+            struct_dim=4
+        )
+
+        base_model = (
+            base_model
+            .to(device)
+        )
+
+        # ----------------------------------------------------
+        # Wrapper
+        # ----------------------------------------------------
+
+        model = ModelWrapper(
+            base_model=base_model,
+            in_feats=in_feats,
+            h_feats=h_feats
+        )
+
+        model = (
+            model
+            .to(device)
+        )
+
+        # ----------------------------------------------------
+        # Train
+        # ----------------------------------------------------
+
+        (
+            mf1,
+            auc,
+            ap,
+            recall_k,
+            gmean
+        ) = train(
+            model,
+            graph,
+            args
+        )
+
+        # ----------------------------------------------------
+        # Save
+        # ----------------------------------------------------
+
+        final_mf1s.append(
+            mf1
+        )
+
+        final_aucs.append(
+            auc
+        )
+
+        final_aps.append(
+            ap
+        )
+
+        final_recall_ks.append(
+            recall_k
+        )
+
+        final_gmeans.append(
+            gmean
+        )
+
+    # ========================================================
+    # Multi-run results
+    # ========================================================
+
+    if args.run > 1:
+
+        final_mf1s = np.asarray(
+            final_mf1s
+        )
+
+        final_aucs = np.asarray(
+            final_aucs
+        )
+
+        final_aps = np.asarray(
+            final_aps
+        )
+
+        final_recall_ks = np.asarray(
+            final_recall_ks
+        )
+
+        final_gmeans = np.asarray(
+            final_gmeans
+        )
+
+        print()
+        print(
+            "======================================================"
+        )
+
+        print(
+            "FINAL {}-RUN RESULTS".format(
+                args.run
+            )
+        )
+
+        print(
+            "======================================================"
+        )
+
+        print(
+            "MF1      : {:.2f} ± {:.2f}".format(
+                100 * np.mean(final_mf1s),
+                100 * np.std(final_mf1s)
+            )
+        )
+
+        print(
+            "AUC      : {:.2f} ± {:.2f}".format(
+                100 * np.mean(final_aucs),
+                100 * np.std(final_aucs)
+            )
+        )
+
+        print(
+            "AP       : {:.2f} ± {:.2f}".format(
+                100 * np.mean(final_aps),
+                100 * np.std(final_aps)
+            )
+        )
+
+        print(
+            "Recall@K : {:.2f} ± {:.2f}".format(
+                100 * np.mean(final_recall_ks),
+                100 * np.std(final_recall_ks)
+            )
+        )
+
+        print(
+            "GMean    : {:.2f} ± {:.2f}".format(
+                100 * np.mean(final_gmeans),
+                100 * np.std(final_gmeans)
+            )
+        )
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+import argparse
+import time
+import pickle as pkl
+import numpy as np
+
+from dataset import Dataset
+from FCRGNN import FCRGNN_amazon
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    f1_score,
+    recall_score,
+    precision_score,
+    roc_auc_score,
+    average_precision_score
+)
+
+from diffusion import (
+    GaussianDiffusion,
+    make_beta_schedule
+)
+
+
+# ============================================================
 # Utility
 # ============================================================
 
