@@ -1,3 +1,704 @@
+Đúng, với error analysis thực tế của bạn thì bây giờ mình có thể đề xuất một hướng cụ thể hơn nhiều. Mình đã search lại các công trình 2025–2026, đặc biệt những paper rất mới về camouflage, spectral fraud detection, diffusion, orthogonal disentanglement và dynamic aggregation. Kết luận của mình là:
+
+Không nên làm “ADC-GNN + Hodge”, cũng không nên làm CADD đơn thuần.
+
+Hướng đáng làm hơn là một failure-conditioned dual-path model: mô hình trước tiên xác định node đang gặp “signal hiding” hay “signal dilution”, sau đó dùng hai cơ chế phục hồi khác nhau, và diffusion của ADC-GNN trở thành thành phần được điều khiển bởi failure type.
+
+Mình sẽ giải thích từ đầu.
+
+1. Phát hiện của bạn thực sự rất quan trọng
+
+Bạn đã phân cụm FN của ADC-GNN và có:
+
+Cluster 1 — 40.9%
+72 node
+cosine(node, neighbors) = 0.9901
+95.8% neighbors là normal
+feature của fraud gần như giống hệt neighborhood
+spectral attention gần như mất tác dụng
+
+Đây là:
+
+$$ \boxed{\text{Signal Hiding}} $$
+
+Fraud không còn biểu hiện rõ trong feature space và lại nằm giữa normal neighbors.
+
+Cluster 2 — 35.8%
+63 node
+cosine = 0.0993
+high-frequency = 87.15
+clustering coefficient = 0.8402
+degree cao
+
+Đây hoàn toàn ngược lại.
+
+Fraud có tín hiệu rất mạnh, đặc biệt là high-frequency:
+
+$$ \boxed{\text{Signal Dilution}} $$
+
+Nhưng neighborhood quá lớn/dense khiến message passing trộn tín hiệu cá nhân vào một representation trung bình.
+
+Hai cluster chiếm:
+
+$$ 40.9+35.8=\boxed{76.7\%} $$
+
+FN.
+
+Đây là điểm rất mạnh để xây research question.
+
+2. Và literature mới nhất xác nhận hai failure này
+
+ADC-GNN chính nó đã xác định:
+
+spatial message passing có thể làm camouflaged anomalies bị oversmooth/dilute;
+spectral filtering có thể làm mất mid/high-frequency fraud irregularities.
+
+Nhưng sau khi ADC-GNN ra đời, các paper 2026 đã đi tiếp theo nhiều hướng.
+
+GNN-LAARA — 2026
+
+Paper này xác định feature camouflage + relation camouflage là hai cách khai thác chính điểm yếu của neighborhood aggregation. Nó dùng CVAE + neighbor selector + adaptive relation aggregation. Báo cáo tăng AUC tới 2.24%.
+
+→ Vì vậy chỉ làm “camouflage-aware aggregation” là chưa đủ mới.
+
+F-GNN — Neural Networks 2026
+
+F-GNN trực tiếp tách frequency và dùng node-adaptive spectral gating để giữ high-frequency fraud signal. Nó đánh chính vào loại failure gần Cluster 2 của bạn.
+
+→ Vì vậy “Cluster 2 → thêm high-pass filter” cũng chưa đủ mới.
+
+McGAD — Information Processing & Management 2026
+
+McGAD dùng structural consistency augmentation + heat-wavelet diffusion để tìm những node có structural role tương đồng, nhằm xử lý feature camouflage và sparse labels.
+
+→ Vì vậy “Cluster 1 → thêm structural diffusion” cũng đã có hướng gần đó.
+
+PROD — Knowledge-Based Systems 2026
+
+Đây là paper mình đặc biệt chú ý cho hướng của bạn.
+
+PROD dùng:
+
+risk-aware encoding + projection-based orthogonal disentanglement
+
+để tách tín hiệu liên quan camouflage khỏi representation, và báo cáo tới 17.8% relative AP improvement trên một financial transaction network.
+
+Đây là một công nghệ rất mới mà mình nghĩ có thể mượn nguyên lý, nhưng không copy architecture.
+
+HDN-GFD — August 2026
+
+Đây còn mới hơn: paper xuất bản 27/08/2026.
+
+Nó dùng:
+
+hypergraph;
+high-order relationships;
+anomaly-probability-guided dynamic aggregation;
+tách benign/fraud neighborhood aggregation.
+
+Nó cũng trực tiếp nói đến feature homogenization + structural camouflage + signal dilution.
+
+→ Vì vậy mình không khuyên bạn làm hypergraph + dynamic aggregation, vì rất dễ đụng HDN-GFD.
+
+3. Vậy ý tưởng mới mình đề xuất là gì?
+
+Tên tạm:
+
+Failure-Conditioned Dual-Path Diffusion GNN
+
+Viết tắt có thể là:
+
+FCD²-GNN
+
+Ý tưởng trung tâm:
+
+$$ \boxed{ \text{Không phải mọi fraud node đều cần được xử lý giống nhau.} } $$
+
+ADC-GNN hiện tại:
+
+Node
+ ↓
+Diffusion
+ ↓
+Spectral GNN
+ ↓
+Prediction
+
+Ta đổi thành:
+
+                         Node
+                           │
+                   Failure Analyzer
+                           │
+             ┌─────────────┴─────────────┐
+             ↓                           ↓
+       Signal Hiding               Signal Dilution
+       Cluster-1 type               Cluster-2 type
+             ↓                           ↓
+    Hidden-signal recovery       Signal-preserving
+       + structural role           node-centric path
+             ↓                           ↓
+       selective diffusion        orthogonal residual
+             └─────────────┬─────────────┘
+                           ↓
+                     ADC-GNN backbone
+                           ↓
+                       prediction
+
+Đây không phải hai model độc lập.
+
+Điểm mới là model học cách xác định failure mechanism rồi routing representation qua cơ chế phù hợp.
+
+4. Nhánh 1: giải quyết Cluster 1
+Problem
+
+Cluster 1:
+
+$$ \cos(x_i,N_i)=0.9901 $$
+
+Nên:
+
+$$ x_i-\bar{x}_{N_i}\approx0 $$
+
+Do đó ý tưởng CADD cũ của mình:
+
+$$ d_i=x_i-\bar{x}_{N_i} $$
+
+không đủ dùng cho Cluster 1.
+
+Đây là lý do mình thay đổi thiết kế.
+
+Ta không tìm "feature difference"
+
+Mà tìm:
+
+structural role discrepancy
+
+Tức là:
+
+node này trông giống normal về feature, nhưng nó đang đóng một vai trò cấu trúc khác normal như thế nào?
+
+Tạo structural signature:
+
+$$ r_i= [ degree, clustering, k\text{-hop density}, spectral energy, motif/structural statistics ]. $$
+
+Sau đó học:
+
+$$ z_i^{struct}=f(r_i). $$
+
+Đây lấy cảm hứng từ structural consistency augmentation của McGAD, nhưng ta không dùng nó để tạo một augmentation model độc lập.
+
+Ta dùng structural signature như evidence để phục hồi một fraud node mà feature space đã bị camouflage.
+
+5. Nhưng cần thêm một thứ: sparse fraud prototype
+
+Bạn chỉ có 1% labels.
+
+Do đó ta có:
+
+$$ P_F = \operatorname{mean} \{h_j:y_j=1,j\in L\} $$
+
+và:
+
+$$ P_N = \operatorname{mean} \{h_j:y_j=0,j\in L\}. $$
+
+Với node \(i\):
+
+$$ s_i^F = \operatorname{sim}(r_i,P_F^r) - \operatorname{sim}(r_i,P_N^r). $$
+
+Điểm này rất quan trọng.
+
+Vì Cluster 1:
+
+$$ x_i\approx x_N $$
+
+nhưng có thể:
+
+$$ r_i\neq r_N. $$
+
+Tức:
+
+feature camouflage nhưng structural role chưa chắc camouflage hoàn toàn.
+
+Đây chính là information mà ADC-GNN hiện tại chưa explicitly khai thác.
+
+6. Nhánh 2: Cluster 2
+
+Đây mới là nhánh mình kỳ vọng đóng góp performance mạnh nhất.
+
+Bạn có:
+
+$$ \cos=0.0993 $$
+
+và:
+
+$$ E_{high}=87.15. $$
+
+Tức là:
+
+Fraud signal đang rất rõ.
+
+Vấn đề là GNN làm mất nó.
+
+Không aggregate tất cả vào một embedding
+
+Ta tách:
+
+$$ h_i^{self}=f(x_i) $$
+
+và:
+
+$$ h_i^{nbr}=AGG(\{h_j:j\in N_i\}). $$
+
+Sau đó không để \(h_i^{self}\) bị hòa vào neighborhood.
+
+Ta tạo:
+
+$$ h_i^{preserve} = h_i^{self} - \operatorname{Proj}_{h_i^{nbr}}(h_i^{self}). $$
+
+Đây chính là chỗ mình muốn sử dụng orthogonal disentanglement.
+
+Ý tưởng này lấy cảm hứng từ PROD 2026, nơi projection-based orthogonal disentanglement được dùng để tách camouflage-induced heterophily. Nhưng ở đây ta áp dụng nó vào một vấn đề khác:
+
+tách intrinsic fraud signal khỏi neighborhood contamination trước khi fusion với ADC-GNN.
+
+7. Vì sao orthogonal projection rất hợp với Cluster 2?
+
+Giả sử:
+
+$$ h_i^{self} = \underbrace{s_i}_{fraud\ signal} + \underbrace{c_i}_{context} $$
+
+Neighborhood:
+
+$$ h_i^{nbr}\approx c_i. $$
+
+Ta muốn:
+
+$$ s_i\perp c_i. $$
+
+Dùng:
+
+$$ s_i= h_i^{self} - \operatorname{Proj}_{h_i^{nbr}}(h_i^{self}). $$
+
+Khi đó:
+
+              h_self
+                ●
+               /|
+              / |
+             /  | s_i
+            /   |
+       c_i ●----→
+
+Ta giữ phần không giải thích được bởi neighborhood.
+
+Cluster 2 có high-frequency rất cao → khả năng phần residual này chính là nơi chứa anomaly signal.
+
+8. Đây khác F-GNN
+
+F-GNN nói:
+
+high-frequency signal có giá trị → học node-adaptive spectral gate.
+
+Còn chúng ta nói:
+
+high-frequency signal của một số node đã tồn tại nhưng bị neighborhood representation nuốt mất → trước tiên tách intrinsic signal khỏi contextual component bằng orthogonal decomposition.
+
+Tức:
+
+$$ \boxed{ F\text{-GNN}: \text{frequency selection} } $$
+
+còn:
+
+$$ \boxed{ FCD^2\text{-GNN}: \text{signal decomposition + failure-conditioned routing} } $$
+
+Đây là khác biệt quan trọng.
+
+9. Vậy diffusion của ADC-GNN để làm gì?
+
+Đây mới là phần khiến mình nghĩ architecture này có thể thành paper mới, thay vì chỉ là một GNN aggregation paper.
+
+ADC-GNN đã có diffusion.
+
+Ta không bỏ nó.
+
+Nhưng thay vì:
+
+$$ x\rightarrow Diffusion(x) $$
+
+ta đưa representation sau recovery vào diffusion:
+
+$$ x \rightarrow \begin{cases} \text{hidden-signal recovery}\\ \text{signal-preserving recovery} \end{cases} \rightarrow \text{adaptive diffusion}. $$
+10. Diffusion cũng được điều khiển bởi failure type
+
+Đây là phần mình muốn gọi:
+
+Failure-Conditioned Diffusion
+
+Ta có gate:
+
+$$ g_i= \sigma( MLP( C_i^{camouflage}, C_i^{dilution}, E_i^{high}, degree_i )). $$
+
+Sau đó:
+
+$$ x_{i,t} = \sqrt{\bar\alpha_t}x_i+ \sqrt{1-\bar\alpha_t} \Sigma_i^{1/2}\epsilon_i. $$
+
+Trong đó:
+
+$$ \Sigma_i= g_i\Sigma_i^{hidden} + (1-g_i)\Sigma_i^{diluted}. $$
+
+Nghĩa là:
+
+Cluster 1
+$$ g_i\approx1 $$
+
+→ diffusion ưu tiên recover hidden representation.
+
+Cluster 2
+$$ g_i\approx0 $$
+
+→ diffusion ưu tiên preserve intrinsic signal.
+
+11. Và đây là chỗ mình thấy research question rất đẹp
+
+ADC-GNN hiện tại giả định:
+
+diffusion augmentation có thể làm representation robust.
+
+Nhưng error analysis của bạn cho thấy:
+
+không phải mọi error đều giống nhau.
+
+Có node:
+
+$$ \boxed{\text{signal is hidden}} $$
+
+và có node:
+
+$$ \boxed{\text{signal is destroyed by aggregation}} $$
+
+Vậy research question mới:
+
+Can diffusion-guided graph fraud detection adapt its representation recovery strategy to the underlying failure mechanism of each fraudulent node?
+
+Đây mạnh hơn:
+
+"Let's add Hodge."
+
+12. Architecture hoàn chỉnh
+
+Mình hình dung như này:
+
+                         Graph G, X
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ ADC-GNN encoder │
+                    └────────┬────────┘
+                             │
+                 preliminary node embedding
+                             │
+                             ▼
+                ┌────────────────────────┐
+                │ Failure Characterizer  │
+                │                        │
+                │ feature-context gap    │
+                │ neighborhood purity    │
+                │ degree / density       │
+                │ spectral energy        │
+                │ structural signature   │
+                └───────────┬────────────┘
+                            │
+                 ┌──────────┴───────────┐
+                 ▼                      ▼
+          Hidden-signal             Diluted-signal
+             score                     score
+                 │                      │
+                 ▼                      ▼
+       Structural/prototype       Self-context
+            recovery              decomposition
+                 │                      │
+                 ▼                      ▼
+       structural residual       orthogonal residual
+                 │                      │
+                 └──────────┬───────────┘
+                            ▼
+                  Failure-conditioned
+                       diffusion
+                            │
+                            ▼
+                ADC spectral attention
+                            │
+                            ▼
+                    Adaptive fusion
+                            │
+                            ▼
+                       classifier
+13. Nó khắc phục chính xác hạn chế nào của ADC-GNN?
+ADC-GNN limitation	Evidence từ error analysis	Module mới
+Feature camouflage	C1 cosine 0.9901	structural/prototype recovery
+Normal-neighbor domination	C1 95.8% normal	structural-role evidence
+Neighborhood dilution	C2 degree cao	self-preserving path
+High-frequency signal bị mất	C2 HF = 87.15	orthogonal residual
+Một diffusion schedule cho nhiều failure	C1/C2 hoàn toàn khác nhau	failure-conditioned diffusion
+Spectral attention không cứu được C1	C1 spectral attention inactive	structural branch trước spectral GNN
+
+Đây là câu chuyện rất coherent.
+
+14. Công nghệ 2026 nào mình đang "mượn"?
+
+Mình sẽ không nói là "dùng công nghệ mới X rồi ghép vào", mà là lấy nguyên lý mới nhất làm building block.
+
+① Orthogonal disentanglement — PROD 2026
+
+PROD dùng projection-based orthogonal disentanglement để tách camouflage-induced heterophily.
+
+Ta dùng nguyên lý:
+
+$$ \text{signal} \perp \text{contamination} $$
+
+nhưng áp dụng cho:
+
+$$ \boxed{\text{intrinsic fraud signal vs neighborhood contamination}} $$
+② Structural consistency — McGAD 2026
+
+McGAD dùng structural embeddings/heat-wavelet diffusion để tìm nodes có structural consistency ngay cả khi feature-space similarity không đủ.
+
+Ta dùng:
+
+$$ \boxed{\text{structural role recovery}} $$
+
+cho Cluster 1.
+
+③ Node-adaptive frequency — F-GNN 2026
+
+F-GNN chứng minh rằng high-frequency fraud signal cần được xử lý node-adaptively.
+
+Ta không copy spectral gate, mà dùng high-frequency energy làm một phần failure characterization và signal-preservation gate.
+
+④ ADC-GNN diffusion
+
+ADC-GNN cung cấp:
+
+$$ \boxed{\text{feature-space diffusion + contrastive learning + spectral attention}} $$
+
+làm backbone.
+
+Ta thay đổi vai trò của diffusion:
+
+từ augmentation chung → failure-conditioned representation recovery.
+
+15. Có bị HDN-GFD 2026 đụng không?
+
+Đây là thứ mình đã kiểm tra rất kỹ.
+
+HDN-GFD vừa xuất bản tháng 8/2026 đã làm:
+
+hypergraph + anomaly probability + dynamic neighborhood aggregation.
+
+Do đó không nên làm:
+
+ADC-GNN + hypergraph + dynamic neighbor aggregation.
+
+Nhưng FCD²-GNN khác ở chỗ:
+
+$$ \boxed{ \text{không chủ yếu thay đổi graph aggregation} } $$
+
+mà:
+
+$$ \boxed{ \text{phân tích failure} \rightarrow \text{tách intrinsic/context representation} \rightarrow \text{điều khiển diffusion} } $$
+
+Đây là điểm mình sẽ bảo vệ về novelty.
+
+16. Còn Cluster 1 có khả năng tăng 3–5% không?
+
+Mình không kỳ vọng Cluster 1 tự nó mang lại +5%.
+
+Vì:
+
+$$ \cos=0.9901 $$
+
+quá cực đoan.
+
+Thông tin feature gần như bị mất.
+
+Nhưng Cluster 2 thì khác.
+
+Bạn có:
+
+$$ E_{high}=87.15 $$
+
+nghĩa là information vẫn còn đó.
+
+Vấn đề là model không giữ được nó.
+
+Đây là loại failure mà architecture có khả năng sửa trực tiếp.
+
+17. Vì vậy target thực nghiệm của mình sẽ là
+
+Không phải:
+
+"Model phải +5% trên mọi dataset."
+
+Mà:
+
+Overall
+$$ \text{AP/AUC}: +3\%-5\% $$
+Hard fraud subset
+$$ \text{Recall}_{C2} \gg \text{Recall}_{ADC} $$
+C1
+$$ \text{Recall}_{C1} > \text{Recall}_{ADC} $$
+
+nhưng có thể nhỏ hơn C2.
+
+Và quan trọng nhất:
+
+$$ \boxed{ \text{AP improvement} } $$
+
+chứ không chỉ F1.
+
+18. Một điểm cực kỳ quan trọng trước khi code
+
+Mình chưa chốt architecture 100%.
+
+Có một experiment phải làm trước:
+
+Với Cluster 2:
+
+so sánh
+
+$$ h_i^{self} $$
+
+vs
+
+$$ h_i^{1-hop} $$
+
+vs
+
+$$ h_i^{2-hop} $$
+
+vs
+
+$$ h_i^{ADC} $$
+
+Nếu thực sự:
+
+$$ \text{separation}(h^{self}) > \text{separation}(h^{1-hop}) > \text{separation}(h^{2-hop}) $$
+
+thì ta có bằng chứng trực tiếp rằng:
+
+message passing đang phá high-frequency fraud signal.
+
+Khi đó orthogonal residual branch có cơ sở rất mạnh.
+
+19. Còn với Cluster 1
+
+Ta test:
+
+$$ \text{feature similarity} $$
+
+so với:
+
+$$ \text{structural similarity}. $$
+
+Nếu:
+
+$$ feature\ similarity\approx1 $$
+
+nhưng:
+
+$$ structural\ similarity $$
+
+vẫn phân biệt được fraud/normal, thì structural recovery branch có lý do tồn tại.
+
+Nếu cả feature lẫn structural role đều indistinguishable, thì Cluster 1 gần như không thể giải quyết bằng representation learning thông thường; lúc đó không nên cố ép model.
+
+20. Kết luận của mình sau deep search
+
+Nếu chỉ xét các ý tưởng chúng ta đã bàn:
+
+❌ Không chọn
+
+ADC + Hodge
+
+→ higher-order/simplicial đã khá đông.
+
+❌ Không chọn
+
+ADC + adaptive high-frequency filter
+
+→ F-GNN 2026 đã rất gần.
+
+❌ Không chọn
+
+ADC + dynamic neighbor filtering
+
+→ GNN-LAARA và HDN-GFD đã làm rất trực tiếp.
+
+❌ Không chọn
+
+ADC + topology diffusion
+
+→ hướng relation/topology diffusion đã có trước đó.
+
+⚠️ Không chọn CADD đơn thuần
+
+Vì Cluster 1:
+
+$$ h_i-\bar h_N\approx0 $$
+
+nên camouflage-direction không đủ thông tin.
+
+✅ Hướng mình đánh giá đáng làm nhất hiện tại
+$$ \boxed{ \textbf{Failure-Conditioned Dual-Path Diffusion GNN} } $$
+
+với 3 contribution chính:
+
+Contribution 1
+
+Failure characterization
+
+Phân biệt:
+
+$$ \text{signal hiding} \quad vs \quad \text{signal dilution}. $$
+Contribution 2
+
+Dual-path signal recovery
+
+$$ \text{structural/prototype recovery} $$
+
+cho C1 và:
+
+$$ \text{orthogonal self-context decomposition} $$
+
+cho C2.
+
+Contribution 3
+
+Failure-conditioned diffusion
+
+ADC-GNN diffusion không còn áp dụng một augmentation strategy cho mọi node, mà diffusion mechanism được điều khiển bởi failure state.
+
+Và điều mình thích nhất ở hướng này là nó xuất phát trực tiếp từ 76.7% FN mà bạn vừa phân tích, chứ không phải mình chọn một công nghệ 2026 rồi cố nhét vào ADC-GNN. Các paper 2026 như PROD, F-GNN, McGAD và HDN-GFD cho thấy từng mảnh của vấn đề này đang là hướng nghiên cứu nóng, nhưng cách dùng chúng để điều khiển “failure-conditioned diffusion” của ADC-GNN vẫn là một hypothesis mới cần kiểm chứng, không phải mình tuyên bố đã có novelty chắc chắn.
+
+Bước tiếp theo mình khuyên làm không phải code model ngay: mình sẽ thiết kế cho bạn 4 thí nghiệm rất cụ thể để chứng minh C1 và C2 thực sự cần hai cơ chế khác nhau, rồi từ kết quả đó mới chốt công thức loss + architecture + ablation. Nếu 4 test đó pass, lúc ấy mình mới nghĩ việc code full model là đáng.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Được. Nếu mục tiêu của bạn là tìm một hướng có xác suất đạt +3–5% cao nhất, thì mình sẽ làm theo kiểu failure-driven research, không code CADD ngay.
 
 ADC-GNN hiện xác định hai vấn đề chính là sparse supervision và representation dilution do camouflaged anomalies, nhưng bản thân diffusion của nó vẫn là feature-space augmentation; paper không chứng minh rằng các FN thực sự tập trung ở một kiểu camouflage cụ thể.
