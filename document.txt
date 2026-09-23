@@ -1,3 +1,526 @@
+Đúng, tôi nói lại từ đầu theo kiểu một ý tưởng paper hoàn chỉnh, không nói lan sang quá nhiều công nghệ.
+
+Ý tưởng tôi đề xuất: chặn sự “khuếch tán sai” của tín hiệu fraud trong GNN
+1. Nó khắc phục lỗi gì?
+
+Lỗi gốc: ADC-GNN dùng graph propagation để trộn thông tin của các node lân cận. Nhưng trong fraud graph, không phải hàng xóm nào cũng nên truyền thông tin cho nhau với cùng mức độ.
+
+Có hai hậu quả:
+
+A. Fraud signal bị pha loãng — signal dilution
+
+Ví dụ:
+
+        Normal
+          │
+Normal ─ FRAUD ─ Normal
+          │
+        Normal
+
+Node FRAUD có representation:
+
+$$ h_F $$
+
+Các node xung quanh có:
+
+$$ h_1,h_2,h_3,h_4 $$
+
+ADC propagation sẽ tạo kiểu:
+
+$$ h_F' \approx \alpha h_F+ \beta_1h_1+\beta_2h_2+\cdots $$
+
+Nếu đa số hàng xóm là normal:
+
+$$ h_F' \rightarrow h_{normal} $$
+
+→ đặc trưng fraud bị làm phẳng.
+
+B. Fraud signal lan sang node bình thường — contamination
+
+Chiều ngược lại:
+
+             FRAUD
+               │
+               ▼
+NORMAL ───── NORMAL
+
+Fraud representation được truyền sang normal node:
+
+$$ h_N' = \alpha h_N+\beta h_F $$
+
+→ normal node bị “nhiễm” thông tin fraud.
+
+2. Tại sao ADC-GNN dễ gặp chuyện này?
+
+Bởi vì bản chất graph convolution có dạng:
+
+$$ H^{(l+1)}=P(A)H^{(l)} $$
+
+Nó giống một quá trình diffusion.
+
+Trong vật lý:
+
+diffusion làm chất từ vùng nồng độ cao lan sang vùng nồng độ thấp.
+
+Trong GNN:
+
+graph propagation làm feature từ node này lan sang node khác.
+
+Nếu fraud là một vùng tín hiệu “sắc”:
+
+normal normal normal
+       ↓
+      FRAUD
+       ↑
+normal normal normal
+
+thì diffusion có xu hướng:
+
+normal → less normal → fraud
+
+và ngược lại.
+
+Cuối cùng boundary bị mất.
+
+Đây chính là liên hệ với over-smoothing: các node kết nối với nhau trở nên quá giống nhau.
+
+Các nghiên cứu gần đây trong graph anomaly detection và graph PDE đang khai thác chính vấn đề này; ví dụ các mô hình reaction–diffusion và TV-based graph propagation được thiết kế để tránh việc diffusion đơn thuần làm mất các cấu trúc sắc nét.
+
+3. Vậy ý tưởng mới của chúng ta là gì?
+
+Tôi không muốn thêm một module:
+
+ADC
+ ↓
+detect failure
+ ↓
+recover
+
+Mà sửa ngay phương trình propagation.
+
+Tên tạm:
+
+Flux-Limited Anisotropic ADC-GNN
+
+Ý tưởng:
+
+Không cho mọi edge truyền feature tự do. Mỗi edge có một “flux” riêng, và flux sẽ tự giảm khi propagation qua edge đó có nguy cơ làm mất boundary fraud.
+
+4. Thay đổi quan trọng nhất
+
+ADC-GNN bình thường có thể hình dung:
+
+$$ h_i^{l+1} = \sum_{j\in N(i)} w_{ij}h_j^l $$
+
+Trong đó graph quyết định:
+
+$$ w_{ij} $$
+
+Nhưng chúng ta thêm một flux limiter:
+
+$$ \boxed{ h_i^{l+1} = h_i^l+ \sum_{j\in N(i)} \Phi_{ij} } $$
+
+với:
+
+$$ \Phi_{ij} = w_{ij} \underbrace{\lambda_{ij}}_{\text{flux limiter}} (h_j-h_i) $$
+
+Trong đó:
+
+$$ 0\leq\lambda_{ij}\leq1 $$
+
+là mức độ cho phép information đi qua edge \(i-j\).
+
+5. Flux limiter quyết định cái gì?
+
+Nó trả lời câu hỏi:
+
+“Edge này có nên để information diffusion mạnh qua hay không?”
+
+Ví dụ:
+
+Edge 1
+Normal ─ Normal
+
+Hai node tương đối giống nhau:
+
+$$ \|h_i-h_j\|\approx0 $$
+
+→ cho phép propagation:
+
+$$ \lambda_{ij}\approx1 $$
+Edge 2
+Normal ─ FRAUD
+
+Hai node rất khác nhau:
+
+$$ \|h_i-h_j\|\gg0 $$
+
+→ có khả năng đây là boundary quan trọng.
+
+Ta giảm propagation:
+
+$$ \lambda_{ij}\ll1 $$
+
+Như vậy:
+
+Normal ─ Normal ─ FRAUD ─ Normal ─ Normal
+   ↑       ↑       ↑        ↑
+ mạnh    mạnh     yếu      mạnh
+
+Thay vì:
+
+Normal ─ Normal ─ FRAUD ─ Normal
+       tất cả diffusion như nhau
+6. Nhưng chỉ dùng feature difference thì chưa đủ
+
+Đây là điểm tôi muốn làm thành novelty chính.
+
+Ta không đặt:
+
+$$ \lambda_{ij}=f(|h_i-h_j|) $$
+
+một cách đơn giản.
+
+Ta học:
+
+$$ \boxed{ \lambda_{ij} = \sigma( MLP( [h_i,h_j, |h_i-h_j|, h_i\odot h_j, s_{ij}] )) } $$
+
+Trong đó \(s_{ij}\) là structural/geometric information của edge.
+
+Ví dụ:
+
+degree;
+common neighbors;
+local density;
+curvature;
+edge direction;
+structural role.
+
+Như vậy model không chỉ hỏi:
+
+“Hai node khác feature nhau bao nhiêu?”
+
+mà hỏi:
+
+“Quan hệ này có phải là một boundary mà tôi nên bảo vệ không?”
+
+7. Đây chính là phần lấy từ các domain khác
+Vật lý / numerical PDE
+
+Trong bài toán fluid dynamics, shock waves tạo ra boundary rất sắc.
+
+Nếu numerical diffusion quá mạnh:
+
+sharp shock
+     ↓
+blurred shock
+
+Các phương pháp flux limiter được dùng để:
+
+cho phép transport ở vùng trơn nhưng hạn chế diffusion tại discontinuity.
+
+Chúng ta mượn nguyên lý đó:
+
+smooth graph region
+       ↓
+allow propagation
+
+fraud/normal boundary
+       ↓
+limit propagation
+8. Nhưng tại sao gọi là anisotropic?
+
+Vì chúng ta không muốn:
+
+$$ \lambda_{ij}=\lambda_{ji} $$
+
+một cách bắt buộc.
+
+Ví dụ transaction graph:
+
+A → B
+
+không nhất thiết tương đương:
+
+B → A
+
+Do đó:
+
+$$ \lambda_{i\rightarrow j} \neq \lambda_{j\rightarrow i} $$
+
+Ta học:
+
+$$ \lambda_{ij} = \sigma( MLP[h_i,h_j,s_{ij}] ) $$
+
+thay vì chỉ:
+
+$$ \lambda_{ij} = \sigma( MLP[h_i-h_j] ) $$
+
+Điều này lấy cảm hứng từ anisotropic diffusion trong các mô hình propagation sinh học/epidemic gần đây.
+
+9. Có thêm một thành phần tôi nghĩ rất quan trọng: Reaction
+
+Nếu chỉ giảm diffusion thì có một vấn đề:
+
+Nếu không truyền thông tin từ hàng xóm, node fraud có thể vẫn thiếu context.
+
+Vì vậy ta tách:
+
+$$ \boxed{ \text{Update} = \text{Reaction} + \text{Transport} } $$
+Reaction
+
+Xử lý thông tin của chính node:
+
+$$ R_i = MLP(h_i) $$
+Transport
+
+Nhận information từ hàng xóm:
+
+$$ T_i= \sum_j \lambda_{ij}w_{ij}(h_j-h_i) $$
+
+Sau đó:
+
+$$ \boxed{ h_i^{l+1} = h_i^l+ R_i+ T_i } $$
+10. Đây là điểm khác biệt quan trọng
+
+GNN thông thường:
+
+$$ h^{l+1}=Aggregation(h^l,A) $$
+
+ADC-GNN:
+
+$$ h^{l+1}=PolynomialFilter(A)h^l $$
+
+Ý tưởng mới:
+
+$$ \boxed{ h^{l+1} = h^l+ R(h^l) + D_{\Lambda}(A,h^l) } $$
+
+Trong đó:
+
+$$ D_{\Lambda} $$
+
+là adaptive transport operator.
+
+Tức là graph không còn là một môi trường diffusion cố định.
+
+Model học:
+
+information nên truyền ở đâu, truyền bao nhiêu và theo hướng nào.
+
+11. Nó chữa hai lỗi như thế nào?
+Trường hợp 1: Signal dilution
+Normal Normal
+     \   /
+     FRAUD
+     /   \
+Normal Normal
+
+ADC:
+
+$$ h_F' = 0.2h_F+0.8h_N $$
+
+→ fraud bị kéo về normal.
+
+Flux model:
+
+$$ \lambda_{F,N}\downarrow $$
+
+nên:
+
+$$ h_F' \approx 0.8h_F+0.2h_N $$
+
+→ giữ fraud identity.
+
+Trường hợp 2: Contamination
+        FRAUD
+          │
+          ▼
+       NORMAL
+
+ADC:
+
+$$ h_N' = 0.5h_N+0.5h_F $$
+
+→ normal bị nhiễm.
+
+Flux model:
+
+$$ \lambda_{N,F}\downarrow $$
+
+→ giảm lượng fraud information truyền sang normal.
+
+12. Nhưng còn một vấn đề: fraud node có thể có fraud neighbors
+
+Đây là lý do không thể đơn giản “giảm propagation khi feature khác nhau”.
+
+Ví dụ:
+
+FRAUD ─ FRAUD ─ FRAUD
+
+Hai fraud node có thể rất khác feature:
+
+$$ |h_i-h_j| \gg 0 $$
+
+nhưng information giữa chúng lại rất hữu ích.
+
+Do đó flux limiter phải học context của edge, không chỉ feature difference.
+
+Đây là lý do tôi muốn đưa:
+
+$$ s_{ij} $$
+
+vào.
+
+Ví dụ:
+
+$$ s_{ij} = [ degree_i, degree_j, commonNeighbors_{ij}, density_i, curvature_{ij} ] $$
+13. Và đây mới là research question đẹp
+
+Không phải:
+
+“Chúng tôi thêm curvature vào GNN.”
+
+Mà:
+
+Can fraud-sensitive graph boundaries be preserved by replacing isotropic graph diffusion with a learned flux-limited transport process?
+
+Dịch đơn giản:
+
+Có thể bảo toàn ranh giới đặc trưng của fraud bằng cách thay quá trình diffusion đồng đều của GNN bằng một cơ chế truyền thông tin có giới hạn và thích nghi theo từng quan hệ hay không?
+
+Cái này có nguyên nhân → cơ chế → giải pháp rất rõ.
+
+14. Kiến trúc cuối cùng sẽ như này
+                 Node Features
+                      │
+                      ▼
+              Linear Projection
+                      │
+                      ▼
+             ┌─────────────────┐
+             │   ADC branches  │
+             │ P1(A), P2(A)... │
+             └────────┬────────┘
+                      │
+                      ▼
+              Node representation
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+   Edge relation encoder     Node reaction
+          │                       │
+          ▼                       ▼
+   Flux limiter λij             R(hi)
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+             Anisotropic transport
+                      │
+                      ▼
+           Flux-Limited ADC Layer
+                      │
+                      ▼
+               Representation
+                      │
+                      ▼
+                  Classifier
+15. Cái hay là không cần diffusion generative
+
+Tôi sẽ bỏ toàn bộ phần:
+
+Gaussian diffusion
+FailureConditionedNoise
+Recovery
+Contrastive diffusion
+
+ở phiên bản đầu.
+
+Không phải vì diffusion xấu, mà vì ADC-GNN vốn đã dùng diffusion/denoising, thêm tiếp vào sẽ khiến contribution khó phân biệt.
+
+Paper mới nên có một câu chuyện sạch:
+
+Existing fraud GNNs propagate information indiscriminately. This causes fraud-sensitive boundaries to diffuse away and allows anomalous signals to contaminate normal representations. We introduce a flux-limited anisotropic propagation mechanism that learns edge-wise transport strength and preserves informative graph boundaries during message passing.
+
+16. Và có một test rất quan trọng trước khi code full
+
+Tôi muốn chứng minh đúng nguyên nhân trước.
+
+Với ADC-GNN hiện tại, lấy representation sau mỗi polynomial layer và đo:
+
+$$ D_{FB}^{(l)} = E[ \|h_f^{(l)}-h_b^{(l)}\| ] $$
+
+Nếu qua layer:
+
+Layer 0    2.10
+Layer 1    1.62
+Layer 2    1.21
+Layer 3    0.83
+
+thì rất rõ:
+
+fraud/benign boundary đang bị co lại.
+
+Đồng thời đo:
+
+$$ D_{FF}^{(l)},D_{BB}^{(l)} $$
+
+Nếu:
+
+$$ D_{FB}\rightarrow D_{FF} $$
+
+thì fraud và normal đang trở nên giống nhau.
+
+Đó mới là bằng chứng để nói ADC-GNN đang gặp dilution/oversmoothing.
+
+Tóm lại cực ngắn
+Nguyên nhân:
+
+Graph propagation = diffusion → information của các node bị trộn → fraud boundary bị làm phẳng + fraud signal có thể lan sang benign.
+
+Không làm:
+
+“Representation hỏng → tìm cách recover.”
+
+Làm:
+
+“Không cho propagation làm hỏng representation ngay từ đầu.”
+
+Cơ chế:
+$$ \boxed{ \text{Reaction} + \text{Flux-limited anisotropic transport} } $$
+Lấy cảm hứng:
+
+PDE / fluid dynamics → flux limiter
+biology → anisotropic reaction-diffusion
+medical imaging → edge-preserving diffusion/TV
+physics → non-standard diffusion
+
+Contribution:
+$$ \boxed{ \text{ADC-GNN} \quad\longrightarrow\quad \text{Flux-Limited ADC-GNN} } $$
+
+và câu hỏi thực nghiệm quan trọng nhất là: cơ chế này có thực sự làm tăng khoảng cách fraud–benign qua các propagation layers và kéo theo AP/Recall@K tăng hay không.
+
+Nếu test này không xảy ra, bỏ ý tưởng ngay; nếu xảy ra, lúc đó mới đáng viết full architecture.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import math
 import torch
 from torch import nn
