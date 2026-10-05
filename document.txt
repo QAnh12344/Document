@@ -4,6 +4,107 @@ import torch.nn.functional as F
 import dgl.function as fn
 
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import sympy
+import scipy
+import numpy as np
+from torch.nn import init
+
+class PolyConv(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 out_feats,
+                 theta,
+                 activation=F.leaky_relu,
+                 lin=False,
+                 bias=False):
+        super(PolyConv, self).__init__()
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+        self.linear = nn.Linear(in_feats, out_feats, bias)
+        self.lin = lin
+
+    def reset_parameters(self):
+        if self.linear.weight is not None:
+            init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
+    def forward(self, graph, feat):
+        def unnLaplacian(feat, D_invsqrt, graph):
+            graph.ndata['poly_h'] = feat * D_invsqrt
+            graph.update_all(fn.copy_u('poly_h', 'm'), fn.sum('m', 'poly_h'))
+            return feat - graph.ndata.pop('poly_h') * D_invsqrt
+
+        with graph.local_scope():
+            D_invsqrt = torch.pow(graph.in_degrees().float().clamp(min=1), -0.5).unsqueeze(-1).to(feat.device)
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, graph)
+                h += self._theta[k] * feat
+        if self.lin:
+            h = self.linear(h)
+            h = self.activation(h)
+        return h
+
+class PolyConvBatch(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 out_feats,
+                 theta,
+                 activation=F.leaky_relu,
+                 lin=False,
+                 bias=False):
+        super(PolyConvBatch, self).__init__()
+        self._theta = theta
+        self._k = len(self._theta)
+        self._in_feats = in_feats
+        self._out_feats = out_feats
+        self.activation = activation
+        self.lin = lin 
+
+    def forward(self, block, feat):
+        def unnLaplacian(feat, D_invsqrt, block):
+            block.srcdata['h'] = feat * D_invsqrt
+            block.update_all(fn.copy_u('h', 'm'), fn.sum('m', 'h'))
+            return feat - block.srcdata.pop('h') * D_invsqrt
+
+        with block.local_scope():
+            D_invsqrt = torch.pow(block.out_degrees().float().clamp(min=1), -0.5).unsqueeze(-1).to(feat.device)
+            h = self._theta[0] * feat
+            for k in range(1, self._k):
+                feat = unnLaplacian(feat, D_invsqrt, block)
+                h += self._theta[k] * feat
+        return h
+
+def calculate_theta2(d):
+    thetas = []
+    x = sympy.symbols('x')
+    for i in range(d + 1):
+        f = sympy.poly((x/2)**i * (1 - x/2)**(d - i) / (scipy.special.beta(i+1, d+1-i)))
+        coeff = f.all_coeffs()
+        inv_coeff = []
+        for j in range(d+1):
+            inv_coeff.append(float(coeff[d - j]))
+        thetas.append(inv_coeff)
+    return thetas
+
+
+
+
+
+
+
+
+
 class ADCGNN_amazon(nn.Module):
     def __init__(
         self, in_feats, h_feats, num_classes, graph, d=2, 
@@ -40,7 +141,7 @@ class ADCGNN_amazon(nn.Module):
         self.attention_fc = nn.Linear(h_feats, 1)
         self.fusion_mlp = nn.Sequential(
             nn.Linear(2 * h_feats, h_feats),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(h_feats, 1),
             nn.Sigmoid()
         )
