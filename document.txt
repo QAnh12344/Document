@@ -84,10 +84,9 @@ class ADCGNN_amazon(nn.Module):
                 self.g.ndata['f_tmp'] = in_feat
                 self.g.update_all(fn.copy_u('f_tmp', 'm'), fn.mean('m', 'neigh_m'))
                 h_nbr = self.g.ndata['neigh_m']
-
-            dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
-            norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
-            s_i = in_feat - (dot_prod / norm_sq) * h_nbr
+                dot_prod = torch.sum(in_feat * h_nbr, dim=-1, keepdim=True)
+                norm_sq = torch.sum(h_nbr * h_nbr, dim=-1, keepdim=True) + 1e-8
+                s_i = in_feat - (dot_prod / norm_sq) * h_nbr
             s_emb = self.norm_s(self.ortho_fc(s_i))
 
             if self.hodge_dim > 0:
