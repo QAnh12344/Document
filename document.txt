@@ -176,7 +176,7 @@ class ADCGNN_amazon(nn.Module):
         self.residual_fc = nn.Linear(h_feats, h_feats)
 
         # Activation / Dropout
-        self.act = nn.ReLU()
+        self.act = nn.LeakyReLU()
         self.dropout = nn.Dropout(dropout)
 
         # HODGE MODULE
