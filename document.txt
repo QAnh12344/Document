@@ -1,3 +1,372 @@
+
+import os
+import numpy as np
+import scipy.sparse as sp
+import torch
+import dgl
+
+
+def build_hodge_topology(
+    g,
+    dataset_name,
+    data_path="./data",
+    max_triangles=None
+):
+    """
+    Returns:
+      edge_index: [2, E], each undirected edge oriented u < v
+      tri_edge_index: [T, 3], columns [edge(i,j), edge(j,k), edge(i,k)]
+                      for each triangle i < j < k
+
+    The triangle boundary convention is:
+      curl = e_ij + e_jk - e_ik
+    """
+
+    cache_dir = os.path.join(data_path, "hodge_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(
+        cache_dir, f"{dataset_name}_topology.pt"
+    )
+
+    if os.path.exists(cache_path):
+        obj = torch.load(
+            cache_path, map_location="cpu", weights_only=True
+        )
+        return obj["edge_index"], obj["tri_edge_index"]
+
+    if len(g.canonical_etypes) > 1:
+        g = dgl.to_homogeneous(g)
+
+    n = g.num_nodes()
+    src, dst = g.edges()
+    src, dst = src.cpu().numpy(), dst.cpu().numpy()
+
+    # Undirected simple graph; ignore self-loops.
+    mask = src != dst
+    src, dst = src[mask], dst[mask]
+
+    A = sp.csr_matrix(
+        (np.ones(len(src), dtype=np.int8), (src, dst)),
+        shape=(n, n)
+    )
+    A = A.maximum(A.T)
+    A.setdiag(0)
+    A.eliminate_zeros()
+    A.data[:] = 1
+    A.sort_indices()
+
+    # Every undirected edge is oriented from smaller to larger ID.
+    upper = sp.triu(A, k=1).tocoo()
+    u = upper.row.astype(np.int64)
+    v = upper.col.astype(np.int64)
+
+    edge_index_np = np.stack([u, v], axis=0)
+    edge_lookup = {
+        (int(a), int(b)): idx
+        for idx, (a, b) in enumerate(zip(u, v))
+    }
+
+    # Enumerate each triangle once: i < j < k.
+    neighbors = [
+        A.indices[A.indptr[i]:A.indptr[i + 1]]
+        for i in range(n)
+    ]
+
+    tri_edges = []
+    for i in range(n):
+        nbr_i = neighbors[i]
+        nbr_i = nbr_i[nbr_i > i]
+
+        for j in nbr_i:
+            common = np.intersect1d(
+                nbr_i, neighbors[int(j)], assume_unique=True
+            )
+            common = common[common > j]
+
+            for k in common:
+                tri_edges.append((
+                    edge_lookup[(i, int(j))],
+                    edge_lookup[(int(j), int(k))],
+                    edge_lookup[(i, int(k))]
+                ))
+
+                if (
+                    max_triangles is not None
+                    and len(tri_edges) > max_triangles
+                ):
+                    raise RuntimeError(
+                        "Triangle limit exceeded. "
+                        "Do not silently truncate triangles: "
+                        "choose an explicit sampled-complex protocol "
+                        "or a more scalable triangle enumerator."
+                    )
+
+    tri_edges_np = np.asarray(
+        tri_edges, dtype=np.int64
+    ).reshape(-1, 3)
+
+    edge_index = torch.from_numpy(edge_index_np).long()
+    tri_edge_index = torch.from_numpy(tri_edges_np).long()
+
+    torch.save({
+        "edge_index": edge_index,
+        "tri_edge_index": tri_edge_index
+    }, cache_path)
+
+    return edge_index, tri_edge_index
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ADCGNN_HNR(nn.Module):
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        num_classes,
+        graph,
+        edge_index,
+        tri_edge_index,
+        d=2,
+        dropout=0.2
+    ):
+        super().__init__()
+
+        self.graph = graph
+        self.dropout = dropout
+
+        # Topology is fixed; the edge signal is learned.
+        self.register_buffer("edge_index", edge_index.long())
+        self.register_buffer(
+            "tri_edge_index", tri_edge_index.long()
+        )
+
+        # Original ADC-GNN Beta-wavelet filters.
+        self.conv = nn.ModuleList([
+            PolyConv(
+                h_feats, h_feats, theta, lin=False
+            )
+            for theta in calculate_theta2(d)
+        ])
+
+        self.linear = nn.Linear(in_feats, h_feats)
+        self.linear2 = nn.Linear(h_feats, h_feats)
+        self.linear3 = nn.Linear(h_feats, h_feats)
+        self.linear4 = nn.Linear(h_feats, num_classes)
+        self.residual_fc = nn.Linear(h_feats, h_feats)
+
+        self.attention_fc = nn.Linear(h_feats, 1)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.LeakyReLU(0.2),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        # Learn a skew-symmetric bilinear edge operator.
+        self.edge_W = nn.Parameter(
+            torch.empty(h_feats, h_feats)
+        )
+        nn.init.xavier_uniform_(self.edge_W)
+
+        # Three node-level Hodge signals:
+        # divergence magnitude, local curl energy,
+        # and local Hodge-Laplacian response magnitude.
+        self.hodge_proj = nn.Sequential(
+            nn.Linear(3, h_feats),
+            nn.LayerNorm(h_feats),
+            nn.LeakyReLU(0.2)
+        )
+
+        self.node_gate = nn.Sequential(
+            nn.Linear(2 * h_feats, h_feats),
+            nn.LeakyReLU(0.2),
+            nn.Linear(h_feats, 1),
+            nn.Sigmoid()
+        )
+
+        self.hodge_scale = nn.Parameter(
+            torch.tensor(0.1)
+        )
+
+    def hodge_node_features(self, h):
+        """
+        Edge orientation: u -> v for u < v.
+
+        B1 convention:
+          B1[u,e] = -1, B1[v,e] = +1
+
+        B2 convention for i < j < k:
+          boundary = e_ij + e_jk - e_ik
+
+        L1 = B1^T B1 + B2 B2^T
+        """
+
+        n = h.shape[0]
+        device = h.device
+        dtype = h.dtype
+
+        u, v = self.edge_index
+        E = u.numel()
+
+        # Skew-symmetric matrix: W = R - R^T.
+        W = self.edge_W - self.edge_W.T
+
+        # Oriented edge signal e_uv = h_u^T W h_v.
+        edge_signal = (
+            (h[u] @ W) * h[v]
+        ).sum(dim=-1)
+
+        # Divergence: div = B1 e.
+        div = h.new_zeros(n)
+        div.index_add_(0, u, -edge_signal)
+        div.index_add_(0, v, edge_signal)
+
+        # Curl: curl = B2^T e.
+        T = self.tri_edge_index.shape[0]
+        if T > 0:
+            e_ij = edge_signal[self.tri_edge_index[:, 0]]
+            e_jk = edge_signal[self.tri_edge_index[:, 1]]
+            e_ik = edge_signal[self.tri_edge_index[:, 2]]
+            curl = e_ij + e_jk - e_ik
+        else:
+            curl = h.new_zeros(0)
+
+        # Compute L1 e = B1^T B1 e + B2 B2^T e.
+        # First term: B1^T div.
+        l1_edge = -div[u] + div[v]
+
+        # Second term: B2 curl.
+        if T > 0:
+            l1_edge = l1_edge.clone()
+            te = self.tri_edge_index
+            l1_edge.index_add_(0, te[:, 0], curl)
+            l1_edge.index_add_(0, te[:, 1], curl)
+            l1_edge.index_add_(0, te[:, 2], -curl)
+
+        # Convert edge/triangle signals into node descriptors.
+        degree = h.new_zeros(n)
+        degree.index_add_(0, u, torch.ones_like(edge_signal))
+        degree.index_add_(0, v, torch.ones_like(edge_signal))
+        degree = degree.clamp_min(1.0)
+
+        # Descriptor 1: divergence magnitude.
+        div_desc = div.abs()
+
+        # Descriptor 2: mean squared curl over incident triangles.
+        curl_energy = h.new_zeros(n)
+        tri_count = h.new_zeros(n)
+
+        if T > 0:
+            te = self.tri_edge_index
+            # Recover the three nodes of each triangle from its edges.
+            # Edge columns are oriented min-ID -> max-ID.
+            eu, ev = u[te], v[te]
+            tri_nodes = torch.stack([
+                eu[:, 0], ev[:, 0], ev[:, 1]
+            ], dim=1)
+
+            energy = curl.square()
+            for col in range(3):
+                curl_energy.index_add_(
+                    0, tri_nodes[:, col], energy
+                )
+                tri_count.index_add_(
+                    0, tri_nodes[:, col], torch.ones_like(energy)
+                )
+
+        curl_energy = curl_energy / tri_count.clamp_min(1.0)
+
+        # Descriptor 3: mean absolute Hodge-Laplacian edge response.
+        l1_energy = h.new_zeros(n)
+        l1_energy.index_add_(0, u, l1_edge.abs())
+        l1_energy.index_add_(0, v, l1_edge.abs())
+        l1_energy = l1_energy / degree
+
+        q = torch.stack(
+            [div_desc, curl_energy, l1_energy], dim=1
+        )
+
+        # Per-graph normalization, without using labels.
+        mean = q.mean(dim=0, keepdim=True)
+        std = q.std(
+            dim=0, unbiased=False, keepdim=True
+        ).clamp_min(1e-6)
+        q = (q - mean) / std
+
+        return torch.nan_to_num(q)
+
+    def forward(self, in_feat):
+        # ADC-GNN backbone.
+        h_pre = self.linear(in_feat)
+        h = F.dropout(
+            F.leaky_relu(self.linear2(
+                F.leaky_relu(h_pre)
+            )),
+            p=self.dropout,
+            training=self.training
+        )
+
+        residual = self.residual_fc(h_pre)
+
+        branch_outputs = [
+            conv(self.graph, h) for conv in self.conv
+        ]
+        branches = torch.stack(branch_outputs, dim=1)
+
+        scores = self.attention_fc(branches).squeeze(-1)
+        weights = torch.softmax(scores, dim=1)
+
+        attn_fused = (
+            branches * weights.unsqueeze(-1)
+        ).sum(dim=1)
+        mean_fused = branches.mean(dim=1)
+
+        fusion_weight = self.fusion_mlp(
+            torch.cat([attn_fused, mean_fused], dim=-1)
+        )
+
+        fused = (
+            0.1 * fusion_weight * attn_fused
+            + (1.0 - fusion_weight) * mean_fused
+            + 0.8 * residual
+        )
+
+        # Hodge-aware node representation update.
+        q_hodge = self.hodge_node_features(fused)
+        z_hodge = self.hodge_proj(q_hodge)
+
+        gate = self.node_gate(
+            torch.cat([fused, z_hodge], dim=-1)
+        )
+
+        fused = fused + self.hodge_scale * gate * z_hodge
+
+        out = F.dropout(
+            F.leaky_relu(self.linear3(fused)),
+            p=self.dropout,
+            training=self.training
+        )
+        return self.linear4(out)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
