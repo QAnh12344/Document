@@ -1,3 +1,116 @@
+              "random_state": args.seed, "positive_label": "Dropout",
+              "weighting_policy": args.weighting,
+              "threshold_for_error_analysis": 0.5,
+              "finance_timing_verified": False,
+              "notes": [
+                  "Enrolled excluded; this is not prospective validation on active students.",
+                  "T0_FIN and T1_FIN are feature-availability scenarios, not proven timestamp-valid predictions.",
+                  "Macro-F1/FP/FN are evaluated at 0.5 on model probabilities; threshold not tuned.",
+                  "With balanced weighting: LR and SVM use balanced class_weight; XGB uses outer-training negative/positive ratio (constant across inner folds).",
+                  "Nadeau-Bengio correction is approximate; report effect sizes and limitations.",
+              ]}
+    (out / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    pd.Series(counts).rename_axis("label").reset_index(name="count").to_csv(out / "label_counts.csv", index=False)
+    scores, oof, best_params = [], [], []
+
+    for stage in stages:
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage {stage}; choose from {STAGES}")
+        Xs = select_stage(X, stage)
+        print(f"\n{'='*65}\n{stage}: {len(Xs.columns)} raw features - {list(Xs.columns)}")
+        if stage.endswith("_FIN"):
+            print("WARNING: FINANCE variables may not be available at the claimed early timepoint.")
+        outer = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=repeats, random_state=args.seed)
+        for fold_id, (train_idx, test_idx) in enumerate(outer.split(Xs, y), start=1):
+            train_x, test_x = Xs.iloc[train_idx], Xs.iloc[test_idx]
+            train_y, test_y = y.iloc[train_idx], y.iloc[test_idx]
+            inner = StratifiedKFold(n_splits=inner_splits, shuffle=True,
+                                   random_state=args.seed + fold_id)
+            for name in models:
+                ratio = float((train_y == 0).sum() / max(1, (train_y == 1).sum()))
+                pipe, param_grid = build_model(
+                    name, train_x, seed=args.seed + fold_id,
+                    weighting=args.weighting, pos_weight=ratio)
+                # Small grid in quick mode; all tuning still stays inside train folds.
+                if args.mode == "quick":
+                    param_grid = param_grid[:2]
+                search = GridSearchCV(
+                    estimator=pipe, param_grid=param_grid, scoring="average_precision",
+                    cv=inner, n_jobs=1, refit=True, error_score="raise",
+                )
+                search.fit(train_x, train_y)
+                prob = search.predict_proba(test_x)[:, 1]
+                pred = (prob >= 0.5).astype(int)
+                cm = confusion_matrix(test_y, pred, labels=[0, 1])
+                tn, fp, fn, tp = cm.ravel()
+                scores.append({"stage": stage, "fold_id": fold_id, "model": name,
+                               "AP_Dropout": average_precision_score(test_y, prob),
+                               "ROC_AUC": roc_auc_score(test_y, prob),
+                               "Macro_F1": f1_score(test_y, pred, average="macro", zero_division=0),
+                               "Precision_Dropout": precision_score(test_y, pred, zero_division=0),
+                               "Recall_Dropout": recall_score(test_y, pred, zero_division=0),
+                               "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)})
+                for i, truth, risk in zip(test_idx, test_y.to_numpy(), prob):
+                    oof.append({"stage": stage, "fold_id": fold_id, "row_id": int(i),
+                                "model": name, "y_true": int(truth), "prob_dropout": float(risk)})
+                best_params.append({"stage": stage, "fold_id": fold_id,
+                                    "model": name, "inner_best_AP": float(search.best_score_),
+                                    "parameters": json.dumps(search.best_params_)})
+                print(f"[{stage} | {fold_id:02d}/{n_splits*repeats:02d}] {name:8s} "
+                      f"AP={scores[-1]['AP_Dropout']:.4f} "
+                      f"ROC={scores[-1]['ROC_AUC']:.4f}", flush=True)
+
+        # Persist results after each stage for long-running full experiments.
+        score_df = pd.DataFrame(scores)
+        score_df.to_csv(out / "fold_scores.csv", index=False)
+        pd.DataFrame(oof).to_csv(out / "oof_predictions.csv", index=False)
+        pd.DataFrame(best_params).to_csv(out / "best_params.csv", index=False)
+        save_error_analysis(pd.DataFrame(oof), X, stage, out)
+
+    score_df = pd.DataFrame(scores)
+    metrics = ["AP_Dropout", "ROC_AUC", "Macro_F1", "Precision_Dropout", "Recall_Dropout"]
+    summary = score_df.groupby(["stage", "model"])[metrics].agg(["mean", "std"])
+    summary.columns = ["_".join(x) for x in summary.columns]
+    summary = summary.reset_index()
+    summary.to_csv(out / "summary.csv", index=False)
+    tests = paired_tests(score_df, models, stages, n_splits, repeats)
+    tests.to_csv(out / "nadeau_bengio.csv", index=False)
+    plot_results(summary, out)
+    print("\n--- SUMMARY ---")
+    print(summary[["stage", "model", "AP_Dropout_mean", "AP_Dropout_std", "ROC_AUC_mean", "Macro_F1_mean"]].round(4).to_string(index=False))
+    print("\n--- PAIRED TESTS ---")
+    if not tests.empty:
+        print(tests[["stage", "comparison", "mean_delta", "p_two_sided"]].round(4).to_string(index=False))
+    print(f"\nResults saved in: {out.resolve()}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="UCI 697 LR vs XGBoost+FE vs SVM-RBF+FS")
+    parser.add_argument("--csv", type=str, default=None, help="Local UCI data.csv; otherwise fetch_ucirepo(id=697).")
+    parser.add_argument("--mode", choices=["quick", "full"], default="quick")
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=None)
+    parser.add_argument("--ablations", action="store_true", help="Include XGB_RAW and SVM_RAW for mechanism ablation.")
+    parser.add_argument("--output", default="results_uci697", type=str)
+    parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument("--weighting", choices=["balanced", "none"], default="balanced",
+                        help="Same class-weighting policy across models. XGB uses outer-train class ratio.")
+    args = parser.parse_args()
+    run(args)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
 
 import os
 import numpy as np
