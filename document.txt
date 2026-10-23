@@ -1,4 +1,111 @@
-              "random_state": args.seed, "positive_label": "Dropout",
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""UCI 697 - Dropout vs Graduate: LR / XGBoost+FE / RBF-SVM+FS.
+
+Install:
+    pip install -U numpy pandas scipy scikit-learn xgboost ucimlrepo matplotlib joblib
+
+Examples:
+    python uci697_end_to_end.py --mode quick
+    python uci697_end_to_end.py --mode full --ablations
+    python uci697_end_to_end.py --mode full --stages T0 T1 --output results_t0_t1
+    python uci697_end_to_end.py --csv path/to/data.csv --mode quick
+
+The --mode full outer CV is 5-fold x 3 repeats, and tuning is performed
+inside each training fold. No held-out fold is used for tuning or feature selection.
+"""
+import argparse
+import json
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import t as student_t
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score, roc_auc_score, precision_score,
+    recall_score, f1_score, confusion_matrix, precision_recall_curve,
+    PrecisionRecallDisplay,
+)
+from sklearn.model_selection import (
+    GridSearchCV, RepeatedStratifiedKFold, StratifiedKFold,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+
+# Explicit category codes should never be treated as ordinal quantities by LR/SVM.
+CATEGORICAL = {
+    "Marital Status", "Application mode", "Course", "Daytime/evening attendance",
+    "Previous qualification", "Nacionality", "Nationality",
+    "Mother's qualification", "Father's qualification", "Mother's occupation",
+    "Father's occupation", "Displaced", "Educational special needs", "Debtor",
+    "Tuition fees up to date", "Gender", "Scholarship holder", "International",
+}
+FINANCE = {"debtor", "tuition fees up to date", "scholarship holder"}
+MACRO = {"unemployment rate", "inflation rate", "gdp"}
+STAGES = ("T0", "T0_FIN", "T1", "T1_FIN")
+
+
+def clean_name(x):
+    return " ".join(str(x).strip().lower().replace("_", " ").split())
+
+
+def is_cat(col):
+    return clean_name(col) in {clean_name(c) for c in CATEGORICAL}
+
+
+def load_data(path):
+    if path:
+        raw = pd.read_csv(path, sep=None, engine="python")
+        raw.columns = [str(c).strip() for c in raw.columns]
+        targets = [c for c in raw.columns if clean_name(c) == "target"]
+        if not targets:
+            raise ValueError("CSV cần có cột Target. Hãy dùng data.csv của UCI 697.")
+        y_raw = raw.pop(targets[0]).astype(str).str.strip()
+        X_raw = raw
+    else:
+        try:
+            from ucimlrepo import fetch_ucirepo
+        except ImportError as exc:
+            raise ImportError("Thiếu ucimlrepo: pip install ucimlrepo") from exc
+        dataset = fetch_ucirepo(id=697)
+        X_raw = dataset.data.features.copy()
+        y_raw = dataset.data.targets.iloc[:, 0].astype(str).str.strip()
+
+    keep = y_raw.isin(["Dropout", "Graduate"])
+    if not keep.any():
+        raise ValueError("Target không chứa nhãn Dropout / Graduate.")
+    X = X_raw.loc[keep].reset_index(drop=True).copy()
+    y = (y_raw.loc[keep] == "Dropout").astype(int).reset_index(drop=True)
+    X.columns = [str(c).strip() for c in X.columns]
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    if X.columns.duplicated().any():
+        raise ValueError("Trùng tên cột dữ liệu sau khi chuẩn hóa.")
+    return X, y, y_raw.value_counts().to_dict()
+
+
+def select_stage(X, stage):
+    with_fin = stage.endswith("_FIN")
+
+
+
+
+
+
+
+
+
+
+
+"random_state": args.seed, "positive_label": "Dropout",
               "weighting_policy": args.weighting,
               "threshold_for_error_analysis": 0.5,
               "finance_timing_verified": False,
