@@ -1,3 +1,99 @@
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn.aggr import DegreeScalerAggregation
+from torch_scatter import scatter
+
+
+class ExSTraQtPnaOrdinaryEdgeGateAgg(nn.Module):
+    def __init__(self, n_hidden, deg, dropout_p=0.4):
+        super().__init__()
+        self.n_hidden = n_hidden
+
+        # Ordinary local edge gate: tau + log_amount.
+        self.edge_gate = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+        aggregators = ["mean", "min", "max", "std"]
+        scalers = ["identity", "amplification", "attenuation"]
+        self.pna_core = DegreeScalerAggregation(
+            aggregators, scalers, deg
+        )
+        pna_out = len(aggregators) * len(scalers) * n_hidden
+
+        self.pna_project = nn.Sequential(
+            nn.Linear(pna_out, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+        self.post_transition = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout_p)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.pna_core.reset_parameters()
+        for module in self.edge_gate:
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(
+                    module.weight, nonlinearity="relu"
+                )
+                nn.init.zeros_(module.bias)
+
+        for seq in [self.pna_project, self.post_transition]:
+            nn.init.kaiming_normal_(
+                seq[0].weight, nonlinearity="relu"
+            )
+            nn.init.zeros_(seq[0].bias)
+            seq[1].reset_parameters()
+
+    def forward(
+        self, x, index, timestamps_, log_amounts, num_groups=None
+    ):
+        num_edges = x.size(0)
+        if num_groups is None:
+            num_groups = (
+                int(index.max().item()) + 1 if num_edges > 0 else 0
+            )
+        if num_edges == 0:
+            return x.new_zeros((num_groups, self.n_hidden))
+
+        min_t = scatter(
+            timestamps_, index, dim=0,
+            dim_size=num_groups, reduce="min"
+        )
+        max_t = scatter(
+            timestamps_, index, dim=0,
+            dim_size=num_groups, reduce="max"
+        )
+        duration_safe = (max_t - min_t) + 1.0
+        tau = (
+            timestamps_ - min_t[index]
+        ) / duration_safe[index]
+
+        edge_local = torch.stack([tau, log_amounts], dim=-1)
+        edge_attention = self.edge_gate(edge_local)
+        filtered_x = x * edge_attention
+
+        pna_raw = self.pna_core(filtered_x, index)
+        pna_feats = self.pna_project(pna_raw)
+        return self.post_transition(pna_feats) + pna_feats
+
+
+
+
+
+
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """UCI 697 - Dropout vs Graduate: LR / XGBoost+FE / RBF-SVM+FS.
